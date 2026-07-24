@@ -657,12 +657,18 @@ impl App {
             .await;
         let model = self.chat_widget.current_model().to_string();
         let mut config = self.fresh_session_config();
-        apply_managed_new_thread_defaults(
+        if let Err(err) = apply_managed_new_thread_defaults(
             &mut config,
             app_server.managed_new_thread_defaults(),
             &self.cli_kv_overrides,
             &self.harness_overrides,
-        );
+        ) {
+            self.chat_widget.add_error_message(format!(
+                "Failed to validate managed new-thread defaults: {err}"
+            ));
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         let summary = session_summary(
             self.chat_widget.token_usage(),
             self.chat_widget.thread_id(),

@@ -166,7 +166,6 @@ pub struct TurnContext {
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
-    pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
 }
 
@@ -356,9 +355,6 @@ impl TurnContext {
             extension_data: Arc::clone(&self.extension_data),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
             terminal_error: Arc::clone(&self.terminal_error),
-            server_model_warning_emitted: AtomicBool::new(
-                self.server_model_warning_emitted.load(Ordering::Relaxed),
-            ),
             model_verification_emitted: AtomicBool::new(
                 self.model_verification_emitted.load(Ordering::Relaxed),
             ),
@@ -624,7 +620,6 @@ impl Session {
             extension_data,
             turn_timing_state: Arc::new(TurnTimingState::default()),
             terminal_error: Arc::new(Mutex::new(None)),
-            server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
         }
     }
@@ -634,49 +629,11 @@ impl Session {
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
-        let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let update_result: CodexResult<_> = {
-            let mut state = self.state.lock().await;
-            match state.session_configuration.clone().apply(&updates) {
-                Ok(next) => {
-                    let mcp_inputs_changed = state.session_configuration.mcp_inputs_differ(&next);
-                    let previous_permission_profile =
-                        state.session_configuration.permission_profile();
-                    let next_permission_profile = next.permission_profile();
-                    let permission_profile_changed =
-                        previous_permission_profile != next_permission_profile;
-                    let previous_config = notify_config_contributors.then(|| {
-                        Self::build_effective_session_config(&state.session_configuration)
-                    });
-                    let new_config = notify_config_contributors
-                        .then(|| Self::build_effective_session_config(&next));
-                    let environment_config = next.environment_config();
-                    if updates.environments.is_some() {
-                        self.services
-                            .turn_environments
-                            .update_selections(next.environment_selections(), &environment_config);
-                    } else if state.session_configuration.environment_config() != environment_config
-                    {
-                        self.services
-                            .turn_environments
-                            .update_environment_configs(&environment_config);
-                    }
-                    if mcp_inputs_changed {
-                        self.mark_mcp_runtime_dirty();
-                    }
-                    state.session_configuration = next.clone();
-                    Ok((
-                        next,
-                        mcp_inputs_changed,
-                        permission_profile_changed,
-                        previous_config,
-                        new_config,
-                    ))
-                }
-                Err(err) => Err(CodexErr::InvalidRequest(err.to_string())),
-            }
-        };
-
+        let final_output_json_schema = updates.final_output_json_schema.clone();
+        let update_result = self
+            .apply_settings_update(&updates)
+            .await
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()));
         let (
             session_configuration,
             mcp_inputs_changed,
@@ -708,11 +665,7 @@ impl Session {
                 .await;
         }
         Ok(self
-            .new_turn_from_configuration(
-                sub_id,
-                session_configuration,
-                updates.final_output_json_schema,
-            )
+            .new_turn_from_configuration(sub_id, session_configuration, final_output_json_schema)
             .await)
     }
 

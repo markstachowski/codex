@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::control::SpawnAgentOptions;
+use crate::config::ModelPolicyLane;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -233,6 +234,67 @@ async fn child_session_inherits_client_mcp_extensions() {
                 }),
             ),
         ]))
+    );
+}
+
+#[test]
+fn spawned_subagent_sources_cannot_reuse_root_policy_classification() {
+    let parent_thread_id = ThreadId::new();
+    let session_source = normalize_spawned_subagent_session_source(
+        parent_thread_id,
+        &SessionSource::Cli,
+        Some(SessionSource::Cli),
+    );
+
+    assert_eq!(
+        session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        })
+    );
+    assert!(ModelPolicyLane::Subscription.allows_user_model_selection());
+    assert!(
+        session_source.is_non_root_agent(),
+        "a spawned child must not inherit the root model-selection exemption"
+    );
+    assert!(!ModelPolicyLane::Spark.allows_non_root_sessions());
+}
+
+#[test]
+fn spawned_subagent_sources_preserve_explicit_role_and_fix_lineage() {
+    let actual_parent_thread_id = ThreadId::new();
+    let requested_parent_thread_id = ThreadId::new();
+    let session_source = normalize_spawned_subagent_session_source(
+        actual_parent_thread_id,
+        &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 2,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("parent".to_string()),
+        }),
+        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: requested_parent_thread_id,
+            depth: 99,
+            agent_path: None,
+            agent_nickname: Some("Ada".to_string()),
+            agent_role: Some("worker".to_string()),
+        })),
+    );
+
+    assert_eq!(
+        session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: actual_parent_thread_id,
+            depth: 3,
+            agent_path: None,
+            agent_nickname: Some("Ada".to_string()),
+            agent_role: Some("worker".to_string()),
+        })
     );
 }
 

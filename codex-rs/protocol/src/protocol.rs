@@ -2729,6 +2729,25 @@ impl InitialHistory {
             .and_then(|meta| meta.parent_thread_id)
     }
 
+    /// Returns the latest effective model and reasoning effort for this resumed thread.
+    ///
+    /// New, cleared, and forked histories intentionally do not inherit a prior root selection.
+    pub fn get_resumed_model_selection(&self) -> Option<(String, Option<ReasoningEffortConfig>)> {
+        let InitialHistory::Resumed(resumed) = self else {
+            return None;
+        };
+        resumed.history.iter().rev().find_map(|item| match item {
+            RolloutItem::TurnContext(turn_context) => {
+                Some((turn_context.model.clone(), turn_context.effort.clone()))
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some((
+                event.thread_settings.model.clone(),
+                event.thread_settings.reasoning_effort.clone(),
+            )),
+            _ => None,
+        })
+    }
+
     fn get_session_meta(&self) -> Option<&SessionMeta> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
@@ -6110,6 +6129,71 @@ mod tests {
                 Some(thread_id),
             ),
             Some(MultiAgentVersion::V2)
+        );
+        Ok(())
+    }
+
+    fn model_settings_item(model: &str, effort: ReasoningEffortConfig) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            ThreadSettingsAppliedEvent {
+                thread_settings: ThreadSettingsSnapshot {
+                    model: model.to_string(),
+                    model_provider_id: "openai".to_string(),
+                    service_tier: None,
+                    approval_policy: AskForApproval::Never,
+                    approvals_reviewer: ApprovalsReviewer::User,
+                    permission_profile: PermissionProfile::read_only(),
+                    active_permission_profile: None,
+                    cwd: test_path_buf("/tmp").abs(),
+                    reasoning_effort: Some(effort.clone()),
+                    reasoning_summary: None,
+                    personality: None,
+                    collaboration_mode: CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: crate::config_types::Settings {
+                            model: model.to_string(),
+                            reasoning_effort: Some(effort),
+                            developer_instructions: None,
+                        },
+                    },
+                },
+            },
+        ))
+    }
+
+    #[test]
+    fn resumed_model_selection_uses_latest_pair_without_fork_inheritance() -> Result<()> {
+        let thread_id = ThreadId::new();
+        let selected = model_settings_item("gpt-5.5", ReasoningEffortConfig::High);
+        let resumed = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history: Arc::new(vec![selected.clone()]),
+            rollout_path: None,
+        });
+        assert_eq!(
+            resumed.get_resumed_model_selection(),
+            Some(("gpt-5.5".to_string(), Some(ReasoningEffortConfig::High)))
+        );
+
+        assert!(
+            InitialHistory::Forked(vec![selected])
+                .get_resumed_model_selection()
+                .is_none(),
+            "forks must not inherit the root selection"
+        );
+
+        let latest = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history: Arc::new(vec![
+                model_settings_item("gpt-5.5", ReasoningEffortConfig::High),
+                model_settings_item("gpt-5.4", ReasoningEffortConfig::Medium),
+            ]),
+            rollout_path: None,
+        });
+        assert_eq!(
+            latest.get_resumed_model_selection(),
+            Some(("gpt-5.4".to_string(), Some(ReasoningEffortConfig::Medium))),
+            "resume must use the latest effective pair"
         );
         Ok(())
     }

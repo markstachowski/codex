@@ -13,6 +13,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
@@ -40,8 +41,10 @@ use crate::codex_delegate::run_codex_thread_interactive;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ManagedFeatures;
+use crate::config::ModelPolicyLane;
 use crate::config::NetworkProxySpec;
 use crate::config::Permissions;
+use crate::config::locked_model_policy_lane;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianFollowupReviewReminder;
 use crate::session::GitEnrichmentPolicy;
@@ -65,6 +68,18 @@ use super::prompt::guardian_policy_prompt_with_config_and_template;
 use super::review::guardian_review_session_config;
 
 const GUARDIAN_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn guardian_service_tier_for_lane(
+    inherited_service_tier: Option<String>,
+    lane: Option<ModelPolicyLane>,
+) -> Option<String> {
+    if lane.is_some() {
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+    } else {
+        inherited_service_tier
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum GuardianReviewSessionOutcome {
     Completed(anyhow::Result<Option<String>>),
@@ -1079,6 +1094,10 @@ pub(crate) fn build_guardian_review_session_config(
     let mut guardian_config = parent_config.clone();
     guardian_config.model = Some(active_model.to_string());
     guardian_config.model_reasoning_effort = reasoning_effort;
+    guardian_config.service_tier = guardian_service_tier_for_lane(
+        parent_config.service_tier.clone(),
+        locked_model_policy_lane()?,
+    );
     guardian_config.model_provider.request_max_retries = Some(1);
     guardian_config.model_provider.stream_max_retries = Some(1);
     guardian_config.include_skill_instructions = false;
@@ -1553,6 +1572,22 @@ mod tests {
         .expect("guardian config");
 
         assert!(!guardian_config.features.enabled(Feature::CodexHooks));
+    }
+
+    #[test]
+    fn managed_guardian_review_clears_parent_service_tier() {
+        assert_eq!(
+            guardian_service_tier_for_lane(
+                Some("priority".to_string()),
+                Some(ModelPolicyLane::Subscription),
+            )
+            .as_deref(),
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+        );
+        assert_eq!(
+            guardian_service_tier_for_lane(Some("priority".to_string()), None).as_deref(),
+            Some("priority")
+        );
     }
 
     #[tokio::test]

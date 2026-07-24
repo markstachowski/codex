@@ -13,6 +13,62 @@ use tempfile::tempdir;
 
 struct TestFileSystem;
 
+#[test]
+fn user_config_homes_require_absolute_paths() {
+    let err = parse_user_config_homes(OsStr::new("relative/.codex"))
+        .expect_err("relative excluded user config homes must fail closed");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains(CDX_USER_CONFIG_HOMES_ENV));
+    assert!(err.to_string().contains("must be an absolute path"));
+}
+
+#[test]
+fn user_config_homes_parse_platform_path_list() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let first = temp.path().join("native/.codex");
+    let second = temp.path().join("windows/.codex");
+    let raw = std::env::join_paths([&first, &second])?;
+
+    assert_eq!(
+        parse_user_config_homes(&raw)?,
+        vec![
+            AbsolutePathBuf::from_absolute_path_checked(first)?,
+            AbsolutePathBuf::from_absolute_path_checked(second)?,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn platform_default_codex_home_resolves_without_override() -> anyhow::Result<()> {
+    let default_home = platform_default_codex_home()?;
+
+    assert!(default_home.as_path().is_absolute());
+    assert!(default_home.as_path().ends_with(".codex"));
+    Ok(())
+}
+
+#[test]
+fn excluded_user_config_homes_always_include_platform_default() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let platform_default =
+        AbsolutePathBuf::from_absolute_path_checked(temp.path().join("default/.codex"))?;
+    let additional =
+        AbsolutePathBuf::from_absolute_path_checked(temp.path().join("additional/.codex"))?;
+    let overrides = LoaderOverrides {
+        platform_default_codex_home: Some(platform_default.clone()),
+        project_layer_excluded_user_config_homes: Some(vec![additional.clone()]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        resolve_project_layer_excluded_user_config_homes(&overrides)?,
+        vec![additional, platform_default]
+    );
+    Ok(())
+}
+
 impl ExecutorFileSystem for TestFileSystem {
     fn canonicalize<'a>(
         &'a self,

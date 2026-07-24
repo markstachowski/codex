@@ -9,6 +9,7 @@ use codex_core_plugins::PluginCommandAttribution;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -92,6 +93,21 @@ fn plugin_attribution_for_guardian_request(
         }
         _ => None,
     }
+}
+
+fn managed_guardian_inference_settings(
+    lane: crate::config::ModelPolicyLane,
+) -> std::io::Result<(&'static str, ReasoningEffort)> {
+    if !lane.allows_non_root_sessions() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} model policy rejects Guardian delegates because the lane is root-only",
+                lane.as_str()
+            ),
+        ));
+    }
+    Ok((lane.required_review_model(), ReasoningEffort::Ultra))
 }
 
 pub(crate) fn new_guardian_review_id() -> String {
@@ -751,6 +767,36 @@ pub(super) async fn guardian_review_session_config(
             turn.config.http_client_factory(),
         )
         .await;
+    if let Some(lane) = crate::config::locked_model_policy_lane()? {
+        let (guardian_model, guardian_reasoning_effort) =
+            managed_guardian_inference_settings(lane)?;
+        let guardian_model = guardian_model.to_string();
+        let guardian_reasoning_effort = Some(guardian_reasoning_effort);
+        let guardian_model_info = session
+            .services
+            .models_manager
+            .get_model_info(
+                guardian_model.as_str(),
+                &turn.config.to_models_manager_config(),
+            )
+            .await;
+        let spawn_config = build_guardian_review_session_config(
+            turn.config.as_ref(),
+            live_network_config,
+            guardian_model.as_str(),
+            guardian_reasoning_effort.clone(),
+            guardian_model_info.model_messages.as_ref(),
+        )?;
+        return Ok(GuardianReviewSessionConfig {
+            spawn_config,
+            model: guardian_model.clone(),
+            reasoning_effort: guardian_reasoning_effort,
+            default_review_model_id: guardian_model,
+            catalog_contains_auto_review: false,
+            model_overridden: false,
+            model_override: None,
+        });
+    }
     let default_review_model_id = turn.provider.approval_review_preferred_model();
     let preferred_reasoning_effort = |supports_low: bool, fallback| {
         if supports_low {
@@ -1012,7 +1058,24 @@ fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    use crate::config::ModelPolicyLane;
     use std::time::Duration;
+
+    #[test]
+    fn managed_guardian_inference_settings_reject_spark_and_use_sol_ultra() {
+        for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
+            assert_eq!(
+                managed_guardian_inference_settings(lane)
+                    .expect("managed Guardian review settings"),
+                (crate::config::SOL_MODEL, ReasoningEffort::Ultra)
+            );
+        }
+
+        let error = managed_guardian_inference_settings(ModelPolicyLane::Spark)
+            .expect_err("Spark is root-only and must not create Guardian work");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("root-only"));
+    }
 
     #[test]
     fn guardian_review_error_reason_distinguishes_error_kinds() {

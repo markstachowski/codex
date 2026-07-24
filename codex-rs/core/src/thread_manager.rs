@@ -1,6 +1,7 @@
 use crate::CodexAppsToolsCache;
 use crate::HostSkillsService;
 use crate::agent::AgentControl;
+use crate::agent::next_thread_spawn_depth;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -284,6 +285,45 @@ fn originator_from_service_name(service_name: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+fn normalize_spawned_subagent_session_source(
+    forked_from_thread_id: ThreadId,
+    parent_session_source: &SessionSource,
+    requested_session_source: Option<SessionSource>,
+) -> SessionSource {
+    let depth = next_thread_spawn_depth(parent_session_source);
+    match requested_session_source {
+        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            agent_path,
+            agent_nickname,
+            agent_role,
+            ..
+        })) => SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: forked_from_thread_id,
+            depth,
+            agent_path,
+            agent_nickname,
+            agent_role,
+        }),
+        Some(SessionSource::SubAgent(source)) => SessionSource::SubAgent(source),
+        Some(
+            SessionSource::Cli
+            | SessionSource::VSCode
+            | SessionSource::Exec
+            | SessionSource::Mcp
+            | SessionSource::Custom(_)
+            | SessionSource::Internal(_)
+            | SessionSource::Unknown,
+        )
+        | None => SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: forked_from_thread_id,
+            depth,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+    }
 }
 
 fn effective_originator_value(
@@ -877,6 +917,12 @@ impl ThreadManager {
         mut options: StartThreadOptions,
     ) -> CodexResult<NewThread> {
         let fork_source = self.get_thread(forked_from_thread_id).await?;
+        options.session_source = Some(normalize_spawned_subagent_session_source(
+            forked_from_thread_id,
+            &fork_source.session_source,
+            options.session_source.take(),
+        ));
+        options.thread_source = Some(ThreadSource::Subagent);
         // Persist queued rollout updates before reading the fork snapshot.
         fork_source.ensure_rollout_materialized().await;
         fork_source.flush_rollout().await?;

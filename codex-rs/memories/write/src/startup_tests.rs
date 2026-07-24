@@ -370,7 +370,7 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
             test.config.model.as_deref().unwrap_or("gpt-5.4-mini"),
             ReasoningEffort::Low,
         )
-        .await;
+        .await?;
     assert_eq!(
         request_context.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
@@ -422,7 +422,6 @@ async fn memories_startup_phase1_provider_default_drives_request_model() -> anyh
         request.body_json()["model"].as_str(),
         Some(MOCK_PROVIDER_PHASE_ONE_MODEL)
     );
-
     Ok(())
 }
 
@@ -438,7 +437,6 @@ async fn memories_startup_phase2_provider_default_drives_request_model() -> anyh
         request.body_json()["model"].as_str(),
         Some(MOCK_PROVIDER_PHASE_TWO_MODEL)
     );
-
     Ok(())
 }
 

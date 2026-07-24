@@ -3537,7 +3537,16 @@ impl ThreadRequestProcessor {
             .await
             .ok()
             .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
+        let managed_lane = codex_core::config::locked_model_policy_lane()
+            .map(|lane| lane.is_some())
+            .unwrap_or(true);
+        if !managed_lane {
+            merge_persisted_resume_metadata(
+                request_overrides,
+                typesafe_overrides,
+                &persisted_metadata,
+            );
+        }
         Some(persisted_metadata)
     }
 

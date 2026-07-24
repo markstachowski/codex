@@ -343,15 +343,19 @@ async fn reasoning_selection_in_plan_mode_without_effort_change_does_not_open_sc
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdateModel(model) if model == "gpt-5.4"
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort: Some(ReasoningEffortConfig::Medium),
+                scope: crate::app_event::ModelSelectionScope::Conversation,
+            } if model == "gpt-5.4"
         )),
-        "expected model update event; events: {events:?}"
+        "expected direct selection apply without scope prompt; events: {events:?}"
     );
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(Some(_)))),
-        "expected reasoning update event; events: {events:?}"
+            .all(|event| !matches!(event, AppEvent::OpenPlanReasoningScopePrompt { .. })),
+        "did not expect scope prompt; events: {events:?}"
     );
 }
 
@@ -456,9 +460,10 @@ async fn advanced_reasoning_selection_in_plan_mode_uses_expected_scope() {
         if effort == ReasoningEffortConfig::Ultra {
             assert!(events.iter().any(|event| matches!(
                 event,
-                AppEvent::ApplyAdvancedReasoning {
+                AppEvent::ApplyThreadModelSelection {
                     model,
-                    effort: ReasoningEffortConfig::Ultra,
+                    effort: Some(ReasoningEffortConfig::Ultra),
+                    scope: crate::app_event::ModelSelectionScope::Conversation,
                 } if model == "gpt-5.4"
             )));
             assert!(events.iter().all(|event| !matches!(
@@ -521,15 +526,19 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdateModel(model) if model == "gpt-5.2"
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort: Some(_),
+                scope: crate::app_event::ModelSelectionScope::Conversation,
+            } if model == "gpt-5.2"
         )),
-        "expected model update event; events: {events:?}"
+        "expected combined model selection apply; events: {events:?}"
     );
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AppEvent::UpdateReasoningEffort(Some(_)))),
-        "expected reasoning update event; events: {events:?}"
+            .all(|event| !matches!(event, AppEvent::OpenPlanReasoningScopePrompt { .. })),
+        "did not expect scope prompt; events: {events:?}"
     );
 }
 
@@ -545,24 +554,24 @@ async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override(
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdatePlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort: Some(ReasoningEffortConfig::High),
+                scope: crate::app_event::ModelSelectionScope::ConversationAndPlan,
+            } if model == "gpt-5.4"
         )),
-        "expected plan override to be updated; events: {events:?}"
+        "expected combined global+plan selection to be applied; events: {events:?}"
     );
     assert!(
-        events.iter().any(|event| matches!(
+        events.iter().all(|event| !matches!(
             event,
-            AppEvent::PersistPlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
+            AppEvent::ApplyThreadModelSelection {
+                scope: crate::app_event::ModelSelectionScope::PlanOnly
+                    | crate::app_event::ModelSelectionScope::Conversation,
+                ..
+            }
         )),
-        "expected updated plan override to be persisted; events: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AppEvent::PersistModelSelection { model, effort: Some(ReasoningEffortConfig::High) }
-                if model == "gpt-5.4"
-        )),
-        "expected global model reasoning selection persistence; events: {events:?}"
+        "did not expect a narrower selection scope; events: {events:?}"
     );
 }
 
@@ -730,14 +739,23 @@ async fn plan_reasoning_scope_popup_plan_only_does_not_update_all_modes_reasonin
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdatePlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort: Some(ReasoningEffortConfig::High),
+                scope: crate::app_event::ModelSelectionScope::PlanOnly,
+            } if model == "gpt-5.4"
         )),
-        "expected plan-only reasoning update; events: {events:?}"
+        "expected plan-only selection to be applied; events: {events:?}"
     );
     assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, AppEvent::UpdateReasoningEffort(_))),
+        events.iter().all(|event| !matches!(
+            event,
+            AppEvent::ApplyThreadModelSelection {
+                scope: crate::app_event::ModelSelectionScope::Conversation
+                    | crate::app_event::ModelSelectionScope::ConversationAndPlan,
+                ..
+            } | AppEvent::UpdateReasoningEffort(_)
+        )),
         "did not expect all-modes reasoning update; events: {events:?}"
     );
 }
