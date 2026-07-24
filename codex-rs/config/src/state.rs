@@ -45,6 +45,12 @@ pub struct LoaderOverrides {
     pub packaged_defaults_path: Option<AbsolutePathBuf>,
     pub user_config_path: Option<AbsolutePathBuf>,
     pub user_config_profile: Option<ProfileV2Name>,
+    /// Overrides the platform default `~/.codex` path that must never be
+    /// reinterpreted as a project-local configuration directory.
+    pub platform_default_codex_home: Option<AbsolutePathBuf>,
+    /// Overrides the launcher-provided list of additional user config homes
+    /// that must never be reinterpreted as project-local configuration.
+    pub project_layer_excluded_user_config_homes: Option<Vec<AbsolutePathBuf>>,
     pub managed_config_path: Option<PathBuf>,
     pub system_config_path: Option<PathBuf>,
     pub system_requirements_path: Option<PathBuf>,
@@ -69,6 +75,8 @@ impl LoaderOverrides {
             packaged_defaults_path: None,
             user_config_path: None,
             user_config_profile: None,
+            platform_default_codex_home: None,
+            project_layer_excluded_user_config_homes: None,
             managed_config_path: Some(base.join("managed_config.toml")),
             system_config_path: Some(base.join("config.toml")),
             system_requirements_path: Some(base.join("requirements.toml")),

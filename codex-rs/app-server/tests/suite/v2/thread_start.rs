@@ -6,6 +6,7 @@ use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_models_cache;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
@@ -37,6 +38,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::loader::project_trust_key;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::config::MODEL_POLICY_LANE_ENV;
 use codex_core::config::set_project_trust_level;
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::resolve_root_git_project_for_trust;
@@ -967,6 +969,81 @@ async fn thread_start_accepts_default_service_tier() -> Result<()> {
             ..Default::default()
         })
         .await?;
+
+    assert_eq!(
+        service_tier,
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn locked_subscription_thread_start_accepts_explicit_standard_tier() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"
+model = "gpt-5.6-sol"
+review_model = "gpt-5.6-sol"
+model_provider = "openai"
+forced_login_method = "chatgpt"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+
+[agents]
+enabled = true
+
+[features]
+fast_mode = true
+multi_agent = true
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = false
+tool_namespace = "agents"
+expose_spawn_agent_model_overrides = false
+max_concurrent_threads_per_session = 6
+"#,
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .plan_type("plus")
+            .chatgpt_account_id("account-123")
+            .account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    write_models_cache(codex_home.path())?;
+    let user_config_home = codex_home.path().to_string_lossy().into_owned();
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            (MODEL_POLICY_LANE_ENV, Some("subscription")),
+            ("CDX_USER_CONFIG_HOMES", Some(user_config_home.as_str())),
+            ("OPENAI_API_KEY", None),
+            ("CODEX_API_KEY", None),
+        ])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            service_tier: Some(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ThreadStartResponse { service_tier, .. } = to_response(response)?;
 
     assert_eq!(
         service_tier,

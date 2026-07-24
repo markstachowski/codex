@@ -12,12 +12,15 @@ use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::config::ModelPolicyLane;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
+use codex_api::Reasoning;
 use codex_api::ResponseEvent;
+use codex_api::ResponsesApiRequest;
 use codex_api::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -36,6 +39,7 @@ use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
+use codex_protocol::config_types::ReasoningMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -108,6 +112,145 @@ fn test_model_client_with_thread_id(
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
+}
+
+fn policy_test_request(model: &str, effort: ReasoningEffort) -> ResponsesApiRequest {
+    ResponsesApiRequest {
+        model: model.to_string(),
+        instructions: String::new(),
+        input: Vec::new(),
+        tools: None,
+        tool_choice: "auto".to_string(),
+        parallel_tool_calls: true,
+        reasoning: Some(Reasoning {
+            mode: None,
+            effort: Some(effort),
+            summary: None,
+            context: None,
+        }),
+        store: false,
+        stream: true,
+        stream_options: None,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        client_metadata: None,
+    }
+}
+
+#[test]
+fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
+    let alternate = policy_test_request("gpt-5.5", ReasoningEffort::High);
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ false,
+        &alternate,
+    )
+    .expect("a validated root turn may use its selected subscription model");
+
+    let mut fast_root = alternate.clone();
+    fast_root.service_tier = Some("priority".to_string());
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ false,
+        &fast_root,
+    )
+    .expect("an explicit subscription root may send the Fast service tier");
+
+    let mut missing_effort = alternate.clone();
+    missing_effort
+        .reasoning
+        .as_mut()
+        .expect("reasoning payload")
+        .effort = None;
+    let error = ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ false,
+        &missing_effort,
+    )
+    .expect_err("a root request must carry its validated turn effort explicitly");
+    assert!(error.to_string().contains("explicit reasoning effort"));
+
+    let error = ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ true,
+        &alternate,
+    )
+    .expect_err("a non-root request must remain on the managed model");
+    assert!(error.to_string().contains("required `gpt-5.6-sol`"));
+
+    let managed = policy_test_request("gpt-5.6-sol", ReasoningEffort::Max);
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ true,
+        &managed,
+    )
+    .expect("a non-root request may use the exact managed wire contract");
+
+    let mut fast_child = managed.clone();
+    fast_child.service_tier = Some("priority".to_string());
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ true,
+        &fast_child,
+    )
+    .expect_err("a subscription child must remain on Standard");
+
+    let mut fast_api = managed.clone();
+    fast_api.reasoning.as_mut().expect("reasoning payload").mode = Some(ReasoningMode::Pro);
+    fast_api.service_tier = Some("priority".to_string());
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Api,
+        /*is_non_root_agent*/ false,
+        &fast_api,
+    )
+    .expect("the API root may send the Priority service tier");
+
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Api,
+        /*is_non_root_agent*/ true,
+        &fast_api,
+    )
+    .expect_err("an API child must remain on Standard");
+
+    let mut standard_api = fast_api.clone();
+    standard_api.service_tier = Some("default".to_string());
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Api,
+        /*is_non_root_agent*/ false,
+        &standard_api,
+    )
+    .expect("the API root may explicitly toggle back to Standard");
+
+    let mut fast_spark = policy_test_request("gpt-5.3-codex-spark", ReasoningEffort::XHigh);
+    fast_spark.service_tier = Some("priority".to_string());
+    ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Spark,
+        /*is_non_root_agent*/ false,
+        &fast_spark,
+    )
+    .expect_err("the Spark lane must remain on Standard");
+
+    for reserved_model in ["gpt-5.3-codex-spark", "codex-auto-balanced"] {
+        let reserved = policy_test_request(reserved_model, ReasoningEffort::High);
+        let error = ModelClient::validate_locked_responses_request_for_lane(
+            ModelPolicyLane::Subscription,
+            /*is_non_root_agent*/ false,
+            &reserved,
+        )
+        .expect_err("the ordinary subscription lane must reject reserved routing models");
+        assert!(error.to_string().contains("reserved model"));
+    }
+
+    let spark = policy_test_request("gpt-5.3-codex-spark", ReasoningEffort::XHigh);
+    let error = ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Spark,
+        /*is_non_root_agent*/ true,
+        &spark,
+    )
+    .expect_err("the Spark lane is root-only");
+    assert!(error.to_string().contains("rejects non-root requests"));
 }
 
 #[tokio::test]

@@ -188,15 +188,18 @@ pub(super) fn apply_accepted_model_migration(
         to_model: target_model.clone(),
     });
 
-    config.model = Some(target_model.clone());
-    config.model_reasoning_effort = Some(target_default_effort.clone());
-    app_event_tx.send(AppEvent::UpdateModel(target_model.clone()));
-    app_event_tx.send(AppEvent::UpdateReasoningEffort(Some(
-        target_default_effort.clone(),
-    )));
-    app_event_tx.send(AppEvent::PersistModelSelection {
+    if crate::legacy_core::config::locked_model_policy_lane()
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        config.model = Some(target_model.clone());
+        config.model_reasoning_effort = Some(target_default_effort.clone());
+    }
+    app_event_tx.send(AppEvent::ApplyThreadModelSelection {
         model: target_model,
         effort: Some(target_default_effort),
+        scope: crate::app_event::ModelSelectionScope::Conversation,
     });
 }
 

@@ -25,6 +25,7 @@ use codex_otel::TelemetryAuthMode;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InternalSessionSource;
@@ -51,6 +52,17 @@ pub(crate) struct StageOneRequestContext {
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) reasoning_summary: ReasoningSummary,
     pub(crate) service_tier: Option<String>,
+}
+
+pub(crate) fn managed_background_service_tier_for_lane(
+    inherited_service_tier: Option<String>,
+    lane: Option<codex_core::config::ModelPolicyLane>,
+) -> Option<String> {
+    if lane.is_some() {
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+    } else {
+        inherited_service_tier
+    }
 }
 
 impl StageOneRequestContext {
@@ -211,31 +223,41 @@ impl MemoryStartupContext {
         config: &Config,
         model_name: &str,
         reasoning_effort: ReasoningEffort,
-    ) -> StageOneRequestContext {
+    ) -> anyhow::Result<StageOneRequestContext> {
         let config_snapshot = self.thread.config_snapshot().await;
+        let lane = codex_core::config::locked_model_policy_lane()?;
+        let service_tier =
+            managed_background_service_tier_for_lane(config_snapshot.service_tier, lane);
+        let (model_name, reasoning_effort) = match lane {
+            Some(lane) => (
+                lane.required_model().to_string(),
+                lane.required_local_effort(),
+            ),
+            None => (model_name.to_string(), reasoning_effort),
+        };
         let model_info = self
             .thread_manager
             .get_models_manager()
-            .get_model_info(model_name, &config.to_models_manager_config())
+            .get_model_info(&model_name, &config.to_models_manager_config())
             .await;
         let reasoning_summary = config
             .model_reasoning_summary
             .unwrap_or(model_info.default_reasoning_summary);
 
-        StageOneRequestContext {
+        Ok(StageOneRequestContext {
             model_info,
             session_telemetry: build_session_telemetry(
                 &self.auth_manager,
                 self.thread_id,
                 config,
-                config_snapshot.session_source,
-                model_name,
+                SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+                &model_name,
                 config_snapshot.originator,
             ),
             reasoning_effort: Some(reasoning_effort),
             reasoning_summary,
-            service_tier: config_snapshot.service_tier,
-        }
+            service_tier,
+        })
     }
 
     pub(crate) async fn stream_stage_one_prompt(
@@ -246,7 +268,7 @@ impl MemoryStartupContext {
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let config_snapshot = self.thread.config_snapshot().await;
-        let session_source = config_snapshot.session_source;
+        let session_source = SessionSource::Internal(InternalSessionSource::MemoryConsolidation);
         let session_id = SessionId::from(self.thread_id);
         let session_id_string = session_id.to_string();
         let model_client = ModelClient::new(
@@ -263,7 +285,8 @@ impl MemoryStartupContext {
             /*concurrent_reasoning_summaries_enabled*/ false,
             /*attestation_provider*/ None,
             config.http_client_factory(),
-        );
+        )
+        .with_model_reasoning_mode(config.model_reasoning_mode);
 
         let mut client_session = model_client.new_session();
         let window_id = format!("{}:0", self.thread_id);
@@ -374,5 +397,26 @@ impl MemoryStartupContext {
         self.thread_manager.remove_thread(&thread_id).await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod managed_service_tier_tests {
+    use super::*;
+
+    #[test]
+    fn managed_background_work_clears_parent_fast_tier() {
+        assert_eq!(
+            managed_background_service_tier_for_lane(
+                Some("priority".to_string()),
+                Some(codex_core::config::ModelPolicyLane::Subscription),
+            )
+            .as_deref(),
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+        );
+        assert_eq!(
+            managed_background_service_tier_for_lane(Some("priority".to_string()), None).as_deref(),
+            Some("priority")
+        );
     }
 }

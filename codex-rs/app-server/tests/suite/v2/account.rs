@@ -40,6 +40,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::config::MODEL_POLICY_LANE_ENV;
 use codex_login::AuthDotJson;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::CLIENT_ID_OVERRIDE_ENV_VAR;
@@ -156,6 +157,37 @@ shell_snapshot = false
 "#
     );
     std::fs::write(config_toml, contents)
+}
+
+fn create_locked_subscription_config(codex_home: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"
+model = "gpt-5.6-sol"
+review_model = "gpt-5.6-sol"
+model_provider = "openai"
+forced_login_method = "chatgpt"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+
+[agents]
+enabled = true
+
+[features]
+fast_mode = true
+multi_agent = true
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = false
+tool_namespace = "agents"
+expose_spawn_agent_model_overrides = false
+max_concurrent_threads_per_session = 6
+"#,
+    )
 }
 
 fn read_config_toml(codex_home: &Path) -> Result<toml::Value> {
@@ -1691,6 +1723,47 @@ async fn login_account_api_key_rejected_when_forced_chatgpt() -> Result<()> {
     assert_eq!(
         err.error.message,
         "API key login is disabled. Use ChatGPT login instead."
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn locked_account_rpc_rejects_cross_lane_login_before_auth_mutation() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_locked_subscription_config(codex_home.path())?;
+    let config_before = std::fs::read(codex_home.path().join("config.toml"))?;
+    let user_config_home = codex_home.path().to_string_lossy().into_owned();
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            (MODEL_POLICY_LANE_ENV, Some("subscription")),
+            ("CDX_USER_CONFIG_HOMES", Some(user_config_home.as_str())),
+            ("OPENAI_API_KEY", None),
+            ("CODEX_API_KEY", None),
+        ])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_login_account_api_key_request("sk-must-not-be-persisted")
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(
+        error.error.message,
+        "subscription policy lane rejects this account login method"
+    );
+    assert_eq!(load_file_auth(codex_home.path())?, None);
+    assert_eq!(
+        std::fs::read(codex_home.path().join("config.toml"))?,
+        config_before
     );
     Ok(())
 }

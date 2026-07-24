@@ -9,7 +9,7 @@ pub(super) async fn spawn_review_thread(
     sub_id: String,
     resolved: crate::review_prompts::ResolvedReviewRequest,
 ) {
-    let model = config
+    let requested_model = config
         .review_model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info.slug.clone());
@@ -21,6 +21,28 @@ pub(super) async fn spawn_review_thread(
             config.http_client_factory(),
         )
         .await;
+    // Upstream (alpha.10) derives the review config from the parent turn's
+    // config while preserving the session token budget; the locked review
+    // policy then owns the model/effort/mode fields on top of that base.
+    let mut per_turn_config = (*parent_turn_context.config).clone();
+    per_turn_config.token_budget = config.token_budget.clone();
+    let model = match crate::tasks::apply_locked_review_inference_settings(
+        &mut per_turn_config,
+        requested_model,
+    ) {
+        Ok(model) => model,
+        Err(error) => {
+            sess.send_event(
+                parent_turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
     let review_model_info = sess
         .services
         .models_manager
@@ -45,10 +67,6 @@ pub(super) async fn spawn_review_thread(
     let model_info = review_model_info.clone();
 
     // Build per‑turn client with the requested model/family.
-    let mut per_turn_config = (*parent_turn_context.config).clone();
-    // Preserve configured overrides without carrying over the parent model's defaults.
-    per_turn_config.token_budget = config.token_budget.clone();
-    per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
     if let Some(current_effort) = per_turn_config.model_reasoning_effort.as_ref()
         && review_model_info.slug != parent_turn_context.model_info.slug
@@ -170,7 +188,6 @@ pub(super) async fn spawn_review_thread(
         extension_data,
         turn_timing_state: Arc::new(TurnTimingState::default()),
         terminal_error: Arc::new(Mutex::new(None)),
-        server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
     };
 
