@@ -64,11 +64,14 @@ pub(crate) fn check_prompt(
     metadata: &crate::responses_metadata::CodexResponsesMetadata,
 ) -> CodexResult<()> {
     let request = session.services.model_client.build_responses_request(
+        crate::config::locked_model_policy_lane()?,
         prompt,
         model,
-        /*effort*/ None,
-        codex_protocol::config_types::ReasoningSummary::None,
-        /*service_tier*/ None,
+        config.model_reasoning_effort.clone(),
+        config
+            .model_reasoning_summary
+            .unwrap_or(model.default_reasoning_summary),
+        config.service_tier.clone(),
         metadata,
     )?;
     if estimate_request_tokens(&request)

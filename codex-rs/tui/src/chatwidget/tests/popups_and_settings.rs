@@ -3769,17 +3769,21 @@ async fn model_reasoning_selection_popup_applies_custom_effort() {
 
     let selected_effort_events = std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|event| match event {
-            AppEvent::UpdateReasoningEffort(effort) => Some((None, effort)),
-            AppEvent::PersistModelSelection { model, effort } => Some((Some(model), effort)),
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort,
+                scope,
+            } => Some((model, effort, scope)),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
         selected_effort_events,
-        vec![
-            (None, Some(custom_effort.clone())),
-            (Some("gpt-5.5".to_string()), Some(custom_effort)),
-        ]
+        vec![(
+            "gpt-5.5".to_string(),
+            Some(custom_effort),
+            crate::app_event::ModelSelectionScope::Conversation,
+        )]
     );
 }
 
@@ -3819,8 +3823,8 @@ async fn select_ultra_with_multi_agent_thread_limit(max_threads: usize) -> (bool
     let mut warnings = Vec::new();
     while let Ok(event) = rx.try_recv() {
         match event {
-            AppEvent::ApplyAdvancedReasoning {
-                effort: ReasoningEffortConfig::Ultra,
+            AppEvent::ApplyThreadModelSelection {
+                effort: Some(ReasoningEffortConfig::Ultra),
                 ..
             } => {
                 selected_ultra = true;
@@ -3871,20 +3875,12 @@ async fn max_reasoning_selection_persists_model_selection() {
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(events.iter().any(|event| matches!(
         event,
-        AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Max))
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AppEvent::PersistModelSelection {
+        AppEvent::ApplyThreadModelSelection {
             model,
             effort: Some(ReasoningEffortConfig::Max),
+            scope: crate::app_event::ModelSelectionScope::Conversation,
         } if model == "gpt-5.5"
     )));
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, AppEvent::ApplyAdvancedReasoning { .. }))
-    );
 }
 
 async fn assert_reasoning_shortcuts_update_effort(
@@ -4020,10 +4016,11 @@ async fn reasoning_up_shortcut_does_not_silently_enter_advanced_effort() {
             chat.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
 
             let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-            assert!(events.iter().all(|event| !matches!(
-                event,
-                AppEvent::UpdateReasoningEffort(_) | AppEvent::ApplyAdvancedReasoning { .. }
-            )));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, AppEvent::UpdateReasoningEffort(_)))
+            );
             let messages = events
                 .into_iter()
                 .filter_map(|event| match event {
@@ -4142,9 +4139,14 @@ async fn single_reasoning_option_skips_selection() {
     }
 
     assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
+        events.iter().any(|ev| matches!(
+            ev,
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort: Some(ReasoningEffortConfig::High),
+                scope: crate::app_event::ModelSelectionScope::Conversation,
+            } if model == "model-with-single-reasoning"
+        )),
         "expected reasoning effort to be applied automatically; events: {events:?}"
     );
 }
@@ -4165,9 +4167,7 @@ async fn advanced_only_reasoning_option_requires_explicit_selection() {
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(events.iter().all(|event| !matches!(
         event,
-        AppEvent::UpdateReasoningEffort(_)
-            | AppEvent::ApplyAdvancedReasoning { .. }
-            | AppEvent::PersistModelSelection { .. }
+        AppEvent::UpdateReasoningEffort(_) | AppEvent::PersistModelSelection { .. }
     )));
 }
 
@@ -4192,9 +4192,7 @@ async fn auto_model_advertising_advanced_effort_opens_reasoning_picker() {
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(events.iter().all(|event| !matches!(
         event,
-        AppEvent::UpdateReasoningEffort(_)
-            | AppEvent::ApplyAdvancedReasoning { .. }
-            | AppEvent::PersistModelSelection { .. }
+        AppEvent::UpdateReasoningEffort(_) | AppEvent::PersistModelSelection { .. }
     )));
     assert!(
         events

@@ -31,6 +31,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::models::ContentItem;
@@ -57,6 +58,7 @@ use crate::codex_delegate::run_codex_thread_interactive;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ManagedFeatures;
+use crate::config::ModelPolicyLane;
 use crate::config::Permissions;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianContextMode;
@@ -103,6 +105,18 @@ use codex_guardian_reviewer::wait_for_guardian_review;
 
 const GUARDIAN_MAX_IMAGE_ITEM_TOKENS: i64 = 10_000;
 pub(crate) use codex_guardian_reviewer::GuardianReviewSessionOutcome;
+
+pub(super) fn guardian_service_tier_for_lane(
+    inherited_service_tier: Option<String>,
+    lane: Option<ModelPolicyLane>,
+) -> Option<String> {
+    if lane.is_some() {
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+    } else {
+        inherited_service_tier
+    }
+}
+
 
 pub(crate) struct GuardianReviewSessionParams {
     pub(crate) parent_session: Arc<Session>,

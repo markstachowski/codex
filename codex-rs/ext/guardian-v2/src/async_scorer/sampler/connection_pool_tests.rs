@@ -110,7 +110,7 @@ async fn cold_pool_uses_http_during_open_timeout_then_recovers_after_cooldown() 
         );
         config.free_guardian = free_guardian;
         config.service_tier = Some("priority".to_owned());
-        let sampler = LunaSampler::new(config);
+        let sampler = LunaSampler::new(config)?;
         let opener = sampler.connections.replenish().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while gateway.opens.load(Ordering::SeqCst) == 0 {
@@ -199,7 +199,7 @@ async fn cooldown_preserves_healthy_sockets_and_both_transports_share_capacity()
     .await;
     let gateway = Gateway::new(&http.uri(), ws.uri()).await?;
     gateway.allowed_opens.store(/*val*/ 1, Ordering::SeqCst);
-    let sampler = LunaSampler::new(sampler_config(format!("{}/v1", gateway.url)));
+    let sampler = LunaSampler::new(sampler_config(format!("{}/v1", gateway.url)))?;
     let opener = sampler.connections.replenish().unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while gateway.opens.load(Ordering::SeqCst) < 2 {
@@ -246,7 +246,7 @@ async fn stalled_http_headers_exhaust_the_sampling_retry_budget() -> Result<()> 
     let mut provider = config.provider.info().clone();
     provider.stream_idle_timeout_ms = Some(1_000);
     config.provider = create_model_provider(provider, config.provider.auth_manager());
-    let sampler = LunaSampler::new(config);
+    let sampler = LunaSampler::new(config)?;
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -283,7 +283,7 @@ async fn supersession_closes_http_before_headers_and_while_draining_the_body() -
         let sampler = Arc::new(LunaSampler::new(sampler_config(format!(
             "http://{}/v1",
             listener.local_addr()?,
-        ))));
+        )))?);
         let (received, mut requests) = tokio::sync::mpsc::unbounded_channel();
         let (closed, mut disconnects) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = tokio::task::JoinSet::new();

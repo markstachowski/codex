@@ -35,6 +35,7 @@ use tokio::time::timeout;
 
 use crate::auth::agent_identity_telemetry;
 use crate::auth::resolve_provider_auth;
+use crate::model_policy::ManagedProviderPolicy;
 use crate::provider::enforce_managed_residency;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -68,10 +69,28 @@ impl OpenAiModelsEndpoint {
     }
 
     async fn uses_codex_backend(&self) -> bool {
-        self.auth()
-            .await
-            .as_ref()
-            .is_some_and(CodexAuth::uses_codex_backend)
+        let Ok(policy) = ManagedProviderPolicy::from_environment() else {
+            return false;
+        };
+        if !policy.is_managed() {
+            return self
+                .auth()
+                .await
+                .as_ref()
+                .is_some_and(CodexAuth::uses_codex_backend);
+        }
+        if policy.validate_before_auth(&self.provider_info).is_err() {
+            return false;
+        }
+        let auth = self.auth().await;
+        let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
+        if policy
+            .resolve_api_provider(&self.provider_info, auth_mode)
+            .is_err()
+        {
+            return false;
+        }
+        auth.as_ref().is_some_and(CodexAuth::uses_codex_backend)
     }
 
     async fn list_models(
@@ -79,13 +98,26 @@ impl OpenAiModelsEndpoint {
         client_version: &str,
         http_client_factory: HttpClientFactory,
     ) -> CoreResult<ModelsEndpointResponse> {
+        let policy = ManagedProviderPolicy::from_environment()?;
+        self.list_models_with_policy(client_version, http_client_factory, policy)
+            .await
+    }
+
+    async fn list_models_with_policy(
+        &self,
+        client_version: &str,
+        http_client_factory: HttpClientFactory,
+        policy: ManagedProviderPolicy,
+    ) -> CoreResult<ModelsEndpointResponse> {
+        policy.validate_before_auth(&self.provider_info)?;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth().await;
         let identity = crate::models_identity::identity(&self.provider_info, auth.as_ref())?;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
-        let mut api_provider = self.provider_info.to_api_provider(auth_mode)?;
-        if auth.as_ref().is_some_and(CodexAuth::is_api_key_auth)
+        let mut api_provider = policy.resolve_api_provider(&self.provider_info, auth_mode)?;
+        if !policy.is_managed()
+            && auth.as_ref().is_some_and(CodexAuth::is_api_key_auth)
             && self.supports_api_key_models()
             && self.provider_info.base_url.is_none()
         {
@@ -303,10 +335,12 @@ impl RequestTelemetry for ModelsRequestTelemetry {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::num::NonZeroU64;
     use std::sync::Mutex;
 
     use super::*;
+    use crate::model_policy::ManagedProviderBuildMode;
     use codex_http_client::OutboundProxyPolicy;
     use codex_login::default_client::RESIDENCY_HEADER_NAME;
     use codex_login::default_client::ResidencyRequirement;
@@ -479,9 +513,14 @@ mod tests {
         };
 
         endpoint
-            .list_models(
+            .list_models_with_policy(
                 "0.0.0",
                 HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+                ManagedProviderPolicy::from_marker(
+                    /*marker*/ None,
+                    ManagedProviderBuildMode::Debug,
+                )
+                .expect("missing marker denotes unmanaged debug execution"),
             )
             .await
             .expect("models request should succeed");
@@ -640,6 +679,79 @@ mod tests {
                 .map(|request| request.headers["authorization"].to_str().unwrap())
                 .collect::<Vec<_>>(),
             vec!["Bearer token-2", "Bearer token-6"]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_policy_rejects_models_endpoint_before_transport() {
+        let observed_request = Arc::new(Mutex::new(None));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(Some(
+                "https://example.invalid/v1".to_string(),
+            )),
+            auth_manager: None,
+            transport_builder: Arc::new(RecordingTransportBuilder {
+                observed_request: Arc::clone(&observed_request),
+            }),
+        };
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(OsStr::new("subscription")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+
+        let error = endpoint
+            .list_models_with_policy(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+                policy,
+            )
+            .await
+            .expect_err("managed models endpoint must reject provider override");
+
+        assert!(error.to_string().contains("base URL override"));
+        assert_eq!(
+            *observed_request
+                .lock()
+                .expect("observed request lock should not be poisoned"),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_api_models_endpoint_preserves_billing_lane_routing() {
+        let capture = Arc::new(CaptureModelsUrl(Mutex::new(None)));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(None),
+            auth_manager: Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "test-api-key",
+            ))),
+            transport_builder: capture.clone(),
+        };
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(OsStr::new("api")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("managed API lane");
+
+        let error = endpoint
+            .list_models_with_policy(
+                "0.155.0",
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                policy,
+            )
+            .await
+            .expect_err("capture stops before sending any request");
+
+        assert!(
+            error
+                .to_string()
+                .contains("transport intentionally unavailable")
+        );
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            Some("https://api.openai.com/v1/models?client_version=0.155.0".to_string()),
+            "managed API credentials must not follow subscription catalog routing"
         );
     }
 }

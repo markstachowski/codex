@@ -6,6 +6,7 @@
 use super::agents_overview_view::AgentsOverviewFocus;
 use super::reconnect::ReconnectState;
 use super::*;
+use crate::managed_new_thread_defaults::apply_managed_new_thread_defaults_for_selection;
 use crate::session_start::SessionStartAction;
 use crate::session_start::SessionStartOutcome;
 use crate::session_start::cancel_session_start;
@@ -73,7 +74,7 @@ pub(super) async fn prepare_fresh_startup_config(
         app_server.managed_new_thread_defaults(),
         cli_kv_overrides,
         harness_overrides,
-    );
+    )?;
     Ok(defaults.is_some())
 }
 
@@ -257,7 +258,16 @@ impl App {
                 app_server.managed_new_thread_defaults(),
                 &cli_kv_overrides,
                 &harness_overrides,
-            );
+            )?;
+        } else {
+            apply_managed_new_thread_defaults_for_selection(&session_selection, || {
+                apply_managed_new_thread_defaults(
+                    &mut config,
+                    app_server.managed_new_thread_defaults(),
+                    &cli_kv_overrides,
+                    &harness_overrides,
+                )
+            })?;
         }
         let mut model = startup_model(&config, &bootstrap, server_defaults_read);
         let available_models = bootstrap.available_models;

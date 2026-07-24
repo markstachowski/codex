@@ -1,0 +1,5 @@
+---
+source: tui/src/app/working_directory_tests.rs
+expression: rendered
+---
+■ Failed to validate managed new-worktree defaults: unsupported CDX_MODEL_POLICY_LANE value `unsupported`; expected subscription, api, or spark

@@ -100,8 +100,30 @@ fn fixed_guardian_parent_session_id() -> ThreadId {
 }
 
 const GUARDIAN_MEMORY_CONTEXT_PROBE: &str = "guardian memory context probe";
+const GUARDIAN_MANAGED_DEVELOPER_INSTRUCTIONS_PROBE: &str =
+    "guardian managed developer instructions probe";
 const GUARDIAN_SKILL_NAME: &str = "guardian-context-probe";
 const GUARDIAN_SKILL_BODY_PROBE: &str = "guardian skill body probe";
+
+fn set_managed_developer_instructions(config: &mut Config, instructions: &str) {
+    let mut requirements = config.config_layer_stack.requirements().clone();
+    requirements.additional_developer_instructions = Some(Sourced::new(
+        instructions.to_string(),
+        RequirementSource::Unknown,
+    ));
+    let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
+    requirements_toml.additional_developer_instructions = Some(instructions.to_string());
+    config.config_layer_stack = ConfigLayerStack::new(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        requirements,
+        requirements_toml,
+    )
+    .expect("managed developer instructions config stack");
+}
 
 // The memories extension depends on codex-core, so this probe verifies the nested Guardian config
 // at request assembly without introducing a circular test dependency.
@@ -2468,6 +2490,7 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         .features
         .enable(Feature::GuardianReuseParentCompaction)
         .expect("Guardian parent-compaction reuse should be configurable");
+    set_managed_developer_instructions(&mut config, GUARDIAN_MANAGED_DEVELOPER_INSTRUCTIONS_PROBE);
     let turn_mut = Arc::get_mut(&mut turn).expect("turn should be unique");
     update_turn_settings_for_test(turn_mut, |settings| {
         Arc::make_mut(&mut settings.model_info).auto_review_model_override =
@@ -2682,7 +2705,7 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
     ));
     assert!(matches!(
         third_metadata.guardian_session_kind,
-        Some(codex_analytics::GuardianReviewSessionKind::TrunkNew)
+        Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
     ));
     assert!(matches!(
         fourth_metadata.guardian_session_kind,
@@ -2711,13 +2734,13 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
     .expect("third guardian thread id should be a valid UUID");
     assert_eq!(first_metadata.had_prior_review_context, Some(false));
     assert_eq!(second_metadata.had_prior_review_context, Some(true));
-    assert_eq!(third_metadata.had_prior_review_context, Some(false));
+    assert_eq!(third_metadata.had_prior_review_context, Some(true));
     assert_eq!(fourth_metadata.had_prior_review_context, Some(true));
     assert_eq!(
         first_metadata.guardian_thread_id,
         second_metadata.guardian_thread_id
     );
-    assert_ne!(
+    assert_eq!(
         second_metadata.guardian_thread_id,
         third_metadata.guardian_thread_id
     );
@@ -2728,6 +2751,13 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
 
     let requests = request_log.requests();
     assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request
+                .body_contains_text(GUARDIAN_MANAGED_DEVELOPER_INSTRUCTIONS_PROBE)),
+        "managed parent instructions must not enter new or reused Guardian requests"
+    );
 
     let first_body = requests[0].body_json();
     let second_body = requests[1].body_json();
@@ -2736,11 +2766,14 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
     let third_input = third_body["input"]
         .as_array()
         .expect("guardian review should include input items");
-    assert!(third_input.iter().any(|item| {
-        item["type"] == "compaction"
-            && item["id"] == "cmp_guardian_parent_summary"
-            && item["encrypted_content"] == "encrypted guardian parent summary"
-    }));
+    assert!(
+        !third_input.iter().any(|item| {
+            item["type"] == "compaction"
+                && item["id"] == "cmp_guardian_parent_summary"
+                && item["encrypted_content"] == "encrypted guardian parent summary"
+        }),
+        "isolated Guardian requests must not inherit opaque parent compaction authority"
+    );
     assert_eq!(
         first_body["prompt_cache_key"],
         second_body["prompt_cache_key"]
@@ -2773,17 +2806,17 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
             .to_string()
             .matches("Use prior reviews as context, not binding precedent.")
             .count(),
-        0,
-        "a fresh guardian session should not inherit the follow-up reminder"
+        1,
+        "the reused Guardian session should retain one follow-up reminder"
     );
     let third_user_message = requests[2]
         .message_input_text_groups("user")
         .last()
-        .expect("fresh guardian user message")
+        .expect("reused guardian user message")
         .join("");
     assert!(third_user_message.contains(">>> TRANSCRIPT START\n"));
     assert!(third_user_message.contains("Please push the third docs fix too."));
-    assert!(!third_body.to_string().contains(first_rationale));
+    assert!(third_body.to_string().contains(first_rationale));
     let second_user_message = requests[1]
         .message_input_text_groups("user")
         .last()
@@ -3869,10 +3902,86 @@ async fn guardian_review_session_config_preserves_context_overrides_for_same_eff
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn managed_guardian_review_session_retains_node_repl_developer_policy() {
+    let lane_env = crate::session::tests::ModelPolicyLaneEnvGuard::unset();
+    let server = start_mock_server().await;
+    let (session, mut turn) = guardian_test_session_and_turn(&server).await;
+    let turn_mut = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
+    Arc::make_mut(&mut turn_mut.model_info).node_repl_auto_review_required = true;
+    // SAFETY: this test is serialized and `lane_env` restores the exact prior value on drop.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        );
+    }
+
+    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref())
+        .await
+        .expect("managed Guardian config")
+        .spawn_config;
+
+    assert!(
+        guardian_config
+            .features
+            .enabled(Feature::RetainClientDeveloperMessages),
+        "managed Guardian must retain the Node REPL developer policy"
+    );
+    drop(lane_env);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn managed_guardian_review_session_uses_forced_model_limits() {
+    let lane_env = crate::session::tests::ModelPolicyLaneEnvGuard::unset();
+    let server = start_mock_server().await;
+    let (session, mut turn) = guardian_test_session_and_turn(&server).await;
+    let mut config = (*turn.config).clone();
+    config.model_context_window = Some(900_000);
+    config.model_auto_compact_token_limit = Some(600_000);
+    Arc::get_mut(&mut turn)
+        .expect("turn should be unique")
+        .config = Arc::new(config);
+    // SAFETY: this test is serialized and `lane_env` restores the exact prior value on drop.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        );
+    }
+
+    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref())
+        .await
+        .expect("managed Guardian config")
+        .spawn_config;
+
+    assert_eq!(
+        guardian_config.model.as_deref(),
+        Some(crate::config::SOL_MODEL)
+    );
+    assert_eq!(
+        guardian_config.model_reasoning_effort,
+        Some(codex_protocol::openai_models::ReasoningEffort::Ultra)
+    );
+    assert_eq!(guardian_config.model_context_window, None);
+    assert_eq!(guardian_config.model_auto_compact_token_limit, None);
+    drop(lane_env);
+}
+
+#[tokio::test]
 async fn guardian_review_session_config_clears_parent_developer_instructions() {
     let mut parent_config = test_config().await;
+    parent_config
+        .features
+        .enable(Feature::GuardianReuseParentCompaction)
+        .expect("Guardian parent-compaction reuse should be configurable");
     parent_config.developer_instructions =
         Some("parent or managed config should not replace guardian policy".to_string());
+    set_managed_developer_instructions(
+        &mut parent_config,
+        GUARDIAN_MANAGED_DEVELOPER_INSTRUCTIONS_PROBE,
+    );
 
     let guardian_config = build_guardian_review_session_config_for_test(
         &parent_config,
@@ -3886,6 +3995,26 @@ async fn guardian_review_session_config_clears_parent_developer_instructions() {
     .expect("guardian config");
 
     assert_eq!(guardian_config.developer_instructions, None);
+    assert_eq!(
+        guardian_config
+            .config_layer_stack
+            .requirements()
+            .additional_developer_instructions,
+        None
+    );
+    assert_eq!(
+        guardian_config
+            .config_layer_stack
+            .requirements_toml()
+            .additional_developer_instructions,
+        None
+    );
+    assert!(
+        !guardian_config
+            .features
+            .enabled(Feature::GuardianReuseParentCompaction),
+        "an isolated Guardian must not inherit opaque parent compaction authority"
+    );
     assert_eq!(
         guardian_config.base_instructions,
         Some(guardian_policy_prompt_with_config_and_template(
@@ -4037,6 +4166,37 @@ async fn guardian_review_session_config_allows_pinned_disabled_feature() {
     assert!(guardian_config.features.enabled(Feature::Collab));
     assert!(guardian_config.mcp_servers.get().is_empty());
     assert!(!guardian_config.include_apps_instructions);
+}
+
+#[tokio::test]
+async fn guardian_review_session_config_rejects_pinned_parent_compaction_reuse() {
+    let mut parent_config = test_config().await;
+    parent_config.features = ManagedFeatures::from_configured(
+        parent_config.features.get().clone(),
+        Some(Sourced {
+            value: FeatureRequirementsToml {
+                entries: BTreeMap::from([("guardian_reuse_parent_compaction".to_string(), true)]),
+            },
+            source: RequirementSource::Unknown,
+        }),
+    )
+    .expect("managed features");
+
+    let error = build_guardian_review_session_config_for_test(
+        &parent_config,
+        /*live_network_config*/ None,
+        "active-model",
+        /*reasoning_effort*/ None,
+        /*model_messages*/ None,
+    )
+    .expect_err("Guardian isolation must fail closed when parent compaction reuse is pinned on");
+
+    assert!(
+        error.to_string().contains(
+            "cannot isolate parent authority while `features.guardian_reuse_parent_compaction` is pinned on"
+        ),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[tokio::test]

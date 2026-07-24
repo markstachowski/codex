@@ -1,0 +1,6 @@
+---
+source: tui/src/app/agents_overview_tests.rs
+assertion_line: 389
+expression: rendered
+---
+■ Failed to validate managed background-task defaults: managed-defaults-sentinel

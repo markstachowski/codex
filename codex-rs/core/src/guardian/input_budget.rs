@@ -8,7 +8,6 @@ use codex_guardian_context::ComposedContext;
 use codex_guardian_context::HistoryTruncation;
 use codex_guardian_context::RequestBudget;
 use codex_guardian_context::effective_input_token_limit;
-use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
@@ -92,11 +91,12 @@ pub(crate) async fn finalize(
         session.get_prompt_base_instructions().await,
     );
     let request = session.services.model_client.build_responses_request(
+        crate::config::locked_model_policy_lane()?,
         &prompt,
         model,
-        /*effort*/ None,
-        ReasoningSummary::None,
-        /*service_tier*/ None,
+        step.settings.reasoning_effort().cloned(),
+        step.settings.reasoning_summary,
+        step.settings.service_tier.clone(),
         &session
             .responses_metadata(&step.turn, CodexResponsesRequestKind::Turn)
             .await,

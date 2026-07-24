@@ -10,6 +10,7 @@ use super::project_discovery;
 use super::project_root_markers_from_config;
 use super::project_trust_context;
 use super::requirements_layers_from_legacy_scheme;
+use super::resolve_project_layer_excluded_user_config_homes;
 use super::system_config_toml_file_with_overrides;
 use super::system_requirements_toml_file_with_overrides;
 use crate::CONFIG_TOML_FILE;
@@ -167,12 +168,15 @@ pub(super) async fn load_local_config_layers_with_overrides(
             .unwrap_or_default();
         apply_credential_broker_requirements(&mut trust_context, &effective_requirements);
     }
+    let project_layer_excluded_user_config_homes =
+        resolve_project_layer_excluded_user_config_homes(overrides)?;
     let project_layers = discover_project_layers(
         fs,
         cwd,
         &trust_context.project_root,
         &trust_context,
         codex_home.as_path(),
+        &project_layer_excluded_user_config_homes,
         /*strict_config*/ false,
     )
     .await?;

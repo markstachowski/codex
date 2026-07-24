@@ -2,6 +2,9 @@ use anyhow::Result;
 use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRunner;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSource;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
@@ -37,14 +40,19 @@ async fn starts_resolved_agent_prompt_in_forked_thread() -> Result<()> {
         .await?;
 
     assert_ne!(agent_run.thread_id, parent_thread_id);
+    let child_config = agent_run.thread.config_snapshot().await;
+    assert_eq!(child_config.forked_from_thread_id, Some(parent_thread_id));
     assert_eq!(
-        agent_run
-            .thread
-            .config_snapshot()
-            .await
-            .forked_from_thread_id,
-        Some(parent_thread_id)
+        child_config.session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        })
     );
+    assert_eq!(child_config.thread_source, Some(ThreadSource::Subagent));
     let started = wait_for_event(&agent_run.thread, |event| {
         matches!(event, EventMsg::TurnStarted(_))
     })

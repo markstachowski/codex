@@ -751,26 +751,54 @@ impl App {
                 ));
             }
         }
-        apply_managed_new_thread_defaults(
+        let validated_config = apply_managed_new_thread_defaults(
             &mut config,
             app_server.managed_new_thread_defaults(),
             &self.cli_kv_overrides,
             &self.harness_overrides,
-        );
-        if server_model_cleared
-            && config.model.is_none()
-            && config.features.enabled(Feature::FastMode)
-        {
-            // Bootstrap's fallback model may be seeded from the client. Resolve tiers
-            // against the server catalog when config/read cleared the model.
-            config.model = self
-                .model_catalog
-                .models
-                .iter()
-                .find(|model| model.is_default)
-                .or_else(|| self.model_catalog.models.first())
-                .map(|model| model.model.clone());
-        }
+        )
+        .map(|()| {
+            if server_model_cleared
+                && config.model.is_none()
+                && config.features.enabled(Feature::FastMode)
+            {
+                // Bootstrap's fallback model may be seeded from the client. Resolve tiers
+                // against the server catalog when config/read cleared the model.
+                config.model = self
+                    .model_catalog
+                    .models
+                    .iter()
+                    .find(|model| model.is_default)
+                    .or_else(|| self.model_catalog.models.first())
+                    .map(|model| model.model.clone());
+            }
+            config
+        });
+        self.start_agents_overview_task_with_config(
+            app_server,
+            prompt,
+            remote_cwd.as_deref(),
+            validated_config,
+        )
+        .await;
+    }
+
+    async fn start_agents_overview_task_with_config(
+        &mut self,
+        app_server: &mut AppServerSession,
+        prompt: UserMessage,
+        remote_cwd: Option<&Path>,
+        validated_config: std::io::Result<Config>,
+    ) {
+        let config = match validated_config {
+            Ok(config) => config,
+            Err(err) => {
+                self.restore_agents_overview_prompt(prompt);
+                return self.chat_widget.add_error_message(format!(
+                    "Failed to validate managed background-task defaults: {err}"
+                ));
+            }
+        };
         let model = config.model.as_deref().or_else(|| {
             self.model_catalog
                 .models
@@ -837,7 +865,7 @@ impl App {
                 &self.local_settings,
                 &config,
                 /*session_start_source*/ None,
-                remote_cwd.as_deref(),
+                remote_cwd,
                 /*selected_profile*/ None,
             )
             .await

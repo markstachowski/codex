@@ -434,7 +434,11 @@ impl AgentControl {
                     CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
                 })?;
         }
-        config.service_tier = self.root_service_tier();
+        let lane = crate::config::locked_model_policy_lane()
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        config.service_tier = self
+            .resolve_child_service_tier(lane, config.service_tier.as_deref())
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
         if let Some(model) = stored_model {
             config.model = Some(model);
         }

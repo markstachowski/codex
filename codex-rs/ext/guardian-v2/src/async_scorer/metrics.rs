@@ -19,6 +19,8 @@ pub(super) const TOOL_CALL_LAG_METRIC: &str = "codex.guardian_v2.tool_call_lag";
 // Never use error messages as metric tags: they may contain server responses or credentials.
 pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
     match error {
+        LunaSamplerError::ManagedModelPolicy(_) => "managed_model_policy",
+        LunaSamplerError::MissingModelPolicyMarker => "missing_model_policy_marker",
         LunaSamplerError::Provider(_) => "provider_error",
         LunaSamplerError::ConnectionTimeout => "connection_timeout",
         LunaSamplerError::MissingOutput => "missing_output",

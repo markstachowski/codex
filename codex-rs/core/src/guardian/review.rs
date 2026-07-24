@@ -15,6 +15,7 @@ use codex_guardian_reviewer::GuardianReviewOutcome;
 #[cfg(test)]
 use codex_guardian_reviewer::GuardianReviewSessionLimits;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
@@ -96,6 +97,21 @@ async fn plugin_attribution_for_guardian_request(
         }
         _ => None,
     }
+}
+
+fn managed_guardian_inference_settings(
+    lane: crate::config::ModelPolicyLane,
+) -> std::io::Result<(&'static str, ReasoningEffort)> {
+    if !lane.allows_non_root_sessions() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} model policy rejects Guardian delegates because the lane is root-only",
+                lane.as_str()
+            ),
+        ));
+    }
+    Ok((lane.required_review_model(), ReasoningEffort::Ultra))
 }
 
 pub(crate) fn new_guardian_review_id() -> String {
@@ -216,6 +232,53 @@ pub(super) async fn guardian_review_session_config(
     context: &GuardianReviewContext,
 ) -> anyhow::Result<GuardianReviewSessionConfig> {
     let turn = context.turn();
+    let managed_settings = crate::config::locked_model_policy_lane()?
+        .map(managed_guardian_inference_settings)
+        .transpose()?;
+    if let Some((guardian_model, guardian_reasoning_effort)) = managed_settings {
+        let guardian_model = guardian_model.to_string();
+        let guardian_reasoning_effort = Some(guardian_reasoning_effort);
+        let guardian_model_info = session
+            .services
+            .models_manager
+            .get_model_info(
+                guardian_model.as_str(),
+                &turn.config.to_models_manager_config(),
+            )
+            .await;
+        let network_proxy = session.services.network_proxy.load_full();
+        let live_network_config = match network_proxy.as_ref() {
+            Some(network_proxy) => Some(network_proxy.proxy().current_cfg().await?),
+            None => None,
+        };
+        let mut spawn_config = build_guardian_review_session_config(
+            turn.config.as_ref(),
+            live_network_config,
+            guardian_model.as_str(),
+            guardian_reasoning_effort.clone(),
+            context.reasoning_summary,
+            context.personality,
+            guardian_model_info.model_messages.as_ref(),
+        )?;
+        retain_node_repl_developer_policy(context, &mut spawn_config)?;
+        if guardian_model != context.model_info.slug {
+            spawn_config.model_context_window = None;
+            spawn_config.model_auto_compact_token_limit = None;
+        }
+        return Ok(GuardianReviewSessionConfig {
+            spawn_config,
+            compaction_model_hash: guardian_model_info.comp_hash.clone(),
+            node_repl_policy: GuardianNodeReplPolicy::from_model_messages(
+                guardian_model_info.model_messages.as_ref(),
+            ),
+            model: guardian_model.clone(),
+            reasoning_effort: guardian_reasoning_effort,
+            default_review_model_id: guardian_model,
+            catalog_contains_auto_review: false,
+            model_overridden: false,
+            model_override: None,
+        });
+    }
     let network_proxy = session.services.network_proxy.load_full();
     let live_network_config = match network_proxy.as_ref() {
         Some(network_proxy) => Some(network_proxy.proxy().current_cfg().await?),
@@ -270,16 +333,7 @@ pub(super) async fn guardian_review_session_config(
         context.personality,
         guardian_model_info.model_messages.as_ref(),
     )?;
-    if context.model_info.computer_use_review_required() {
-        spawn_config
-            .features
-            .enable(Feature::RetainClientDeveloperMessages)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "guardian review session could not preserve REPL developer policy: {error}"
-                )
-            })?;
-    }
+    retain_node_repl_developer_policy(context, &mut spawn_config)?;
     if guardian_model != context.model_info.slug {
         spawn_config.model_context_window = None;
         spawn_config.model_auto_compact_token_limit = None;
@@ -297,6 +351,23 @@ pub(super) async fn guardian_review_session_config(
         model_overridden: guardian_review_model_overridden,
         model_override: guardian_review_model_override,
     })
+}
+
+fn retain_node_repl_developer_policy(
+    context: &GuardianReviewContext,
+    spawn_config: &mut crate::config::Config,
+) -> anyhow::Result<()> {
+    if context.model_info.computer_use_review_required() {
+        spawn_config
+            .features
+            .enable(Feature::RetainClientDeveloperMessages)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "guardian review session could not preserve REPL developer policy: {error}"
+                )
+            })?;
+    }
+    Ok(())
 }
 
 /// Runs the guardian in a locked-down reusable review session.
@@ -409,4 +480,27 @@ async fn run_guardian_review_session_with_retry_before_deadline(
         )
     })
     .await
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::config::ModelPolicyLane;
+
+    #[test]
+    fn managed_guardian_inference_settings_reject_spark_and_use_sol_ultra() {
+        for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
+            assert_eq!(
+                managed_guardian_inference_settings(lane)
+                    .expect("managed Guardian review settings"),
+                (crate::config::SOL_MODEL, ReasoningEffort::Ultra)
+            );
+        }
+
+        let error = managed_guardian_inference_settings(ModelPolicyLane::Spark)
+            .expect_err("Spark is root-only and must not create Guardian work");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("root-only"));
+    }
+
 }

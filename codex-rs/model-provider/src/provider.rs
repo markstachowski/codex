@@ -30,6 +30,7 @@ use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
+use crate::model_policy::ManagedProviderPolicy;
 use crate::models_endpoint::OpenAiModelsEndpoint;
 
 pub(crate) fn enforce_managed_residency(provider: &mut Provider) {
@@ -343,6 +344,56 @@ impl ConfiguredModelProvider {
             auth_manager,
         }
     }
+
+    async fn validated_api_setup(
+        &self,
+        policy: ManagedProviderPolicy,
+        auth: ModelProviderFuture<'_, Option<CodexAuth>>,
+    ) -> codex_protocol::error::Result<(Option<CodexAuth>, Provider)> {
+        policy.validate_before_auth(&self.info)?;
+        let auth = auth.await;
+        let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
+        let mut api_provider = policy.resolve_api_provider(&self.info, auth_mode)?;
+        enforce_managed_residency(&mut api_provider);
+        Ok((auth, api_provider))
+    }
+
+    async fn api_auth_with_policy(
+        &self,
+        policy: ManagedProviderPolicy,
+    ) -> codex_protocol::error::Result<SharedAuthProvider> {
+        if !policy.is_managed() {
+            let auth = self.auth().await;
+            return resolve_provider_auth(auth.as_ref(), &self.info);
+        }
+        let (auth, _api_provider) = self.validated_api_setup(policy, self.auth()).await?;
+        resolve_provider_auth(auth.as_ref(), &self.info)
+    }
+
+    async fn api_auth_for_scope_with_policy(
+        &self,
+        policy: ManagedProviderPolicy,
+        scope: ProviderAuthScope,
+    ) -> codex_protocol::error::Result<ResolvedProviderAuth> {
+        if !policy.is_managed() {
+            if !provider_uses_first_party_auth_path(&self.info) {
+                return self
+                    .api_auth_with_policy(policy)
+                    .await
+                    .map(ResolvedProviderAuth::new);
+            }
+            let auth = self.auth().await;
+            return resolve_provider_auth_for_scope(
+                self.auth_manager(),
+                auth.as_ref(),
+                &self.info,
+                scope,
+            )
+            .await;
+        }
+        let (auth, _api_provider) = self.validated_api_setup(policy, self.auth()).await?;
+        resolve_provider_auth_for_scope(self.auth_manager(), auth.as_ref(), &self.info, scope).await
+    }
 }
 
 impl ModelProvider for ConfiguredModelProvider {
@@ -363,6 +414,33 @@ impl ModelProvider for ConfiguredModelProvider {
             remote_compaction,
             ..ProviderCapabilities::default()
         }
+    }
+
+    fn api_provider(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Provider>> {
+        Box::pin(async move {
+            let policy = ManagedProviderPolicy::from_environment()?;
+            let (_auth, api_provider) = self.validated_api_setup(policy, self.auth()).await?;
+            Ok(api_provider)
+        })
+    }
+
+    fn api_auth(
+        &self,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<SharedAuthProvider>> {
+        Box::pin(async move {
+            let policy = ManagedProviderPolicy::from_environment()?;
+            self.api_auth_with_policy(policy).await
+        })
+    }
+
+    fn api_auth_for_scope(
+        &self,
+        scope: ProviderAuthScope,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedProviderAuth>> {
+        Box::pin(async move {
+            let policy = ManagedProviderPolicy::from_environment()?;
+            self.api_auth_for_scope_with_policy(policy, scope).await
+        })
     }
 
     fn approval_review_preferred_model(&self) -> &'static str {
@@ -516,6 +594,8 @@ impl ModelProvider for ConfiguredModelProvider {
 mod tests {
     use std::future::Future;
     use std::num::NonZeroU64;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Waker;
 
@@ -547,6 +627,7 @@ mod tests {
 
     use super::*;
     use crate::auth::AgentIdentitySessionFallback;
+    use crate::model_policy::ManagedProviderBuildMode;
     use crate::shared_state::process_shared_state;
 
     fn provider_info_with_command_auth() -> ModelProviderInfo {
@@ -626,21 +707,58 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_auth_ignores_scope_for_non_openai_provider() {
-        let provider = create_model_provider(
+        let provider = ConfiguredModelProvider::new(
             create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses),
             /*auth_manager*/ None,
         );
+        let policy = ManagedProviderPolicy::from_marker(
+            /*marker*/ None,
+            ManagedProviderBuildMode::Debug,
+        )
+        .expect("missing marker denotes unmanaged debug execution");
 
         let auth = provider
-            .api_auth_for_scope(ProviderAuthScope {
-                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
-                session_source: SessionSource::Cli,
-                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
-            })
+            .api_auth_for_scope_with_policy(
+                policy,
+                ProviderAuthScope {
+                    agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+                    session_source: SessionSource::Cli,
+                    agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+                },
+            )
             .await
             .expect("auth should resolve");
 
         assert!(auth.auth.to_auth_headers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_custom_provider_is_rejected_before_auth_is_polled() {
+        let provider = ConfiguredModelProvider::new(
+            ModelProviderInfo::create_openai_provider(Some(
+                "https://example.invalid/v1".to_string(),
+            )),
+            /*auth_manager*/ None,
+        );
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(std::ffi::OsStr::new("subscription")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+        let auth_polled = Arc::new(AtomicBool::new(false));
+        let auth_polled_for_future = Arc::clone(&auth_polled);
+        let auth: ModelProviderFuture<'_, Option<CodexAuth>> = Box::pin(async move {
+            auth_polled_for_future.store(true, Ordering::SeqCst);
+            None
+        });
+
+        let error = provider
+            .validated_api_setup(policy, auth)
+            .await
+            .expect_err("managed provider override must fail before auth is polled");
+
+        assert!(error.to_string().contains("base URL override"));
+        assert_eq!(auth_polled.load(Ordering::SeqCst), false);
     }
 
     #[test]

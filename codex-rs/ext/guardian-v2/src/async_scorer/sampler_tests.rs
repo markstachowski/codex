@@ -29,6 +29,8 @@ use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -45,6 +47,90 @@ use super::LunaSamplerConfig;
 use super::LunaSamplerError;
 use super::LunaSamplingRequest;
 use super::MAX_CONCURRENT_REQUESTS;
+use super::ModelPolicyMarkerRequirement;
+
+#[cfg(unix)]
+fn non_utf8_model_policy_lane() -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    OsString::from_vec(vec![0xff])
+}
+
+#[cfg(windows)]
+fn non_utf8_model_policy_lane() -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+
+    OsString::from_wide(&[0xd800])
+}
+
+#[test]
+fn model_policy_marker_values_are_rejected_before_construction() {
+    let mut cases = vec![
+        (OsString::from("subscription"), "subscription"),
+        (OsString::from("api"), "api"),
+        (OsString::from("spark"), "spark"),
+        (OsString::from(""), "<empty>"),
+        (OsString::from("unsupported"), "unsupported"),
+    ];
+    cases.push((non_utf8_model_policy_lane(), "<non-UTF-8>"));
+
+    for (lane, expected) in cases {
+        let result = LunaSampler::new_for_model_policy_lane(
+            sampler_config("http://127.0.0.1:9/v1".to_owned()),
+            Some(lane.as_os_str()),
+            ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+        );
+        assert!(matches!(
+            result,
+            Err(LunaSamplerError::ManagedModelPolicy(rejected)) if rejected == expected
+        ));
+    }
+}
+
+#[test]
+fn required_model_policy_marker_is_rejected_before_construction() {
+    let result = LunaSampler::new_for_model_policy_lane(
+        sampler_config("http://127.0.0.1:9/v1".to_owned()),
+        /*lane*/ None,
+        ModelPolicyMarkerRequirement::RequiredForManagedRelease,
+    );
+
+    assert!(matches!(
+        result,
+        Err(LunaSamplerError::MissingModelPolicyMarker)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_model_policy_is_rechecked_before_prewarm() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_websocket_server(vec![vec![vec![]]]).await;
+    let sampler = LunaSampler::new_for_model_policy_lane(
+        sampler_config(format!(
+            "http://{}/v1",
+            server.uri().trim_start_matches("ws://")
+        )),
+        /*lane*/ None,
+        ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+    )?;
+
+    let result = sampler
+        .prewarm_for_model_policy_lane(
+            Some(OsStr::new("subscription")),
+            ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LunaSamplerError::ManagedModelPolicy(rejected)) if rejected == "subscription"
+    ));
+    assert!(server.handshakes().is_empty());
+    assert!(server.connections().is_empty());
+    server.shutdown().await;
+    Ok(())
+}
 
 impl LunaSampler {
     /// Waits for warm sockets to enter the client pool, beyond the server handshake.
@@ -215,8 +301,8 @@ pub(super) fn sampler_config(base_url: String) -> LunaSamplerConfig {
 }
 
 async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
-    let sampler = LunaSampler::new(config);
-    sampler.prewarm().await;
+    let sampler = LunaSampler::new(config)?;
+    sampler.prewarm().await?;
     Ok(sampler)
 }
 
@@ -438,6 +524,43 @@ async fn classifier_uses_free_endpoint_only_with_codex_backend_auth() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_model_policy_is_rechecked_before_sampling() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let idle_server = responses::start_websocket_server(vec![vec![vec![]]]).await;
+    let server = responses::start_websocket_server(vec![vec![vec![]]]).await;
+    let sampler = LunaSampler::new_for_model_policy_lane(
+        sampler_config(proxy_websocket_servers(&[&idle_server, &server]).await?),
+        /*lane*/ None,
+        ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+    )?;
+    sampler
+        .prewarm_for_model_policy_lane(
+            /*lane*/ None,
+            ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+        )
+        .await?;
+
+    let result = sampler
+        .sample_for_model_policy_lane(
+            sample_request("turn-1"),
+            Some(OsStr::new("api")),
+            ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LunaSamplerError::ManagedModelPolicy(rejected)) if rejected == "api"
+    ));
+    assert!(idle_server.single_connection().is_empty());
+    assert!(server.single_connection().is_empty());
+    drop(sampler);
+    tokio::join!(idle_server.shutdown(), server.shutdown());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -563,7 +686,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
     .await?;
     manager.refresh_token_from_authority().await?;
     sampler.connections.clear();
-    sampler.prewarm().await;
+    sampler.prewarm().await?;
     let second = sampler
         .sample(LunaSamplingRequest {
             parent_response_id: None,
@@ -620,6 +743,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         let effort = if index == 1 { "medium" } else { "none" };
         assert_eq!(request["reasoning"]["effort"], effort);
         assert_eq!(request["reasoning"]["context"], "all_turns");
+        assert!(request["reasoning"].get("mode").is_none());
     }
 
     Ok(())
@@ -881,7 +1005,7 @@ async fn sampler_replaces_scored_drains_before_unfinished_classifications() -> R
     .await?;
 
     for index in 0..MAX_CONCURRENT_REQUESTS - 2 {
-        sampler.prewarm().await;
+        sampler.prewarm().await?;
         assert_eq!(
             sampler
                 .sample(sample_request(&format!("turn-{index}")))

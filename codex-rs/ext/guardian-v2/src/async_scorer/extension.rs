@@ -148,9 +148,18 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     .enable_image_capture();
             }
             input.thread_store.remove::<LunaSampler>();
-            let sampler = input
-                .thread_store
-                .get_or_init(|| LunaSampler::new(sampler_config));
+            input.thread_store.remove::<GuardianV2Enabled>();
+            let sampler = match LunaSampler::new(sampler_config) {
+                Ok(sampler) => input.thread_store.get_or_init(|| sampler),
+                Err(error) => {
+                    self.event_sink.emit_warning(ExtensionWarning {
+                        thread_id,
+                        turn_id: None,
+                        message: format!("Guardian V2 Luna initialization failed: {error}"),
+                    });
+                    return;
+                }
+            };
             input.thread_store.insert(guardian_config);
             input.thread_store.insert(GuardianV2ScoreProgress {
                 metrics: input.extension_metrics.clone(),
@@ -180,8 +189,16 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                         .map(|environment| &environment.config),
                 )
             {
+                let event_sink = Arc::clone(&self.event_sink);
+                let prewarm_thread_id = thread_id.clone();
                 tokio::spawn(async move {
-                    sampler.prewarm().await;
+                    if let Err(error) = sampler.prewarm().await {
+                        event_sink.emit_warning(ExtensionWarning {
+                            thread_id: prewarm_thread_id,
+                            turn_id: None,
+                            message: format!("Guardian V2 Luna prewarm failed: {error}"),
+                        });
+                    }
                 });
             }
         })

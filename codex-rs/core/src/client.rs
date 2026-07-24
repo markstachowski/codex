@@ -79,6 +79,7 @@ use codex_protocol::ResponseItemId;
 use codex_protocol::auth::AuthMode;
 
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningMode as ReasoningModeConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
@@ -120,6 +121,8 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
 use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
 use crate::cyber_access_program;
@@ -247,6 +250,7 @@ impl RequestRouteTelemetry {
 pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
+    model_reasoning_mode: Option<ReasoningModeConfig>,
     prompt_cache_key_override: Option<String>,
     free_guardian_enabled: bool,
     event_sender: Option<Sender<ProtocolEvent>>,
@@ -472,6 +476,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
             agent_identity_policy,
+            model_reasoning_mode: None,
             prompt_cache_key_override: None,
             free_guardian_enabled: false,
             event_sender: None,
@@ -491,6 +496,14 @@ impl ModelClient {
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
         self.event_sender = Some(event_sender);
+        self
+    }
+
+    pub fn with_model_reasoning_mode(
+        mut self,
+        model_reasoning_mode: Option<ReasoningModeConfig>,
+    ) -> Self {
+        self.model_reasoning_mode = model_reasoning_mode;
         self
     }
 
@@ -540,6 +553,177 @@ impl ModelClient {
                 .borrow()
                 .owner_generation
         })
+    }
+
+    fn locked_policy_lane(&self) -> Result<Option<ModelPolicyLane>> {
+        locked_model_policy_lane().map_err(|err| CodexErr::InvalidRequest(err.to_string()))
+    }
+
+    fn validate_locked_client_setup(&self, setup: &CurrentClientSetup) -> Result<()> {
+        let Some(lane) = self.locked_policy_lane()? else {
+            return Ok(());
+        };
+        let auth_mode = setup.auth.as_ref().map(CodexAuth::auth_mode);
+        let expected_auth_mode = match lane {
+            ModelPolicyLane::Api => AuthMode::ApiKey,
+            ModelPolicyLane::Subscription | ModelPolicyLane::Spark => AuthMode::Chatgpt,
+        };
+        if auth_mode != Some(expected_auth_mode) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected resolved authentication mode {auth_mode:?}; required {expected_auth_mode}",
+                lane.as_str()
+            )));
+        }
+
+        let base_url = setup.api_provider.base_url.trim_end_matches('/');
+        let expected_base_url = match lane {
+            ModelPolicyLane::Api => "https://api.openai.com/v1",
+            ModelPolicyLane::Subscription | ModelPolicyLane::Spark => {
+                "https://chatgpt.com/backend-api/codex"
+            }
+        };
+        if base_url != expected_base_url {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected API base URL `{base_url}`; required `{expected_base_url}`",
+                lane.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_locked_responses_request(&self, request: &ResponsesApiRequest) -> Result<()> {
+        let Some(lane) = self.locked_policy_lane()? else {
+            return Ok(());
+        };
+        Self::validate_locked_responses_request_for_lane(
+            lane,
+            self.state.session_source.is_non_root_agent(),
+            request,
+        )
+    }
+
+    fn validate_locked_responses_request_for_lane(
+        lane: ModelPolicyLane,
+        is_non_root_agent: bool,
+        request: &ResponsesApiRequest,
+    ) -> Result<()> {
+        if is_non_root_agent && !lane.allows_non_root_sessions() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejects non-root requests",
+                lane.as_str()
+            )));
+        }
+        if lane.allows_user_model_selection() && !is_non_root_agent {
+            lane.validate_user_selected_model(request.model.as_str())
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            let Some(reasoning) = request.reasoning.as_ref() else {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "{} model policy requires an explicit reasoning payload",
+                    lane.as_str()
+                )));
+            };
+            if reasoning.effort.is_none() {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "{} model policy requires an explicit reasoning effort for `{}`",
+                    lane.as_str(),
+                    request.model
+                )));
+            }
+            if request
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.mode.is_some())
+            {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "{} model policy rejected reasoning mode {:?}; required None",
+                    lane.as_str(),
+                    request
+                        .reasoning
+                        .as_ref()
+                        .and_then(|reasoning| reasoning.mode)
+                )));
+            }
+            lane.validate_service_tier(
+                request.service_tier.as_deref(),
+                /*allow_user_service_tier_selection*/ true,
+            )
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            return Ok(());
+        }
+        if request.model != lane.required_model() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected request model `{}`; required `{}`",
+                lane.as_str(),
+                request.model,
+                lane.required_model()
+            )));
+        }
+        let Some(reasoning) = request.reasoning.as_ref() else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires an explicit reasoning payload",
+                lane.as_str()
+            )));
+        };
+        let required_effort = lane.required_wire_effort();
+        if reasoning.effort.as_ref() != Some(&required_effort) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected wire reasoning effort {:?}; required {}",
+                lane.as_str(),
+                reasoning.effort,
+                required_effort
+            )));
+        }
+        if reasoning.mode != lane.required_reasoning_mode() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected reasoning mode {:?}; required {:?}",
+                lane.as_str(),
+                reasoning.mode,
+                lane.required_reasoning_mode()
+            )));
+        }
+        lane.validate_service_tier(
+            request.service_tier.as_deref(),
+            /*allow_user_service_tier_selection*/ !is_non_root_agent,
+        )
+        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        Ok(())
+    }
+
+    fn validate_locked_memory_request(
+        &self,
+        model: &str,
+        reasoning: Option<&Reasoning>,
+    ) -> Result<()> {
+        let Some(lane) = self.locked_policy_lane()? else {
+            return Ok(());
+        };
+        if model != lane.required_model() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected memory model `{model}`; required `{}`",
+                lane.as_str(),
+                lane.required_model()
+            )));
+        }
+        let Some(reasoning) = reasoning else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires explicit memory reasoning",
+                lane.as_str()
+            )));
+        };
+        let required_effort = lane.required_wire_effort();
+        if reasoning.effort.as_ref() != Some(&required_effort)
+            || reasoning.mode != lane.required_reasoning_mode()
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected memory reasoning mode={:?} effort={:?}; required mode={:?} effort={}",
+                lane.as_str(),
+                reasoning.mode,
+                reasoning.effort,
+                lane.required_reasoning_mode(),
+                required_effort
+            )));
+        }
+        Ok(())
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -665,11 +849,13 @@ impl ModelClient {
             reasoning: effort
                 .map(|effort| model_info.resolve_reasoning_effort(effort))
                 .map(|effort| Reasoning {
+                    mode: self.model_reasoning_mode,
                     effort: Some(effort),
                     summary: None,
                     context: None,
                 }),
         };
+        self.validate_locked_memory_request(&payload.model, payload.reasoning.as_ref())?;
 
         client
             .summarize_input(&payload, self.build_subagent_headers())
@@ -767,6 +953,7 @@ impl ModelClient {
         summary: ReasoningSummaryConfig,
     ) -> Reasoning {
         Reasoning {
+            mode: self.model_reasoning_mode,
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
                 .map(|effort| model_info.resolve_reasoning_effort(effort)),
@@ -886,6 +1073,7 @@ impl ModelClient {
             client_metadata: Some(responses_metadata.client_metadata()),
             access_programs: None,
         };
+        self.validate_locked_responses_request(&request)?;
         Ok(request)
     }
 
@@ -941,8 +1129,8 @@ impl ModelClient {
         // Capture before resolving credentials so an account switch during setup cannot label
         // an old connection with the new owner's revision.
         let auth_owner_generation = self.auth_owner_generation();
-        let auth = self.state.provider.auth().await;
         let api_provider = self.state.provider.api_provider().await?;
+        let auth = self.state.provider.auth().await;
         let resolved_auth = self
             .state
             .provider
@@ -952,13 +1140,15 @@ impl ModelClient {
                 agent_identity_session_fallback: self.state.agent_identity_session_fallback.clone(),
             })
             .await?;
-        Ok(CurrentClientSetup {
+        let setup = CurrentClientSetup {
             auth,
             auth_owner_generation,
             api_provider,
             api_auth: resolved_auth.auth,
             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
-        })
+        };
+        self.validate_locked_client_setup(&setup)?;
+        Ok(setup)
     }
 
     fn responses_endpoint(&self, auth: Option<&CodexAuth>, model: &str) -> ResponsesEndpoint {

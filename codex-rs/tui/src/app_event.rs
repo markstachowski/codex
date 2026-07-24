@@ -266,6 +266,13 @@ pub(crate) struct AgentsOverviewThreadRefresh {
     pub(crate) recent_seed_complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelSelectionScope {
+    Conversation,
+    PlanOnly,
+    ConversationAndPlan,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -1106,6 +1113,13 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
+    /// Apply a model-picker choice as one combined thread-local model/effort update.
+    ApplyThreadModelSelection {
+        model: String,
+        effort: Option<ReasoningEffort>,
+        scope: ModelSelectionScope,
+    },
+
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
 
@@ -1186,12 +1200,6 @@ pub(crate) enum AppEvent {
     /// Open the explicit Max/Ultra reasoning selection popup for a model.
     OpenAdvancedReasoningPopup {
         model: ModelPreset,
-    },
-
-    /// Apply an advanced reasoning effort to the active conversation without changing defaults.
-    ApplyAdvancedReasoning {
-        model: String,
-        effort: ReasoningEffort,
     },
 
     /// Open the Plan-mode reasoning scope prompt for the selected model/effort.

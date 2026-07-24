@@ -10,7 +10,9 @@ use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
+use crate::session::tests::ModelPolicyLaneEnvGuard;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
@@ -34,6 +36,7 @@ use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::items::TurnItem;
@@ -4563,4 +4566,133 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
     assert_eq!(config, expected);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
+    let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+    let (session, turn) = make_session_and_context().await;
+    let mut turn = turn
+        .with_model(
+            crate::config::SOL_MODEL.to_string(),
+            &session.services.models_manager,
+        )
+        .await;
+    let mut config = (*turn.config).clone();
+    config.model = Some("gpt-5.5".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+
+    apply_locked_non_root_inference_defaults(
+        &mut config,
+        crate::config::ModelPolicyLane::Subscription,
+    )
+    .expect("subscription children should be repinned");
+    assert_eq!(config.model.as_deref(), Some(crate::config::SOL_MODEL));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Ultra));
+    assert_eq!(
+        config.service_tier.as_deref(),
+        Some(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+    );
+    turn.config = Arc::new(config.clone());
+    update_turn_settings_for_test(&mut turn, |settings| {
+        let selected = settings.selected_mut();
+        selected.collaboration_mode.settings.reasoning_effort = Some(ReasoningEffort::Ultra);
+        selected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+        settings.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+    });
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: session.thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    for (lane, root_service_tier) in [
+        (crate::config::ModelPolicyLane::Subscription, "priority"),
+        (crate::config::ModelPolicyLane::Api, "flex"),
+    ] {
+        // SAFETY: this test is serialized and `_lane_guard` restores the prior value.
+        unsafe { std::env::set_var(crate::config::MODEL_POLICY_LANE_ENV, lane.as_str()) };
+        session
+            .services
+            .agent_control
+            .set_root_service_tier(Some(root_service_tier.to_string()));
+        let step = session
+            .capture_step_context(Arc::clone(&turn), &CancellationToken::new())
+            .await
+            .expect("managed child capture should retain Standard");
+        assert_eq!(
+            step.settings.service_tier.as_deref(),
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+            "{} child capture must ignore root tier {root_service_tier}",
+            lane.as_str()
+        );
+    }
+
+    let error = apply_locked_non_root_inference_defaults(
+        &mut config,
+        crate::config::ModelPolicyLane::Spark,
+    )
+    .expect_err("Spark is root-only");
+    assert!(error.to_string().contains("rejects non-root sessions"));
+}
+
+#[test]
+fn locked_spawn_service_tier_rejects_child_fast_overrides() {
+    let lane = crate::config::ModelPolicyLane::Subscription;
+    let control = crate::agent::AgentControl::default();
+    assert_eq!(
+        control
+            .resolve_child_service_tier(Some(lane), /*configured_service_tier*/ None)
+            .expect("a managed child should start Standard"),
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+    );
+    control
+        .resolve_child_service_tier(Some(lane), Some("priority"))
+        .expect_err("role-derived Fast must be rejected for a child");
+
+    // Flex (API-lane root tier since 2026-08-05) follows the same child
+    // contract as Fast: a flex root's children stay on Standard, and a role
+    // config cannot select flex for them.
+    let api = crate::config::ModelPolicyLane::Api;
+    assert_eq!(
+        control
+            .resolve_child_service_tier(Some(api), /*configured_service_tier*/ None)
+            .expect("a flex-era API child still starts Standard"),
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
+    );
+    control
+        .resolve_child_service_tier(Some(api), Some("flex"))
+        .expect_err("role-derived flex must be rejected for a child");
+
+    control.set_root_service_tier(Some("priority".to_string()));
+    assert_eq!(
+        control
+            .resolve_child_service_tier(Some(lane), Some("default"))
+            .expect("a managed child capture must ignore the root Priority tier")
+            .as_deref(),
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+    );
+    control.set_root_service_tier(Some("flex".to_string()));
+    assert_eq!(
+        control
+            .resolve_child_service_tier(Some(api), Some("default"))
+            .expect("a managed child resume must ignore the root Flex tier")
+            .as_deref(),
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+    );
+    assert_eq!(
+        control
+            .resolve_child_service_tier(/*lane*/ None, Some("default"))
+            .expect("unmanaged children must retain Alpha 4 root-tier inheritance")
+            .as_deref(),
+        Some("flex")
+    );
+    control
+        .resolve_child_service_tier(Some(crate::config::ModelPolicyLane::Spark), Some("default"))
+        .expect_err("Spark must continue rejecting non-root sessions");
 }

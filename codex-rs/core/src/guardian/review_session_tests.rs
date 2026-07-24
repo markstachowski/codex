@@ -608,6 +608,22 @@ async fn guardian_review_session_config_disables_hooks() {
     assert!(!guardian_config.features.enabled(Feature::CodexHooks));
 }
 
+#[test]
+fn managed_guardian_review_clears_parent_service_tier() {
+    assert_eq!(
+        guardian_service_tier_for_lane(
+            Some("priority".to_string()),
+            Some(ModelPolicyLane::Subscription),
+        )
+        .as_deref(),
+        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+    );
+    assert_eq!(
+        guardian_service_tier_for_lane(Some("priority".to_string()), None).as_deref(),
+        Some("priority")
+    );
+}
+
 #[tokio::test]
 async fn guardian_review_session_config_disables_skill_instructions() {
     let mut parent_config = crate::config::test_config().await;

@@ -61,6 +61,7 @@ async fn older_server_notice_falls_back_in_short_overview() {
 }
 use crate::app::agents_overview_view::AgentsOverviewFocus;
 use crate::app::test_support::make_test_app;
+use crate::app::test_support::make_test_app_with_event_receiver;
 use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::bottom_pane::BottomPaneView;
 use crate::bottom_pane::CancellationEvent;
@@ -1593,6 +1594,78 @@ async fn filtered_dashboard_actions_use_configured_shortcuts() {
         Ok(AppEvent::SelectAgentsOverviewThread { thread_id }) if thread_id == second
     ));
     assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn invalid_managed_defaults_restore_background_task_draft_and_fail_closed() -> Result<()> {
+    let (mut app, mut app_event_rx) = make_test_app_with_event_receiver().await;
+    app.sync_agents_overview_composer();
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let loaded_before = app_server
+        .thread_loaded_list(ThreadLoadedListParams::default())
+        .await?;
+    while app_event_rx.try_recv().is_ok() {}
+
+    let mut prompt: crate::chatwidget::UserMessage = "Keep this background-task draft".into();
+    prompt
+        .local_images
+        .push(crate::bottom_pane::LocalImageAttachment {
+            placeholder: "[Image #1]".to_string(),
+            path: test_path_buf("draft-image.png"),
+        });
+    app.start_agents_overview_task_with_config(
+        &mut app_server,
+        prompt.clone(),
+        /*remote_cwd*/ None,
+        Err(std::io::Error::other("managed-defaults-sentinel")),
+    )
+    .await;
+
+    {
+        let state = app.agents_overview.view_state.lock().unwrap();
+        let composer = state.composer.as_ref().expect("retained task composer");
+        assert_eq!(composer.current_text_with_pending(), prompt.text);
+        assert_eq!(
+            composer.local_image_paths(),
+            vec![prompt.local_images[0].path.clone()]
+        );
+    }
+    assert!(app.agents_overview.dispatched_requests.is_empty());
+    assert_eq!(
+        app_server
+            .thread_loaded_list(ThreadLoadedListParams::default())
+            .await?,
+        loaded_before,
+        "invalid managed defaults must not start a background thread"
+    );
+    let error_cell = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .expect("managed defaults failure should insert an error cell");
+    let rendered = error_cell
+        .display_lines(/*width*/ 80)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("managed-defaults-sentinel"));
+    insta::with_settings!({snapshot_path => "../snapshots"}, {
+        insta::assert_snapshot!(
+            "agents_overview_invalid_managed_defaults",
+            rendered
+        );
+    });
+
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]

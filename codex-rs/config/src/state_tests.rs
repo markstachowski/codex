@@ -346,6 +346,47 @@ fn layer_iterators_preserve_precedence_and_disabled_layers() {
 }
 
 #[test]
+fn without_additional_developer_instructions_preserves_stack_metadata_and_other_requirements() {
+    let layer = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str(r#"model = "configured-model""#).expect("session config"),
+    );
+    let requirements = ConfigRequirements {
+        additional_developer_instructions: Some(crate::Sourced::new(
+            "parent-managed instructions".to_string(),
+            crate::RequirementSource::Unknown,
+        )),
+        check_for_update_on_startup: Some(crate::Sourced::new(
+            false,
+            crate::RequirementSource::Unknown,
+        )),
+        ..Default::default()
+    };
+    let mut requirements_toml = ConfigRequirementsToml {
+        additional_developer_instructions: Some("parent-managed instructions".to_string()),
+        check_for_update_on_startup: Some(false),
+        ..Default::default()
+    };
+    let stack = ConfigLayerStack::new(vec![layer], requirements, requirements_toml.clone())
+        .expect("layer stack should be valid")
+        .with_user_and_project_exec_policy_rules_ignored(true)
+        .with_startup_warnings(vec!["preserved warning".to_string()]);
+    let mut expected = stack.clone();
+    expected.requirements.additional_developer_instructions = None;
+    requirements_toml.additional_developer_instructions = None;
+    expected.requirements_toml = requirements_toml;
+
+    assert_eq!(stack.without_additional_developer_instructions(), expected);
+    assert!(
+        stack
+            .requirements()
+            .additional_developer_instructions
+            .is_some(),
+        "the source stack should remain unchanged"
+    );
+}
+
+#[test]
 fn with_user_config_updates_matching_user_layer_without_replacing_active_profile() {
     let temp_dir = TempDir::new().expect("tempdir");
     let base_file = test_user_config_path(&temp_dir, "config.toml");

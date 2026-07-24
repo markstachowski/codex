@@ -285,9 +285,10 @@ impl ChatWidget {
                     });
                 }
             } else if effort_for_action == Some(ReasoningEffortConfig::Ultra) {
-                tx.send(AppEvent::ApplyAdvancedReasoning {
+                tx.send(AppEvent::ApplyThreadModelSelection {
                     model: model_for_action.clone(),
-                    effort: ReasoningEffortConfig::Ultra,
+                    effort: Some(ReasoningEffortConfig::Ultra),
+                    scope: crate::app_event::ModelSelectionScope::Conversation,
                 });
             } else if should_prompt_plan_mode_scope {
                 tx.send(AppEvent::OpenPlanReasoningScopePrompt {
@@ -295,11 +296,10 @@ impl ChatWidget {
                     effort: effort_for_action.clone(),
                 });
             } else {
-                tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-                tx.send(AppEvent::UpdateReasoningEffort(effort_for_action.clone()));
-                tx.send(AppEvent::PersistModelSelection {
+                tx.send(AppEvent::ApplyThreadModelSelection {
                     model: model_for_action.clone(),
                     effort: effort_for_action.clone(),
+                    scope: crate::app_event::ModelSelectionScope::Conversation,
                 });
             }
             if let Some(warning) = warning.clone() {
@@ -383,9 +383,11 @@ impl ChatWidget {
             let effort = effort.clone();
             let warning = warning.clone();
             move |tx| {
-                tx.send(AppEvent::UpdateModel(model.clone()));
-                tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort.clone()));
-                tx.send(AppEvent::PersistPlanModeReasoningEffort(effort.clone()));
+                tx.send(AppEvent::ApplyThreadModelSelection {
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    scope: crate::app_event::ModelSelectionScope::PlanOnly,
+                });
                 if let Some(warning) = warning.clone() {
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_warning_event(warning),
@@ -394,13 +396,10 @@ impl ChatWidget {
             }
         })];
         let all_modes_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::UpdateModel(model.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort.clone()));
-            tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort.clone()));
-            tx.send(AppEvent::PersistPlanModeReasoningEffort(effort.clone()));
-            tx.send(AppEvent::PersistModelSelection {
+            tx.send(AppEvent::ApplyThreadModelSelection {
                 model: model.clone(),
                 effort: effort.clone(),
+                scope: crate::app_event::ModelSelectionScope::ConversationAndPlan,
             });
             if let Some(warning) = warning.clone() {
                 tx.send(AppEvent::InsertHistoryCell(Box::new(

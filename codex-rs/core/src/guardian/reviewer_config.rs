@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use codex_features::Feature;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ModelMessages;
 use tracing::warn;
@@ -11,9 +12,11 @@ use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::NetworkProxySpec;
 use crate::config::TokenBudgetConfig;
+use crate::config::locked_model_policy_lane;
 
 use super::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 use super::prompt::guardian_policy_prompt_with_config_and_template;
+use super::review_session::guardian_service_tier_for_lane;
 
 /// Builds the existing read-only reviewer configuration with its policy and live network rules.
 pub fn build_guardian_review_session_config(
@@ -45,6 +48,10 @@ pub fn build_guardian_review_session_config(
         guardian_config.token_budget_startup_config = None;
         guardian_config.token_budget = Some(TokenBudgetConfig::default());
     }
+    guardian_config.service_tier = guardian_service_tier_for_lane(
+        parent_config.service_tier.clone(),
+        locked_model_policy_lane()?,
+    );
     let catalog_auto_review = model_messages.and_then(|messages| messages.auto_review.as_ref());
     let tenant_policy_config = parent_config.resolve_guardian_policy(model_messages);
     let policy_template = catalog_auto_review
@@ -59,6 +66,9 @@ pub fn build_guardian_review_session_config(
     guardian_config.developer_instructions = overrides.developer_instructions;
     guardian_config.permissions.approval_policy =
         Constrained::allow_only(overrides.approval_policy);
+    guardian_config.config_layer_stack = guardian_config
+        .config_layer_stack
+        .without_additional_developer_instructions();
     guardian_config
         .permissions
         .set_permission_profile(overrides.permission_profile)
@@ -88,6 +98,22 @@ pub fn build_guardian_review_session_config(
             network_constraints,
             guardian_config.permissions.permission_profile(),
         )?);
+    }
+    let opaque_parent_compaction = Feature::GuardianReuseParentCompaction;
+    guardian_config
+        .features
+        .disable(opaque_parent_compaction)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "guardian review session could not disable `features.{}`: {err}",
+                opaque_parent_compaction.key()
+            )
+        })?;
+    if guardian_config.features.enabled(opaque_parent_compaction) {
+        return Err(anyhow::anyhow!(
+            "guardian review session cannot isolate parent authority while `features.{}` is pinned on",
+            opaque_parent_compaction.key()
+        ));
     }
     for feature in overrides.disabled_features {
         guardian_config.features.disable(feature).map_err(|err| {

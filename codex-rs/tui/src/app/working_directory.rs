@@ -15,6 +15,10 @@ enum DestinationConfig {
     Prepared(Box<Config>),
 }
 
+#[cfg(test)]
+#[path = "working_directory_tests.rs"]
+mod tests;
+
 /// Session and configuration prepared before the event loop attaches a managed checkout.
 pub(super) struct ManagedWorktreeAttach {
     started: AppServerStartedThread,
@@ -321,13 +325,17 @@ impl App {
                 return self.working_directory_error("Active background terminals block /cd.");
             }
         }
-        if is_new_worktree {
-            apply_managed_new_thread_defaults(
+        if is_new_worktree
+            && let Err(error) = apply_managed_new_thread_defaults(
                 &mut config,
                 app_server.managed_new_thread_defaults(),
                 &self.cli_kv_overrides,
                 &self.harness_overrides,
-            );
+            )
+        {
+            return self.working_directory_error(format!(
+                "Failed to validate managed new-worktree defaults: {error}"
+            ));
         }
         let preserve_history = has_rollout && !is_new_worktree;
         let transitioned = if preserve_history {
