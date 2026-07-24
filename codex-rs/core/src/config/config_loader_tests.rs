@@ -3170,6 +3170,167 @@ async fn codex_home_is_not_loaded_as_project_layer_from_home_dir() -> std::io::R
 }
 
 #[tokio::test]
+async fn platform_default_codex_home_is_not_loaded_with_alternate_codex_home() -> std::io::Result<()>
+{
+    let tmp = tempdir()?;
+    let home_dir = tmp.path().join("home");
+    let platform_default_codex_home = home_dir.join(".codex");
+    let alternate_codex_home = home_dir.join(".codex-api");
+    tokio::fs::create_dir_all(&platform_default_codex_home).await?;
+    tokio::fs::create_dir_all(&alternate_codex_home).await?;
+    tokio::fs::write(
+        platform_default_codex_home.join(CONFIG_TOML_FILE),
+        r#"foo = "default-user"
+model_provider = "must-not-become-project-local"
+"#,
+    )
+    .await?;
+    tokio::fs::write(
+        alternate_codex_home.join(CONFIG_TOML_FILE),
+        r#"foo = "alternate-user"
+forced_login_method = "api"
+"#,
+    )
+    .await?;
+
+    let cwd = AbsolutePathBuf::from_absolute_path(&home_dir)?;
+    let layers = load_config_layers_state(
+        LOCAL_FS.as_ref(),
+        &alternate_codex_home,
+        Some(cwd),
+        &[] as &[(String, TomlValue)],
+        LoaderOverrides {
+            platform_default_codex_home: Some(AbsolutePathBuf::from_absolute_path(
+                &platform_default_codex_home,
+            )?),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        },
+        &codex_config::NoopThreadConfigLoader,
+    )
+    .await?;
+
+    let has_project_layer = layers
+        .all_layers_high_to_low()
+        .any(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }));
+    assert!(!has_project_layer);
+    assert_eq!(
+        layers.effective_config().get("foo"),
+        Some(&TomlValue::String("alternate-user".to_string()))
+    );
+    assert_eq!(
+        layers.effective_config().get("forced_login_method"),
+        Some(&TomlValue::String("api".to_string()))
+    );
+    let empty_warnings: &[String] = &[];
+    assert_eq!(layers.startup_warnings(), Some(empty_warnings));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alternate_codex_homes_skip_additional_user_home_but_load_repo_layer() -> std::io::Result<()>
+{
+    for alternate_home_name in [".codex-api", ".codex-spark"] {
+        let tmp = tempdir()?;
+        let primary_home = tmp.path().join("home/mark");
+        let platform_default_codex_home = primary_home.join(".codex");
+        let alternate_codex_home = primary_home.join(alternate_home_name);
+        let second_user_home = tmp.path().join("mnt/c/Users/Mark");
+        let second_user_codex_home = second_user_home.join(".codex");
+        let project_root = second_user_home.join("Code/project");
+        let nested = project_root.join("src");
+        let project_dot_codex = project_root.join(".codex");
+        tokio::fs::create_dir_all(&platform_default_codex_home).await?;
+        tokio::fs::create_dir_all(&alternate_codex_home).await?;
+        tokio::fs::create_dir_all(&second_user_codex_home).await?;
+        tokio::fs::create_dir_all(&nested).await?;
+        tokio::fs::create_dir_all(&project_dot_codex).await?;
+        tokio::fs::create_dir_all(project_root.join(".git")).await?;
+        tokio::fs::write(
+            platform_default_codex_home.join(CONFIG_TOML_FILE),
+            r#"foo = "primary-user"
+"#,
+        )
+        .await?;
+        tokio::fs::write(
+            second_user_codex_home.join(CONFIG_TOML_FILE),
+            r#"foo = "second-user"
+model_provider = "must-not-become-project-local"
+"#,
+        )
+        .await?;
+        make_config_for_test(
+            &alternate_codex_home,
+            &project_root,
+            TrustLevel::Trusted,
+            /*project_root_markers*/ None,
+        )
+        .await?;
+        let alternate_config_path = alternate_codex_home.join(CONFIG_TOML_FILE);
+        let alternate_config = tokio::fs::read_to_string(&alternate_config_path).await?;
+        tokio::fs::write(
+            alternate_config_path,
+            format!(
+                r#"foo = "alternate-user"
+{alternate_config}"#
+            ),
+        )
+        .await?;
+        tokio::fs::write(
+            project_dot_codex.join(CONFIG_TOML_FILE),
+            r#"foo = "project"
+"#,
+        )
+        .await?;
+
+        let cwd = AbsolutePathBuf::from_absolute_path(&nested)?;
+        let layers = load_config_layers_state(
+            LOCAL_FS.as_ref(),
+            &alternate_codex_home,
+            Some(cwd),
+            &[] as &[(String, TomlValue)],
+            LoaderOverrides {
+                platform_default_codex_home: Some(AbsolutePathBuf::from_absolute_path(
+                    &platform_default_codex_home,
+                )?),
+                project_layer_excluded_user_config_homes: Some(vec![
+                    AbsolutePathBuf::from_absolute_path(&second_user_codex_home)?,
+                ]),
+                ..LoaderOverrides::without_managed_config_for_tests()
+            },
+            &codex_config::NoopThreadConfigLoader,
+        )
+        .await?;
+
+        let project_layers: Vec<_> = layers
+            .layers_high_to_low()
+            .filter(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+            .collect();
+        assert_eq!(project_layers.len(), 1, "lane {alternate_home_name}");
+        assert_eq!(
+            project_layers[0].name,
+            ConfigLayerSource::Project {
+                dot_codex_folder: AbsolutePathBuf::from_absolute_path(&project_dot_codex)?,
+            },
+            "lane {alternate_home_name}"
+        );
+        assert_eq!(
+            layers.effective_config().get("foo"),
+            Some(&TomlValue::String("project".to_string())),
+            "lane {alternate_home_name}"
+        );
+        let empty_warnings: &[String] = &[];
+        assert_eq!(
+            layers.startup_warnings(),
+            Some(empty_warnings),
+            "lane {alternate_home_name}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn codex_home_within_project_tree_is_not_double_loaded() -> std::io::Result<()> {
     let tmp = tempdir()?;
     let project_root = tmp.path().join("project");

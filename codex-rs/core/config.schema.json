@@ -2867,6 +2867,13 @@
       "minLength": 1,
       "type": "string"
     },
+    "ReasoningMode": {
+      "description": "Selects an API reasoning mode independently from reasoning effort.",
+      "enum": [
+        "pro"
+      ],
+      "type": "string"
+    },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
       "oneOf": [
@@ -5648,6 +5655,9 @@
     },
     "model_reasoning_effort": {
       "$ref": "#/definitions/ReasoningEffort"
+    },
+    "model_reasoning_mode": {
+      "$ref": "#/definitions/ReasoningMode"
     },
     "model_reasoning_summary": {
       "$ref": "#/definitions/ReasoningSummary"

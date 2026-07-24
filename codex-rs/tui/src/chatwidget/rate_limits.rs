@@ -371,24 +371,11 @@ impl ChatWidget {
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
 
         let switch_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::CodexOp(AppCommand::override_turn_context(
-                /*cwd*/ None,
-                /*approval_policy*/ None,
-                /*approvals_reviewer*/ None,
-                /*permission_profile*/ None,
-                /*active_permission_profile*/ None,
-                /*windows_sandbox_level*/ None,
-                Some(switch_model_for_events.clone()),
-                Some(Some(default_effort.clone())),
-                /*summary*/ None,
-                /*service_tier*/ None,
-                /*collaboration_mode*/ None,
-                /*personality*/ None,
-            )));
-            tx.send(AppEvent::UpdateModel(switch_model_for_events.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(Some(
-                default_effort.clone(),
-            )));
+            tx.send(AppEvent::ApplyThreadModelSelection {
+                model: switch_model_for_events.clone(),
+                effort: Some(default_effort.clone()),
+                scope: crate::app_event::ModelSelectionScope::Conversation,
+            });
         })];
 
         let keep_actions: Vec<SelectionAction> = Vec::new();

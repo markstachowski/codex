@@ -4427,6 +4427,231 @@ async fn turn_context_with_model_updates_model_fields() {
     );
 }
 
+struct ModelPolicyLaneEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ModelPolicyLaneEnvGuard {
+    fn unset() -> Self {
+        let previous = std::env::var_os(crate::config::MODEL_POLICY_LANE_ENV);
+        // SAFETY: this test is serialized and restores the process environment on drop.
+        unsafe { std::env::remove_var(crate::config::MODEL_POLICY_LANE_ENV) };
+        Self { previous }
+    }
+}
+
+impl Drop for ModelPolicyLaneEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: this test is serialized and restores the exact prior value.
+        unsafe {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(crate::config::MODEL_POLICY_LANE_ENV, value),
+                None => std::env::remove_var(crate::config::MODEL_POLICY_LANE_ENV),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn shared_settings_apply_path_rejects_unlisted_subscription_model() {
+    let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+    let (session, _turn_context) = make_session_and_context().await;
+    // SAFETY: this test is serialized and `_lane_guard` restores the prior value.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        )
+    };
+
+    let original = session.collaboration_mode().await;
+    let invalid_model_update = SessionSettingsUpdate {
+        collaboration_mode: Some(original.with_updates(
+            Some("not-in-the-picker".to_string()),
+            Some(Some(ReasoningEffortConfig::High)),
+            /*developer_instructions*/ None,
+        )),
+        ..Default::default()
+    };
+    for result in [
+        session
+            .preview_settings_for_lane(
+                &invalid_model_update,
+                Some(crate::config::ModelPolicyLane::Subscription),
+            )
+            .await
+            .map(|_| ()),
+        session
+            .apply_settings_update_for_lane(
+                &invalid_model_update,
+                Some(crate::config::ModelPolicyLane::Subscription),
+            )
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            result.is_err(),
+            "preview and apply must share locked validation"
+        );
+    }
+
+    let error = session
+        .new_turn_with_sub_id("invalid-model".to_string(), invalid_model_update)
+        .await
+        .expect_err("new_turn_with_sub_id must use the shared settings validator");
+    assert!(error.to_string().contains("not present and visible"));
+    assert_eq!(session.collaboration_mode().await, original);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn managed_root_fast_settings_preview_apply_round_trip() {
+    let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+    let (subscription_session, _turn_context) = make_session_and_context().await;
+    // SAFETY: this test is serialized and `_lane_guard` restores the prior value.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        )
+    };
+
+    for service_tier in ["priority", SERVICE_TIER_DEFAULT_REQUEST_VALUE] {
+        let update = SessionSettingsUpdate {
+            service_tier: Some(Some(service_tier.to_string())),
+            ..Default::default()
+        };
+        let preview = subscription_session
+            .preview_settings_for_lane(&update, Some(crate::config::ModelPolicyLane::Subscription))
+            .await
+            .expect("subscription root service-tier preview should succeed");
+        assert_eq!(preview.service_tier.as_deref(), Some(service_tier));
+
+        subscription_session
+            .apply_settings_update_for_lane(
+                &update,
+                Some(crate::config::ModelPolicyLane::Subscription),
+            )
+            .await
+            .expect("subscription root service-tier apply should succeed");
+        let applied = subscription_session.thread_config_snapshot().await;
+        assert_eq!(applied.service_tier.as_deref(), Some(service_tier));
+    }
+
+    unsafe { std::env::remove_var(crate::config::MODEL_POLICY_LANE_ENV) };
+    let (api_session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.model = Some(crate::config::SOL_MODEL.to_string());
+            config.model_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
+            config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
+            config.model_reasoning_mode = Some(codex_protocol::config_types::ReasoningMode::Pro);
+            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            config
+                .features
+                .enable(Feature::FastMode)
+                .expect("Fast is a known feature");
+        },
+    )
+    .await;
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Api.as_str(),
+        )
+    };
+    for service_tier in ["priority", SERVICE_TIER_DEFAULT_REQUEST_VALUE] {
+        let update = SessionSettingsUpdate {
+            service_tier: Some(Some(service_tier.to_string())),
+            ..Default::default()
+        };
+        let preview = api_session
+            .preview_settings_for_lane(&update, Some(crate::config::ModelPolicyLane::Api))
+            .await
+            .expect("API root service-tier preview should succeed");
+        assert_eq!(preview.service_tier.as_deref(), Some(service_tier));
+
+        api_session
+            .apply_settings_update_for_lane(&update, Some(crate::config::ModelPolicyLane::Api))
+            .await
+            .expect("API root service-tier apply should succeed");
+        let applied = api_session.thread_config_snapshot().await;
+        assert_eq!(applied.service_tier.as_deref(), Some(service_tier));
+    }
+}
+
+#[tokio::test]
+async fn locked_new_root_defaults_are_lane_specific() {
+    let histories = [
+        InitialHistory::New,
+        InitialHistory::Cleared,
+        InitialHistory::Forked(Vec::new()),
+    ];
+
+    for lane in [
+        crate::config::ModelPolicyLane::Subscription,
+        crate::config::ModelPolicyLane::Api,
+        crate::config::ModelPolicyLane::Spark,
+    ] {
+        for history in &histories {
+            assert_eq!(
+                locked_new_root_inference_defaults_for_lane(
+                    history,
+                    &SessionSource::Cli,
+                    Some(lane),
+                ),
+                Some((lane.required_model(), lane.required_local_effort()))
+            );
+
+            let mut config = crate::config::test_config().await;
+            config.service_tier = Some("priority".to_string());
+            apply_locked_new_root_inference_defaults_for_lane(
+                &mut config,
+                history,
+                &SessionSource::Cli,
+                Some(lane),
+            );
+            assert_eq!(
+                config.service_tier.as_deref(),
+                Some(lane.required_root_service_tier()),
+                "lane: {}, history: {history:?}",
+                lane.as_str()
+            );
+        }
+    }
+
+    assert_eq!(
+        locked_new_root_inference_defaults_for_lane(
+            &InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::new(),
+                history: Arc::new(Vec::new()),
+                rollout_path: None,
+            }),
+            &SessionSource::Cli,
+            Some(crate::config::ModelPolicyLane::Subscription),
+        ),
+        None
+    );
+    assert_eq!(
+        locked_new_root_inference_defaults_for_lane(
+            &InitialHistory::New,
+            &SessionSource::SubAgent(SubAgentSource::Review),
+            Some(crate::config::ModelPolicyLane::Subscription),
+        ),
+        None
+    );
+    assert_eq!(
+        locked_new_root_inference_defaults_for_lane(
+            &InitialHistory::New,
+            &SessionSource::Cli,
+            /*lane*/ None,
+        ),
+        None
+    );
+}
+
 #[test]
 fn falls_back_to_content_when_structured_is_null() {
     let ctr = McpCallToolResult {
