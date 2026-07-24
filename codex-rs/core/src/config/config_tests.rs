@@ -224,6 +224,259 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn load_config_retains_reasoning_mode() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config = Config::load_from_base_config_with_overrides(
+        toml::from_str(r#"model_reasoning_mode = "pro""#).expect("parse reasoning mode config"),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.model_reasoning_mode, Some(ReasoningMode::Pro));
+    Ok(())
+}
+
+#[test]
+fn rejects_unknown_reasoning_mode() {
+    let error = toml::from_str::<ConfigToml>(r#"model_reasoning_mode = "fast""#)
+        .expect_err("unknown reasoning modes must be rejected");
+
+    assert!(error.to_string().contains("unknown variant `fast`"));
+}
+
+#[test]
+fn locked_model_policy_lane_contracts_are_exact() {
+    let cases = [
+        (
+            ModelPolicyLane::Subscription,
+            SOL_MODEL,
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Max,
+            None,
+            ForcedLoginMethod::Chatgpt,
+            true,
+            MultiAgentVersion::V2,
+            true,
+            true,
+            true,
+        ),
+        (
+            ModelPolicyLane::Api,
+            SOL_MODEL,
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Max,
+            Some(ReasoningMode::Pro),
+            ForcedLoginMethod::Api,
+            true,
+            MultiAgentVersion::V2,
+            false,
+            true,
+            true,
+        ),
+        (
+            ModelPolicyLane::Spark,
+            SPARK_MODEL,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::XHigh,
+            None,
+            ForcedLoginMethod::Chatgpt,
+            false,
+            MultiAgentVersion::Disabled,
+            false,
+            false,
+            false,
+        ),
+    ];
+
+    for (
+        lane,
+        model,
+        local_effort,
+        wire_effort,
+        mode,
+        login,
+        multi_agent,
+        version,
+        allows_user_model_selection,
+        allows_user_service_tier_selection,
+        allows_non_root_sessions,
+    ) in cases
+    {
+        assert_eq!(lane.required_model(), model);
+        assert_eq!(lane.required_review_model(), SOL_MODEL);
+        assert_eq!(lane.required_local_effort(), local_effort);
+        assert_eq!(lane.required_wire_effort(), wire_effort);
+        assert_eq!(lane.required_reasoning_mode(), mode);
+        assert_eq!(lane.required_login_method(), login);
+        assert_eq!(lane.multi_agent_enabled(), multi_agent);
+        assert_eq!(lane.required_multi_agent_version(), version);
+        assert_eq!(
+            lane.allows_user_model_selection(),
+            allows_user_model_selection
+        );
+        assert_eq!(
+            lane.allows_user_service_tier_selection(),
+            allows_user_service_tier_selection
+        );
+        let expected_new_root_tier = if lane == ModelPolicyLane::Api {
+            ServiceTier::Fast.request_value()
+        } else {
+            SERVICE_TIER_DEFAULT_REQUEST_VALUE
+        };
+        assert_eq!(lane.required_root_service_tier(), expected_new_root_tier);
+        assert_eq!(
+            lane.required_config_service_tier(),
+            (lane == ModelPolicyLane::Api).then_some(ServiceTier::Fast.request_value())
+        );
+        assert_eq!(lane.allows_non_root_sessions(), allows_non_root_sessions);
+    }
+}
+
+#[test]
+fn locked_model_policy_lane_resolution_requires_managed_marker() {
+    assert_eq!(
+        resolve_locked_model_policy_lane(None, /*require_marker*/ false)
+            .expect("unmanaged debug/test execution may omit the lane marker"),
+        None
+    );
+    let error = resolve_locked_model_policy_lane(None, /*require_marker*/ true)
+        .expect_err("managed release execution must not invent a subscription lane");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains(MODEL_POLICY_LANE_ENV));
+
+    for (value, expected) in [
+        ("subscription", ModelPolicyLane::Subscription),
+        ("api", ModelPolicyLane::Api),
+        ("spark", ModelPolicyLane::Spark),
+    ] {
+        assert_eq!(
+            resolve_locked_model_policy_lane(Some(value), /*require_marker*/ true)
+                .expect("known managed lane marker"),
+            Some(expected)
+        );
+    }
+    resolve_locked_model_policy_lane(Some("automatic"), /*require_marker*/ true)
+        .expect_err("unknown lanes must fail visibly");
+}
+
+#[test]
+fn locked_model_policy_bootstrap_service_tiers_are_lane_specific() {
+    for accepted in [None, Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)] {
+        assert!(
+            ModelPolicyLane::Subscription.allows_bootstrap_service_tier(accepted),
+            "subscription should accept {accepted:?}"
+        );
+        assert!(
+            ModelPolicyLane::Spark.allows_bootstrap_service_tier(accepted),
+            "Spark should accept {accepted:?}"
+        );
+    }
+
+    for rejected in [Some(ServiceTier::Fast.request_value()), Some("flex")] {
+        assert!(
+            !ModelPolicyLane::Subscription.allows_bootstrap_service_tier(rejected),
+            "subscription should reject {rejected:?}"
+        );
+        assert!(
+            !ModelPolicyLane::Spark.allows_bootstrap_service_tier(rejected),
+            "Spark should reject {rejected:?}"
+        );
+    }
+
+    assert!(
+        ModelPolicyLane::Api.allows_bootstrap_service_tier(Some(ServiceTier::Fast.request_value()))
+    );
+    for rejected in [None, Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE), Some("flex")] {
+        assert!(
+            !ModelPolicyLane::Api.allows_bootstrap_service_tier(rejected),
+            "API should reject {rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn locked_model_policy_scopes_fast_to_explicit_subscription_and_api_roots() {
+    for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
+        lane.validate_service_tier(
+            Some(ServiceTier::Fast.request_value()),
+            /*allow_user_service_tier_selection*/ true,
+        )
+        .expect("an explicit subscription or API root may enable Fast");
+    }
+
+    for (lane, allow_user_service_tier_selection) in [
+        (ModelPolicyLane::Subscription, false),
+        (ModelPolicyLane::Spark, true),
+    ] {
+        lane.validate_service_tier(
+            Some(ServiceTier::Fast.request_value()),
+            allow_user_service_tier_selection,
+        )
+        .expect_err("children and Spark must reject Fast");
+    }
+
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        lane.validate_service_tier(
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+            /*allow_user_service_tier_selection*/ false,
+        )
+        .expect("all managed sessions may explicitly select Standard");
+        lane.validate_service_tier(None, /*allow_user_service_tier_selection*/ false)
+            .expect("an absent tier remains Standard at the request boundary");
+    }
+}
+
+#[test]
+fn locked_model_policy_allows_only_root_subscription_model_selection() {
+    ModelPolicyLane::Subscription
+        .validate_model_and_effort(
+            "gpt-5.5",
+            Some(&ReasoningEffort::High),
+            /*allow_user_model_selection*/ true,
+        )
+        .expect("the subscription root may explicitly select another catalog model");
+
+    let child_error = ModelPolicyLane::Subscription
+        .validate_model_and_effort(
+            "gpt-5.5",
+            Some(&ReasoningEffort::High),
+            /*allow_user_model_selection*/ false,
+        )
+        .expect_err("a non-root subscription session must remain on Sol/Ultra");
+    assert!(child_error.to_string().contains("required `gpt-5.6-sol`"));
+
+    let api_error = ModelPolicyLane::Api
+        .validate_model_and_effort(
+            "gpt-5.5",
+            Some(&ReasoningEffort::High),
+            /*allow_user_model_selection*/ true,
+        )
+        .expect_err("the API lane never permits a model override");
+    assert!(api_error.to_string().contains("required `gpt-5.6-sol`"));
+
+    for reserved_model in [
+        SPARK_MODEL,
+        "codex-auto-balanced",
+        "openai/codex-auto-balanced",
+        "CODEX-AUTO-BALANCED",
+    ] {
+        let error = ModelPolicyLane::Subscription
+            .validate_model_and_effort(
+                reserved_model,
+                Some(&ReasoningEffort::High),
+                /*allow_user_model_selection*/ true,
+            )
+            .expect_err("Spark and automatic routing stay outside the ordinary picker");
+        assert!(error.to_string().contains("reserved model"));
+    }
+}
+
+#[tokio::test]
 async fn test_toml_parsing() {
     let history_with_persistence = r#"
 [history]

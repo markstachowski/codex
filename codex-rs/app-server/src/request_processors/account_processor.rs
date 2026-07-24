@@ -5,6 +5,8 @@ use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
 use chrono::DateTime;
 use codex_app_server_protocol::DesktopOnboardingEntrypoint;
+use codex_core::config::ModelPolicyLane;
+use codex_core::config::locked_model_policy_lane;
 use codex_login::LoginOnboardingEntrypoint;
 use codex_model_provider::is_supported_amazon_bedrock_region;
 
@@ -63,6 +65,42 @@ enum RefreshTokenRequestOutcome {
     FailedPermanently,
 }
 
+fn validate_locked_account_login(
+    lane: ModelPolicyLane,
+    params: &LoginAccountParams,
+) -> Result<(), JSONRPCErrorError> {
+    let allowed = match lane {
+        ModelPolicyLane::Subscription => matches!(
+            params,
+            LoginAccountParams::Chatgpt { .. } | LoginAccountParams::ChatgptDeviceCode
+        ),
+        ModelPolicyLane::Api => matches!(params, LoginAccountParams::ApiKey { .. }),
+        ModelPolicyLane::Spark => false,
+    };
+    if allowed {
+        return Ok(());
+    }
+
+    Err(invalid_request(format!(
+        "{} policy lane rejects this account login method",
+        lane.as_str()
+    )))
+}
+
+fn validate_locked_account_logout(lane: ModelPolicyLane) -> Result<(), JSONRPCErrorError> {
+    if matches!(lane, ModelPolicyLane::Spark) {
+        return Err(invalid_request(
+            "spark policy lane shares subscription authentication; use the subscription lane to log out",
+        ));
+    }
+    Ok(())
+}
+
+fn locked_account_policy_lane() -> Result<Option<ModelPolicyLane>, JSONRPCErrorError> {
+    locked_model_policy_lane()
+        .map_err(|err| invalid_request(format!("invalid model policy lane: {err}")))
+}
+
 impl Drop for ActiveLogin {
     fn drop(&mut self) {
         self.cancel();
@@ -102,6 +140,9 @@ impl AccountRequestProcessor {
         request_id: ConnectionRequestId,
         params: LoginAccountParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if let Some(lane) = locked_account_policy_lane()? {
+            validate_locked_account_login(lane, &params)?;
+        }
         self.login_v2(request_id, params).await.map(|()| None)
     }
 
@@ -109,6 +150,9 @@ impl AccountRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if let Some(lane) = locked_account_policy_lane()? {
+            validate_locked_account_logout(lane)?;
+        }
         self.logout_v2(request_id).await.map(|()| None)
     }
 
@@ -1400,6 +1444,50 @@ mod tests {
     use codex_backend_client::TokenUsageProfileDailyBucket;
     use codex_backend_client::TokenUsageProfileStats;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn locked_account_policy_enforces_lane_auth_boundaries() {
+        let chatgpt = LoginAccountParams::Chatgpt {
+            codex_streamlined_login: false,
+            use_hosted_login_success_page: false,
+            app_brand: None,
+        };
+        let device_code = LoginAccountParams::ChatgptDeviceCode;
+        let api_key = LoginAccountParams::ApiKey {
+            api_key: "test-api-key".to_string(),
+        };
+        let access_token = LoginAccountParams::ChatgptAuthTokens {
+            access_token: "test-access-token".to_string(),
+            chatgpt_account_id: "test-account".to_string(),
+            chatgpt_plan_type: None,
+        };
+        let bedrock = LoginAccountParams::AmazonBedrock {
+            api_key: "test-bedrock-key".to_string(),
+            region: "us-east-1".to_string(),
+        };
+
+        assert!(validate_locked_account_login(ModelPolicyLane::Subscription, &chatgpt).is_ok());
+        assert!(validate_locked_account_login(ModelPolicyLane::Subscription, &device_code).is_ok());
+        assert!(validate_locked_account_login(ModelPolicyLane::Subscription, &api_key).is_err());
+        assert!(
+            validate_locked_account_login(ModelPolicyLane::Subscription, &access_token).is_err()
+        );
+        assert!(validate_locked_account_login(ModelPolicyLane::Subscription, &bedrock).is_err());
+
+        assert!(validate_locked_account_login(ModelPolicyLane::Api, &api_key).is_ok());
+        assert!(validate_locked_account_login(ModelPolicyLane::Api, &chatgpt).is_err());
+        assert!(validate_locked_account_login(ModelPolicyLane::Api, &device_code).is_err());
+        assert!(validate_locked_account_login(ModelPolicyLane::Api, &access_token).is_err());
+        assert!(validate_locked_account_login(ModelPolicyLane::Api, &bedrock).is_err());
+
+        for params in [&chatgpt, &device_code, &api_key, &access_token, &bedrock] {
+            assert!(validate_locked_account_login(ModelPolicyLane::Spark, params).is_err());
+        }
+
+        assert!(validate_locked_account_logout(ModelPolicyLane::Subscription).is_ok());
+        assert!(validate_locked_account_logout(ModelPolicyLane::Api).is_ok());
+        assert!(validate_locked_account_logout(ModelPolicyLane::Spark).is_err());
+    }
 
     #[test]
     fn account_token_usage_response_maps_profile_stats_and_daily_buckets() {

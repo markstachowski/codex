@@ -3797,7 +3797,7 @@ async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
     let original_approval_policy = app.config.permissions.approval_policy.value();
     let original_sandbox_policy = app.config.legacy_sandbox_policy();
 
-    let fork_config = app.side_fork_config();
+    let fork_config = app.side_fork_config().expect("side fork config");
 
     assert!(fork_config.ephemeral);
     assert_eq!(
@@ -3859,7 +3859,7 @@ async fn side_fork_config_inherits_parent_thread_runtime_settings() {
     app.chat_widget
         .set_approvals_reviewer(ApprovalsReviewer::AutoReview);
 
-    let fork_config = app.side_fork_config();
+    let fork_config = app.side_fork_config().expect("side fork config");
 
     assert_eq!(
         (

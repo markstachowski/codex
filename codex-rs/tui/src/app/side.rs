@@ -576,7 +576,7 @@ impl App {
         }
     }
 
-    pub(super) fn side_fork_config(&self) -> Config {
+    pub(super) fn side_fork_config(&self) -> std::io::Result<Config> {
         let mut fork_config = self.chat_widget.config_ref().clone();
         let parent_model = self.chat_widget.current_model();
         if !parent_model.trim().is_empty() {
@@ -584,11 +584,14 @@ impl App {
         }
         fork_config.model_reasoning_effort = self.chat_widget.current_reasoning_effort();
         fork_config.service_tier = self.chat_widget.configured_service_tier();
+        crate::managed_new_thread_defaults::apply_managed_new_root_model_defaults(
+            &mut fork_config,
+        )?;
         fork_config.ephemeral = true;
         fork_config.developer_instructions = Some(Self::side_developer_instructions(
             fork_config.developer_instructions.as_deref(),
         ));
-        fork_config
+        Ok(fork_config)
     }
 
     pub(super) fn side_start_block_message(&self) -> Option<&'static str> {
@@ -684,7 +687,16 @@ impl App {
         self.refresh_in_memory_config_from_disk_best_effort("starting a side conversation")
             .await;
 
-        let fork_config = self.side_fork_config();
+        let fork_config = match self.side_fork_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.restore_side_user_message(user_message.take());
+                self.chat_widget.add_error_message(format!(
+                    "Failed to validate managed side-conversation defaults: {err}"
+                ));
+                return Ok(AppRunControl::Continue);
+            }
+        };
         match app_server
             .fork_side_thread(fork_config, parent_thread_id)
             .await

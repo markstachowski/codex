@@ -1068,6 +1068,15 @@ async fn maybe_run_previous_model_inline_compact(
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    if crate::config::locked_model_policy_lane()
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?
+        .is_some()
+    {
+        // A historical thread model is never allowed to create an inference
+        // request in a locked lane. The normal current-model context-limit
+        // compaction check immediately following this helper remains active.
+        return Ok(());
+    }
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(());
     };
@@ -2451,16 +2460,10 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
-                if !turn_context
-                    .server_model_warning_emitted
-                    .load(Ordering::Relaxed)
-                    && sess
-                        .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
-                        .await
+                if let Err(error) =
+                    sess.enforce_server_model_match(&turn_context, server_model.as_str())
                 {
-                    turn_context
-                        .server_model_warning_emitted
-                        .store(true, Ordering::Relaxed);
+                    break Err(error);
                 }
             }
             ResponseEvent::ModelVerifications(verifications) => {

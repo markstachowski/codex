@@ -8,6 +8,7 @@ use crate::prune_old_extension_resources;
 use crate::rebuild_raw_memories_file_from_memories;
 use crate::runtime::MemoryStartupContext;
 use crate::runtime::SpawnedConsolidationAgent;
+use crate::runtime::managed_background_service_tier_for_lane;
 use crate::sync_rollout_summaries_from_memories;
 use crate::workspace::memory_workspace_diff;
 use crate::workspace::prepare_memory_workspace;
@@ -354,14 +355,24 @@ mod agent {
         }
         .ok()?;
 
-        agent_config.model = Some(
-            config
-                .memories
-                .consolidation_model
-                .clone()
-                .unwrap_or_else(|| provider.memory_consolidation_preferred_model().to_string()),
-        );
-        agent_config.model_reasoning_effort = Some(crate::stage_two::REASONING_EFFORT);
+        if let Some(lane) = codex_core::config::locked_model_policy_lane().ok()? {
+            if !lane.allows_non_root_sessions() {
+                return None;
+            }
+            agent_config.model = Some(lane.required_model().to_string());
+            agent_config.model_reasoning_effort = Some(lane.required_local_effort());
+            agent_config.service_tier =
+                managed_background_service_tier_for_lane(agent_config.service_tier, Some(lane));
+        } else {
+            agent_config.model = Some(
+                config
+                    .memories
+                    .consolidation_model
+                    .clone()
+                    .unwrap_or_else(|| provider.memory_consolidation_preferred_model().to_string()),
+            );
+            agent_config.model_reasoning_effort = Some(crate::stage_two::REASONING_EFFORT);
+        }
 
         Some(agent_config)
     }
