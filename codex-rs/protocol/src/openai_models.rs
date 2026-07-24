@@ -37,6 +37,27 @@ const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 /// Backend model-catalog specialty identifying cybersecurity-focused models.
 pub const MODEL_SPECIALTY_CYBER: &str = "cyber";
 pub const SPEED_TIER_FAST: &str = "fast";
+const AUTO_ROUTING_MODEL_PREFIX: &str = "codex-auto-";
+
+fn unqualified_model_slug(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Returns whether a model slug belongs to the dedicated Spark family.
+pub fn is_spark_model_family(model: &str) -> bool {
+    unqualified_model_slug(model)
+        .to_ascii_lowercase()
+        .contains("codex-spark")
+}
+
+/// Returns whether a model slug selects automatic model routing.
+///
+/// Provider namespaces and ASCII case do not change the family identity.
+pub fn is_auto_routing_model_family(model: &str) -> bool {
+    unqualified_model_slug(model)
+        .get(..AUTO_ROUTING_MODEL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(AUTO_ROUTING_MODEL_PREFIX))
+}
 
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
 #[derive(Debug, Default, Clone, PartialEq, Eq, TS, Hash)]
@@ -874,6 +895,27 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::from_str;
     use serde_json::to_string;
+
+    #[test]
+    fn model_family_detection_normalizes_namespace_and_ascii_case() {
+        for model in [
+            "codex-auto-balanced",
+            "openai/codex-auto-balanced",
+            "OPENAI/CODEX-AUTO-BALANCED",
+        ] {
+            assert!(is_auto_routing_model_family(model), "{model}");
+        }
+        assert!(!is_auto_routing_model_family("gpt-5.6-sol"));
+
+        for model in [
+            "gpt-5.3-codex-spark",
+            "openai/gpt-5.3-codex-spark",
+            "OPENAI/GPT-5.3-CODEX-SPARK",
+        ] {
+            assert!(is_spark_model_family(model), "{model}");
+        }
+        assert!(!is_spark_model_family("gpt-5.6-sol"));
+    }
 
     fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {

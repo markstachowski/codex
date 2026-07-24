@@ -2358,12 +2358,6 @@ async fn websocket_reachability_check(
     ));
 
     let runtime_provider = create_model_provider(provider.clone(), auth_manager);
-    let auth = runtime_provider.auth().await;
-    details.push(format!(
-        "auth mode: {}",
-        auth.as_ref().map(auth_mode_name).unwrap_or("none")
-    ));
-
     let api_provider = match runtime_provider.api_provider().await {
         Ok(api_provider) => api_provider,
         Err(err) => {
@@ -2374,6 +2368,11 @@ async fn websocket_reachability_check(
             );
         }
     };
+    let auth = runtime_provider.auth().await;
+    details.push(format!(
+        "auth mode: {}",
+        auth.as_ref().map(auth_mode_name).unwrap_or("none")
+    ));
     match api_provider.websocket_url_for_path("responses") {
         Ok(url) => {
             details.push(format!("endpoint: {url}"));
