@@ -3,14 +3,19 @@ use std::sync::Arc;
 use codex_prompts::render_review_exit_interrupted;
 use codex_prompts::render_review_exit_success;
 use codex_protocol::ResponseItemId;
+use codex_protocol::config_types::ReasoningMode;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::ExitedReviewModeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
@@ -21,7 +26,10 @@ use codex_protocol::review_format::render_review_output_text;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex_delegate::run_codex_thread_one_shot;
+use crate::config::Config;
 use crate::config::Constrained;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -35,6 +43,63 @@ use super::SessionTaskResult;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReviewTask;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewInferenceSettings {
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_mode: Option<ReasoningMode>,
+    service_tier: Option<String>,
+}
+
+fn resolve_review_inference_settings(
+    requested_model: String,
+    inherited_reasoning_effort: Option<ReasoningEffort>,
+    inherited_reasoning_mode: Option<ReasoningMode>,
+    inherited_service_tier: Option<String>,
+    lane: Option<ModelPolicyLane>,
+) -> std::io::Result<ReviewInferenceSettings> {
+    match lane {
+        Some(lane) if !lane.allows_non_root_sessions() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} model policy rejects review delegates because the lane is root-only",
+                lane.as_str()
+            ),
+        )),
+        Some(lane) => Ok(ReviewInferenceSettings {
+            model: lane.required_model().to_string(),
+            reasoning_effort: Some(lane.required_local_effort()),
+            reasoning_mode: lane.required_reasoning_mode(),
+            service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+        }),
+        None => Ok(ReviewInferenceSettings {
+            model: requested_model,
+            reasoning_effort: inherited_reasoning_effort,
+            reasoning_mode: inherited_reasoning_mode,
+            service_tier: inherited_service_tier,
+        }),
+    }
+}
+
+pub(crate) fn apply_locked_review_inference_settings(
+    config: &mut Config,
+    requested_model: String,
+) -> std::io::Result<String> {
+    let lane = locked_model_policy_lane()?;
+    let settings = resolve_review_inference_settings(
+        requested_model,
+        config.model_reasoning_effort.clone(),
+        config.model_reasoning_mode,
+        config.service_tier.clone(),
+        lane,
+    )?;
+    config.model = Some(settings.model.clone());
+    config.model_reasoning_effort = settings.reasoning_effort;
+    config.model_reasoning_mode = settings.reasoning_mode;
+    config.service_tier = settings.service_tier;
+    Ok(settings.model)
+}
 
 impl ReviewTask {
     pub(crate) fn new() -> Self {
@@ -118,12 +183,26 @@ async fn start_review_conversation(
     sub_agent_config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
     sub_agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
 
-    let model = config
+    let requested_model = config
         .review_model
         .clone()
         .unwrap_or_else(|| ctx.model_info.slug.clone());
-    sub_agent_config.model = Some(model);
-    (run_codex_thread_one_shot(
+    if let Err(error) =
+        apply_locked_review_inference_settings(&mut sub_agent_config, requested_model)
+    {
+        tracing::error!(%error, "failed to resolve locked review inference settings");
+        session
+            .send_event(
+                ctx.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            )
+            .await;
+        return None;
+    }
+    match run_codex_thread_one_shot(
         sub_agent_config,
         Arc::clone(&session.services.auth_manager),
         Arc::clone(&session.services.models_manager),
@@ -135,10 +214,25 @@ async fn start_review_conversation(
         /*final_output_json_schema*/ None,
         /*initial_history*/ None,
     )
-    .await)
-        .ok()
-        .map(|(_session, io)| io.rx_event)
+    .await
+    {
+        Ok((_session, io)) => Some(io.rx_event),
+        Err(error) => {
+            tracing::error!(%error, "failed to start review delegate");
+            session
+                .send_event(
+                    ctx.as_ref(),
+                    EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                )
+                .await;
+            None
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "review_tests.rs"]
+mod tests;
 
 async fn process_review_events(
     session: Arc<Session>,

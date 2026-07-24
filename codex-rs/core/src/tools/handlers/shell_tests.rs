@@ -29,7 +29,9 @@ use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_shell_command::is_safe_command::is_known_safe_command;
+#[cfg(windows)]
 use codex_shell_command::powershell::try_find_powershell_executable_blocking;
+#[cfg(windows)]
 use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
 use codex_utils_path_uri::PathUri;
 use serde_json::json;
@@ -52,6 +54,7 @@ fn commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_c
     };
     assert_safe(&zsh_shell, "ls -la");
 
+    #[cfg(windows)]
     if let Some(path) = try_find_powershell_executable_blocking() {
         let powershell = Shell {
             shell_type: ShellType::PowerShell,
@@ -60,6 +63,7 @@ fn commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_c
         assert_safe(&powershell, "ls -Name");
     }
 
+    #[cfg(windows)]
     if let Some(path) = try_find_pwsh_executable_blocking() {
         let pwsh = Shell {
             shell_type: ShellType::PowerShell,

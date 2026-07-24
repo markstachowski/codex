@@ -4,6 +4,7 @@
 //! remains isolated from protected interactive requests until the initialized composer owns it.
 
 use super::*;
+use crate::managed_new_thread_defaults::apply_managed_new_thread_defaults_for_selection;
 
 async fn resolve_runtime_model_provider_base_url(provider: &ModelProviderInfo) -> Option<String> {
     let provider = create_model_provider(provider.clone(), /*auth_manager*/ None);
@@ -120,17 +121,14 @@ impl App {
             },
         };
         let bootstrap_ms = bootstrap.duration.as_millis();
-        if matches!(
-            &session_selection,
-            SessionSelection::StartFresh | SessionSelection::Exit
-        ) {
+        apply_managed_new_thread_defaults_for_selection(&session_selection, || {
             apply_managed_new_thread_defaults(
                 &mut config,
                 app_server.managed_new_thread_defaults(),
                 &cli_kv_overrides,
                 &harness_overrides,
-            );
-        }
+            )
+        })?;
         let mut model = config.model.clone().unwrap_or(bootstrap.default_model);
         let available_models = bootstrap.available_models;
         let remote_connection = crate::status::remote_connection::remote_connection_status_value(

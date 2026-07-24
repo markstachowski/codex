@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -38,6 +39,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 
 pub(crate) const MODEL: &str = "gpt-5.6-luna";
+const MODEL_POLICY_LANE_ENV: &str = "CDX_MODEL_POLICY_LANE";
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const INITIAL_WEBSOCKET_CONNECTIONS: usize = 2;
 const MAX_WEBSOCKET_CONNECTIONS: usize = 16;
@@ -89,6 +91,14 @@ pub struct LunaSamplingRequest {
 /// Failures returned while connecting or sampling the Luna model.
 #[derive(Debug, Error)]
 pub enum LunaSamplerError {
+    /// Managed model policy does not permit this direct Luna transport.
+    #[error("Luna sampling is unavailable under managed model policy lane `{0}`")]
+    ManagedModelPolicy(String),
+    /// A managed release was started without a launcher-provided lane marker.
+    #[error(
+        "CDX_MODEL_POLICY_LANE is required for managed release execution; use the codex, cdxpro, or cdxspark launcher"
+    )]
+    MissingModelPolicyMarker,
     /// The thread's provider or scoped credentials could not be resolved.
     #[error("could not resolve the Luna model provider: {0}")]
     Provider(#[source] CodexErr),
@@ -142,9 +152,40 @@ pub struct LunaSampler {
     active_requests: Mutex<VecDeque<ActiveRequest>>,
 }
 
+#[derive(Clone, Copy)]
+enum ModelPolicyMarkerRequirement {
+    OptionalForUnmanaged,
+    RequiredForManagedRelease,
+}
+
+impl ModelPolicyMarkerRequirement {
+    const fn for_current_build() -> Self {
+        if cfg!(debug_assertions) {
+            Self::OptionalForUnmanaged
+        } else {
+            Self::RequiredForManagedRelease
+        }
+    }
+}
+
 impl LunaSampler {
     /// Opens the initial WebSockets before any sample is requested.
     pub async fn connect(config: LunaSamplerConfig) -> Result<Self, LunaSamplerError> {
+        let lane = std::env::var_os(MODEL_POLICY_LANE_ENV);
+        Self::connect_for_model_policy_lane(
+            config,
+            lane.as_deref(),
+            ModelPolicyMarkerRequirement::for_current_build(),
+        )
+        .await
+    }
+
+    async fn connect_for_model_policy_lane(
+        config: LunaSamplerConfig,
+        lane: Option<&OsStr>,
+        marker_requirement: ModelPolicyMarkerRequirement,
+    ) -> Result<Self, LunaSamplerError> {
+        reject_managed_model_policy_lane(lane, marker_requirement)?;
         let sampler = Self {
             config,
             idle_connections: Arc::new(Mutex::new(Vec::with_capacity(MAX_WEBSOCKET_CONNECTIONS))),
@@ -277,6 +318,22 @@ impl LunaSampler {
 
     /// Sends one structured, tool-less request on an exclusively leased WebSocket.
     pub async fn sample(&self, request: LunaSamplingRequest) -> Result<String, LunaSamplerError> {
+        let lane = std::env::var_os(MODEL_POLICY_LANE_ENV);
+        self.sample_for_model_policy_lane(
+            request,
+            lane.as_deref(),
+            ModelPolicyMarkerRequirement::for_current_build(),
+        )
+        .await
+    }
+
+    async fn sample_for_model_policy_lane(
+        &self,
+        request: LunaSamplingRequest,
+        lane: Option<&OsStr>,
+        marker_requirement: ModelPolicyMarkerRequirement,
+    ) -> Result<String, LunaSamplerError> {
+        reject_managed_model_policy_lane(lane, marker_requirement)?;
         let metadata = HashMap::from([
             ("session_id".to_owned(), self.config.session_id.clone()),
             ("thread_id".to_owned(), self.config.thread_id.clone()),
@@ -329,6 +386,7 @@ impl LunaSampler {
             tool_choice: "none".to_owned(),
             parallel_tool_calls: false,
             reasoning: Some(Reasoning {
+                mode: None,
                 effort: Some(request.reasoning_effort),
                 summary: None,
                 context: Some(ReasoningContext::AllTurns),
@@ -470,6 +528,27 @@ impl LunaSampler {
                 }
             }
             return Err(LunaSamplerError::MissingOutput);
+        }
+    }
+}
+
+fn reject_managed_model_policy_lane(
+    lane: Option<&OsStr>,
+    marker_requirement: ModelPolicyMarkerRequirement,
+) -> Result<(), LunaSamplerError> {
+    match (lane, marker_requirement) {
+        (
+            Some(lane),
+            ModelPolicyMarkerRequirement::OptionalForUnmanaged
+            | ModelPolicyMarkerRequirement::RequiredForManagedRelease,
+        ) => Err(LunaSamplerError::ManagedModelPolicy(match lane.to_str() {
+            Some("") => "<empty>".to_owned(),
+            Some(lane) => lane.to_owned(),
+            None => "<non-UTF-8>".to_owned(),
+        })),
+        (None, ModelPolicyMarkerRequirement::OptionalForUnmanaged) => Ok(()),
+        (None, ModelPolicyMarkerRequirement::RequiredForManagedRelease) => {
+            Err(LunaSamplerError::MissingModelPolicyMarker)
         }
     }
 }
