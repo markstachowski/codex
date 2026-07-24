@@ -818,14 +818,14 @@ impl App {
         let bootstrap_ms = bootstrap.duration.as_millis();
         if matches!(
             &session_selection,
-            SessionSelection::StartFresh | SessionSelection::Exit
+            SessionSelection::StartFresh | SessionSelection::Fork(_) | SessionSelection::Exit
         ) {
             apply_managed_new_thread_defaults(
                 &mut config,
                 app_server.managed_new_thread_defaults(),
                 &cli_kv_overrides,
                 &harness_overrides,
-            );
+            )?;
         }
         let mut model = config.model.clone().unwrap_or(bootstrap.default_model);
         let available_models = bootstrap.available_models;

@@ -13,6 +13,7 @@ use crate::tools::context::ToolPayload;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::BaseInstructions;
@@ -33,12 +34,78 @@ pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 pub(crate) const MAX_SPAWN_AGENT_MODEL_OVERRIDES: usize = 5;
 
+fn validate_locked_spawn_config(config: &Config) -> Result<(), FunctionCallError> {
+    let model = config.model.as_deref().unwrap_or_default();
+    config
+        .validate_locked_subagent_inference_settings(
+            model,
+            config.model_reasoning_effort.as_ref(),
+            config.service_tier.as_deref(),
+        )
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
+}
+
+fn validate_locked_requested_spawn_overrides(
+    lane: crate::config::ModelPolicyLane,
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<&ReasoningEffort>,
+) -> Result<(), FunctionCallError> {
+    if requested_model.is_some_and(|model| model != lane.required_model()) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{} model policy rejects child model override; required {}",
+            lane.as_str(),
+            lane.required_model()
+        )));
+    }
+    let required_effort = lane.required_local_effort();
+    if requested_reasoning_effort.is_some_and(|effort| effort != &required_effort) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{} model policy rejects child reasoning override; required {}",
+            lane.as_str(),
+            required_effort
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_locked_non_root_inference_defaults(
+    config: &mut Config,
+    lane: crate::config::ModelPolicyLane,
+) -> Result<(), FunctionCallError> {
+    if !lane.allows_non_root_sessions() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{} model policy rejects non-root sessions",
+            lane.as_str()
+        )));
+    }
+    config.model = Some(lane.required_model().to_string());
+    config.model_reasoning_effort = Some(lane.required_local_effort());
+    config.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+    Ok(())
+}
+
 pub(crate) fn model_supports_multi_agent_backend(
     model: &ModelPreset,
     multi_agent_version: MultiAgentVersion,
 ) -> bool {
     multi_agent_version != MultiAgentVersion::V2
         || model.multi_agent_version != Some(MultiAgentVersion::Disabled)
+}
+
+pub(crate) fn locked_spawn_service_tier_for_lane(
+    lane: crate::config::ModelPolicyLane,
+    configured_service_tier: Option<&str>,
+    requested_service_tier: Option<&str>,
+) -> std::io::Result<String> {
+    lane.validate_service_tier(
+        configured_service_tier,
+        /*allow_user_service_tier_selection*/ false,
+    )?;
+    lane.validate_service_tier(
+        requested_service_tier,
+        /*allow_user_service_tier_selection*/ false,
+    )?;
+    Ok(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
 }
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
@@ -222,6 +289,12 @@ fn build_agent_shared_config(
     }
     apply_spawn_agent_runtime_overrides(&mut config, turn, environment)?;
 
+    if let Some(lane) = crate::config::locked_model_policy_lane()
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
+    {
+        apply_locked_non_root_inference_defaults(&mut config, lane)?;
+    }
+
     Ok(config)
 }
 
@@ -276,11 +349,24 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
-    let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
+    let locked_lane = crate::config::locked_model_policy_lane()
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
+        .filter(|lane| lane.multi_agent_enabled());
+    let requested_model = requested_model
+        .or(turn.config.agent_default_subagent_model.as_deref())
+        .or_else(|| locked_lane.map(crate::config::ModelPolicyLane::required_model));
     let requested_reasoning_effort = requested_reasoning_effort
-        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
+        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone())
+        .or_else(|| locked_lane.map(crate::config::ModelPolicyLane::required_local_effort));
+    if let Some(lane) = locked_lane {
+        validate_locked_requested_spawn_overrides(
+            lane,
+            requested_model,
+            requested_reasoning_effort.as_ref(),
+        )?;
+    }
     if requested_model.is_none() && requested_reasoning_effort.is_none() {
-        return Ok(());
+        return validate_locked_spawn_config(config);
     }
 
     if let Some(requested_model) = requested_model {
@@ -312,7 +398,7 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
             config.model_reasoning_effort = selected_model_info.default_reasoning_level;
         }
 
-        return Ok(());
+        return validate_locked_spawn_config(config);
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
@@ -324,7 +410,7 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
         config.model_reasoning_effort = Some(reasoning_effort);
     }
 
-    Ok(())
+    validate_locked_spawn_config(config)
 }
 
 pub(crate) async fn apply_spawn_agent_service_tier(
@@ -333,6 +419,20 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     parent_service_tier: Option<&str>,
     requested_service_tier: Option<&str>,
 ) -> Result<(), FunctionCallError> {
+    if let Some(lane) = crate::config::locked_model_policy_lane()
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
+    {
+        config.service_tier = Some(
+            locked_spawn_service_tier_for_lane(
+                lane,
+                config.service_tier.as_deref(),
+                requested_service_tier,
+            )
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?,
+        );
+        return validate_locked_spawn_config(config);
+    }
+
     let candidate_service_tiers = [
         config.service_tier.clone(),
         requested_service_tier.map(str::to_string),
@@ -340,7 +440,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     ];
     if candidate_service_tiers.iter().all(Option::is_none) {
         config.service_tier = None;
-        return Ok(());
+        return validate_locked_spawn_config(config);
     }
 
     let model = config.model.clone().ok_or_else(|| {
@@ -379,7 +479,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
             .find(|candidate_service_tier| {
                 model_info.supports_service_tier(candidate_service_tier.as_str())
             });
-    Ok(())
+    validate_locked_spawn_config(config)
 }
 
 pub(crate) async fn apply_spawn_agent_role(
@@ -400,11 +500,11 @@ pub(crate) async fn apply_spawn_agent_role(
     }
     if config.model == previous_model && config.model_reasoning_effort == previous_reasoning_effort
     {
-        return Ok(());
+        return validate_locked_spawn_config(config);
     }
 
     let Some(reasoning_effort) = config.model_reasoning_effort.clone() else {
-        return Ok(());
+        return validate_locked_spawn_config(config);
     };
     let model = config.model.clone().ok_or_else(|| {
         FunctionCallError::RespondToModel(
@@ -418,14 +518,15 @@ pub(crate) async fn apply_spawn_agent_role(
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
     if model_info.used_fallback_model_metadata {
-        return Ok(());
+        return validate_locked_spawn_config(config);
     }
 
     validate_spawn_agent_reasoning_effort(
         &model,
         &model_info.supported_reasoning_levels,
         &reasoning_effort,
-    )
+    )?;
+    validate_locked_spawn_config(config)
 }
 
 fn find_spawn_agent_model_name(
@@ -475,4 +576,44 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelPolicyLane;
+
+    #[test]
+    fn locked_model_policy_accepts_exact_configured_subagent_defaults() {
+        validate_locked_requested_spawn_overrides(
+            ModelPolicyLane::Api,
+            Some("gpt-5.6-sol"),
+            Some(&ReasoningEffort::Ultra),
+        )
+        .expect("exact configured subagent defaults must remain valid");
+    }
+
+    #[test]
+    fn locked_model_policy_rejects_configured_subagent_model_drift() {
+        let error = validate_locked_requested_spawn_overrides(
+            ModelPolicyLane::Api,
+            Some("gpt-5.4"),
+            Some(&ReasoningEffort::Ultra),
+        )
+        .expect_err("a configured child model must not escape the API lane");
+
+        assert!(error.to_string().contains("required gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn locked_model_policy_rejects_configured_subagent_effort_drift() {
+        let error = validate_locked_requested_spawn_overrides(
+            ModelPolicyLane::Api,
+            Some("gpt-5.6-sol"),
+            Some(&ReasoningEffort::High),
+        )
+        .expect_err("a configured child effort must not escape the API lane");
+
+        assert!(error.to_string().contains("required ultra"));
+    }
 }

@@ -1,15 +1,55 @@
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigOverrides;
+use crate::legacy_core::config::ModelPolicyLane;
+use crate::legacy_core::config::locked_model_policy_lane;
 use codex_app_server_protocol::NewThreadModelDefaults;
 use codex_protocol::config_types::ServiceTier;
 use toml::Value as TomlValue;
+
+pub(crate) fn apply_managed_new_root_model_defaults(config: &mut Config) -> std::io::Result<()> {
+    if let Some(lane) = locked_model_policy_lane()? {
+        apply_lane_model_defaults(config, lane);
+    }
+    Ok(())
+}
+
+fn apply_lane_model_defaults(config: &mut Config, lane: ModelPolicyLane) {
+    config.model = Some(lane.required_model().to_string());
+    config.model_reasoning_effort = Some(lane.required_local_effort());
+    config.plan_mode_reasoning_effort = Some(lane.required_local_effort());
+    config.service_tier = Some(lane.required_root_service_tier().to_string());
+}
 
 pub(crate) fn apply_managed_new_thread_defaults(
     config: &mut Config,
     defaults: Option<&NewThreadModelDefaults>,
     cli_kv_overrides: &[(String, TomlValue)],
     harness_overrides: &ConfigOverrides,
+) -> std::io::Result<()> {
+    apply_managed_new_thread_defaults_for_lane(
+        config,
+        defaults,
+        cli_kv_overrides,
+        harness_overrides,
+        locked_model_policy_lane()?,
+    );
+    Ok(())
+}
+
+fn apply_managed_new_thread_defaults_for_lane(
+    config: &mut Config,
+    defaults: Option<&NewThreadModelDefaults>,
+    cli_kv_overrides: &[(String, TomlValue)],
+    harness_overrides: &ConfigOverrides,
+    lane: Option<ModelPolicyLane>,
 ) {
+    // Interactive subscription model changes belong only to the active conversation. Every new,
+    // cleared, forked, or side root starts from the lane's managed pair; app-server defaults must
+    // not carry the prior conversation selection into a new root.
+    if let Some(lane) = lane {
+        apply_lane_model_defaults(config, lane);
+        return;
+    }
     let Some(defaults) = defaults else {
         return;
     };

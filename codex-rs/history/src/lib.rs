@@ -12,6 +12,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -356,6 +357,25 @@ impl InitialHistory {
     pub fn get_resumed_parent_thread_id(&self) -> Option<ThreadId> {
         self.get_resumed_session_meta()
             .and_then(|meta| meta.parent_thread_id)
+    }
+
+    /// Returns the latest effective model and reasoning effort for this resumed thread.
+    ///
+    /// New, cleared, and forked histories intentionally do not inherit a prior root selection.
+    pub fn get_resumed_model_selection(&self) -> Option<(String, Option<ReasoningEffortConfig>)> {
+        let Self::Resumed(resumed) = self else {
+            return None;
+        };
+        resumed.history.iter().rev().find_map(|item| match item {
+            RolloutItem::TurnContext(turn_context) => {
+                Some((turn_context.model.clone(), turn_context.effort.clone()))
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some((
+                event.thread_settings.model.clone(),
+                event.thread_settings.reasoning_effort.clone(),
+            )),
+            _ => None,
+        })
     }
 
     fn get_session_meta(&self) -> Option<&SessionMeta> {
