@@ -112,6 +112,7 @@ use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::is_auto_routing_model_family;
+pub use codex_protocol::openai_models::is_pro_capable_model;
 pub use codex_protocol::openai_models::is_spark_model_family;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -391,6 +392,23 @@ impl ModelPolicyLane {
         match self {
             Self::Api => Some(ReasoningMode::Pro),
             Self::Subscription | Self::Spark => None,
+        }
+    }
+
+    /// Reasoning mode required for one specific model on this lane.
+    ///
+    /// Pro is a property of the MODEL, not of the lane: the API rejects the
+    /// whole request when `reasoning.mode` reaches a model that does not
+    /// implement it. Deriving the mode from the resolved model — rather than
+    /// carrying it in config — is what keeps Pro structurally guaranteed on the
+    /// models that support it while still letting the lane offer models that do
+    /// not. It also keeps `/review` correct: review always resolves to Sol, so
+    /// a review request derives Pro even when the root selected another model.
+    pub fn required_reasoning_mode_for_model(self, model: &str) -> Option<ReasoningMode> {
+        match self {
+            Self::Api if is_pro_capable_model(model) => Some(ReasoningMode::Pro),
+            Self::Api => None,
+            Self::Subscription | Self::Spark => self.required_reasoning_mode(),
         }
     }
 
