@@ -147,6 +147,14 @@ pub enum CodexErrorDetails {
     /// Retry limit exceeded.
     #[error("{0}")]
     RetryLimit(RetryLimitReachedError),
+    /// Best-effort capacity (the flex service tier) is momentarily exhausted.
+    /// The request was not billed and is retryable after a short wait; this is
+    /// the documented contract of flex, not a rate limit, so it must never be
+    /// presented as one.
+    #[error(
+        "service capacity is temporarily unavailable for the requested tier; retry shortly or select another tier"
+    )]
+    ResourceUnavailable(RetryLimitReachedError),
     /// Agent loop died unexpectedly
     #[error("internal error; agent loop died unexpectedly")]
     InternalAgentDied,
@@ -327,6 +335,7 @@ impl CodexErr {
         ResponseStreamFailed(error: ResponseStreamFailed),
         ConnectionFailed(error: ConnectionFailedError),
         RetryLimit(error: RetryLimitReachedError),
+        ResourceUnavailable(error: RetryLimitReachedError),
         Sandbox(error: SandboxErr),
         UnsupportedOperation(message: String),
         RefreshTokenFailed(error: RefreshTokenFailedError),
@@ -376,6 +385,10 @@ impl CodexErr {
             | CodexErrorDetails::Sandbox(_)
             | CodexErrorDetails::LandlockSandboxExecutableNotProvided
             | CodexErrorDetails::RetryLimit(_)
+            // Deliberately NOT generically retryable: only the flex-scoped
+            // driver loop may wait on capacity, so every other consumer
+            // treats this exactly like RetryLimit today.
+            | CodexErrorDetails::ResourceUnavailable(_)
             | CodexErrorDetails::ContextWindowExceeded
             | CodexErrorDetails::ThreadNotFound(_)
             | CodexErrorDetails::AgentLimitReached { .. }
@@ -464,6 +477,7 @@ impl CodexErr {
     pub fn http_status_code_value(&self) -> Option<u16> {
         let http_status_code = match &self.details {
             CodexErrorDetails::RetryLimit(err) => Some(err.status),
+            CodexErrorDetails::ResourceUnavailable(err) => Some(err.status),
             CodexErrorDetails::UnexpectedStatus(err) => Some(err.status),
             CodexErrorDetails::ConnectionFailed(err) => err.source.status(),
             CodexErrorDetails::ResponseStreamFailed(err) => err.source.status(),

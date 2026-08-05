@@ -524,12 +524,13 @@ impl SessionConfiguration {
     }
 }
 
-pub(crate) fn validate_subscription_root_model_selection(
+pub(crate) fn validate_root_model_selection_for_lane(
+    lane: crate::config::ModelPolicyLane,
     model: &str,
     reasoning_effort: Option<&ReasoningEffortConfig>,
     available_models: &[ModelPreset],
 ) -> std::io::Result<()> {
-    crate::config::ModelPolicyLane::Subscription.validate_user_selected_model(model)?;
+    lane.validate_user_selected_model(model)?;
     let preset = available_models
         .iter()
         .find(|preset| preset.show_in_picker && preset.model == model)
@@ -537,7 +538,8 @@ pub(crate) fn validate_subscription_root_model_selection(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "subscription model policy rejected `{}` because it is not present and visible in the current model picker catalog",
+                    "{} model policy rejected `{}` because it is not present and visible in the current model picker catalog",
+                    lane.as_str(),
                     model
                 ),
             )
@@ -553,8 +555,10 @@ pub(crate) fn validate_subscription_root_model_selection(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "subscription model policy rejected reasoning effort {:?} for `{}` because the current picker catalog does not advertise it",
-                reasoning_effort, model
+                "{} model policy rejected reasoning effort {:?} for `{}` because the current picker catalog does not advertise it",
+                lane.as_str(),
+                reasoning_effort,
+                model
             ),
         ));
     }
@@ -581,14 +585,17 @@ pub(crate) fn validate_model_selection_update_for_lane(
             /*allow_user_model_selection*/ false,
         );
     }
-    if lane == crate::config::ModelPolicyLane::Subscription {
+    if lane.allows_user_model_selection() {
         let available_models = available_models.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "subscription model policy requires the current picker catalog",
+                format!(
+                    "{} model policy requires the current picker catalog",
+                    lane.as_str()
+                ),
             )
         })?;
-        validate_subscription_root_model_selection(model, reasoning_effort, available_models)
+        validate_root_model_selection_for_lane(lane, model, reasoning_effort, available_models)
     } else {
         lane.validate_model_and_effort(
             model,
@@ -1716,12 +1723,25 @@ mod model_selection_update_tests {
             )
             .expect_err("all non-root sessions must reject Fast");
 
-            validate_service_tier_update_for_lane(
+            // Flex became an explicit API-root tier on 2026-08-05; the other
+            // lanes keep rejecting it, and no non-root session may hold it.
+            let flex = Some("flex".to_string());
+            let flex_result = validate_service_tier_update_for_lane(
                 lane,
                 /*is_non_root_agent*/ false,
-                Some(&Some("flex".to_string())),
+                Some(&flex),
+            );
+            if matches!(lane, crate::config::ModelPolicyLane::Api) {
+                flex_result.expect("an explicit API root may select flex");
+            } else {
+                flex_result.expect_err("only the API lane may select flex");
+            }
+            validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ true,
+                Some(&flex),
             )
-            .expect_err("unmanaged service tiers remain unavailable");
+            .expect_err("all non-root sessions must reject flex");
         }
     }
 }
