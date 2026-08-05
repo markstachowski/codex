@@ -1583,6 +1583,7 @@ mod model_selection_update_tests {
         ModelPreset {
             id: model.to_string(),
             model: model.to_string(),
+            model_specialty: None,
             display_name: model.to_string(),
             description: String::new(),
             default_reasoning_effort: ReasoningEffortConfig::Medium,
