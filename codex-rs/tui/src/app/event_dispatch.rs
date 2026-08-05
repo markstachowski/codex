@@ -1337,7 +1337,12 @@ impl App {
                     Err(err) => self
                         .chat_widget
                         .add_error_message(format!("Invalid managed model policy: {err}")),
-                    Ok(Some(crate::legacy_core::config::ModelPolicyLane::Subscription)) => {
+                    // Any selecting lane (subscription, and API since
+                    // 2026-08-05) applies through the server-side settings
+                    // update, where the session layer validates the selection
+                    // against the picker catalog. Spark stays on the
+                    // rejection arm below.
+                    Ok(Some(lane)) if lane.allows_user_model_selection() => {
                         let Some(mut params) =
                             self.active_thread_model_setting_update_params(model.clone())
                         else {

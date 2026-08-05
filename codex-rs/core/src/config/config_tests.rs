@@ -270,7 +270,9 @@ fn locked_model_policy_lane_contracts_are_exact() {
             ForcedLoginMethod::Api,
             true,
             MultiAgentVersion::V2,
-            false,
+            // Root model selection opened 2026-08-05; the locked catalog file
+            // (gpt-5.6 sol/terra/luna) is the model boundary.
+            true,
             true,
             true,
         ),
@@ -556,50 +558,124 @@ fn locked_model_policy_scopes_fast_to_explicit_subscription_and_api_roots() {
         lane.validate_service_tier(None, /*allow_user_service_tier_selection*/ false)
             .expect("an absent tier remains Standard at the request boundary");
     }
+
+    // Flex (cheaper best-effort capacity, probed live 2026-08-05) is scoped
+    // one lane tighter than Fast: explicit API roots only. Subscription and
+    // Spark keep their exact pre-flex behavior, and children/background stay
+    // on Standard exactly as they do for Fast.
+    ModelPolicyLane::Api
+        .validate_service_tier(
+            Some(ServiceTier::Flex.request_value()),
+            /*allow_user_service_tier_selection*/ true,
+        )
+        .expect("an explicit API root may select flex");
+    for (lane, allow_user_service_tier_selection) in [
+        (ModelPolicyLane::Api, false),
+        (ModelPolicyLane::Subscription, true),
+        (ModelPolicyLane::Subscription, false),
+        (ModelPolicyLane::Spark, true),
+        (ModelPolicyLane::Spark, false),
+    ] {
+        lane.validate_service_tier(
+            Some(ServiceTier::Flex.request_value()),
+            allow_user_service_tier_selection,
+        )
+        .expect_err("only an explicit API root may select flex");
+    }
+    // "auto" delegates the tier decision to project state nobody is looking
+    // at; every selectable tier stays explicit.
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        lane.validate_service_tier(
+            Some("auto"),
+            /*allow_user_service_tier_selection*/ true,
+        )
+        .expect_err("the ambiguous auto tier stays rejected on every lane");
+    }
 }
 
 #[test]
 fn locked_model_policy_allows_only_root_subscription_model_selection() {
-    ModelPolicyLane::Subscription
-        .validate_model_and_effort(
+    // Both selecting lanes: an explicit root may pick another model. The API
+    // lane joined 2026-08-05; its catalog file bounds the concrete choices at
+    // the session layer, which this lane-level predicate does not see.
+    for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
+        lane.validate_model_and_effort(
             "gpt-5.5",
             Some(&ReasoningEffort::High),
             /*allow_user_model_selection*/ true,
         )
-        .expect("the subscription root may explicitly select another catalog model");
+        .expect("an explicit selecting-lane root may pick another model");
 
-    let child_error = ModelPolicyLane::Subscription
-        .validate_model_and_effort(
-            "gpt-5.5",
-            Some(&ReasoningEffort::High),
-            /*allow_user_model_selection*/ false,
-        )
-        .expect_err("a non-root subscription session must remain on Sol/Ultra");
-    assert!(child_error.to_string().contains("required `gpt-5.6-sol`"));
-
-    let api_error = ModelPolicyLane::Api
-        .validate_model_and_effort(
-            "gpt-5.5",
-            Some(&ReasoningEffort::High),
-            /*allow_user_model_selection*/ true,
-        )
-        .expect_err("the API lane never permits a model override");
-    assert!(api_error.to_string().contains("required `gpt-5.6-sol`"));
-
-    for reserved_model in [
-        SPARK_MODEL,
-        "codex-auto-balanced",
-        "openai/codex-auto-balanced",
-        "CODEX-AUTO-BALANCED",
-    ] {
-        let error = ModelPolicyLane::Subscription
+        let child_error = lane
             .validate_model_and_effort(
-                reserved_model,
+                "gpt-5.5",
                 Some(&ReasoningEffort::High),
-                /*allow_user_model_selection*/ true,
+                /*allow_user_model_selection*/ false,
             )
-            .expect_err("Spark and automatic routing stay outside the ordinary picker");
-        assert!(error.to_string().contains("reserved model"));
+            .expect_err("a non-root session must remain on the managed model");
+        assert!(child_error.to_string().contains("required `gpt-5.6-sol`"));
+
+        for reserved_model in [
+            SPARK_MODEL,
+            "codex-auto-balanced",
+            "openai/codex-auto-balanced",
+            "CODEX-AUTO-BALANCED",
+        ] {
+            let error = lane
+                .validate_model_and_effort(
+                    reserved_model,
+                    Some(&ReasoningEffort::High),
+                    /*allow_user_model_selection*/ true,
+                )
+                .expect_err("Spark and automatic routing stay outside the ordinary picker");
+            assert!(error.to_string().contains("reserved model"));
+        }
+    }
+
+    // Spark keeps no selection at all.
+    let spark_error = ModelPolicyLane::Spark
+        .validate_model_and_effort(
+            "gpt-5.5",
+            Some(&ReasoningEffort::High),
+            /*allow_user_model_selection*/ true,
+        )
+        .expect_err("Spark never permits a model override");
+    assert!(spark_error.to_string().contains("required"));
+}
+
+#[test]
+fn locked_model_policy_user_selectable_wire_efforts_match_the_live_api() {
+    use codex_protocol::openai_models::is_user_selectable_wire_effort;
+
+    // Probed live 2026-08-05 on gpt-5.6 sol/terra/luna.
+    for accepted in [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ] {
+        assert!(
+            is_user_selectable_wire_effort(&accepted),
+            "{accepted:?} is wire-valid"
+        );
+    }
+    for rejected in [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        // `ultra` is a client-side label; a literal ultra on the wire is a
+        // live 400 (`invalid_value`) and must be translated to max instead.
+        ReasoningEffort::Ultra,
+        ReasoningEffort::Custom("mystery".to_string()),
+    ] {
+        assert!(
+            !is_user_selectable_wire_effort(&rejected),
+            "{rejected:?} must be rejected before egress"
+        );
     }
 }
 
