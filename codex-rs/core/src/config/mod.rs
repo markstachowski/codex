@@ -308,28 +308,29 @@ impl ModelPolicyLane {
         matches!(self, Self::Subscription | Self::Api)
     }
 
-    /// Service tier applied whenever a new managed root is created. API roots
-    /// start on Priority; subscription and Spark roots start on Standard.
+    /// Service tier applied whenever a new managed root is created. Every lane
+    /// starts on Standard; Fast is an explicit per-root opt-in via `/fast`,
+    /// never a startup default, so no session can silently begin billing at
+    /// the premium tier.
     pub const fn required_root_service_tier(self) -> &'static str {
         match self {
-            Self::Api => ServiceTier::Fast.request_value(),
-            Self::Subscription | Self::Spark => SERVICE_TIER_DEFAULT_REQUEST_VALUE,
+            Self::Api | Self::Subscription | Self::Spark => SERVICE_TIER_DEFAULT_REQUEST_VALUE,
         }
     }
 
-    /// Persistent startup tier required in each lane's physical config.
-    /// Native and Spark omit the key; the API lane explicitly defaults Fast.
+    /// Persistent startup tier required in each lane's physical config. Every
+    /// lane omits the key, so a root can only reach Fast through an explicit
+    /// in-session selection.
     pub const fn required_config_service_tier(self) -> Option<&'static str> {
         match self {
-            Self::Api => Some(ServiceTier::Fast.request_value()),
-            Self::Subscription | Self::Spark => None,
+            Self::Api | Self::Subscription | Self::Spark => None,
         }
     }
 
     /// Whether a fully merged config carries an allowed tier while a managed
-    /// root is being bootstrapped. Native and Spark may use either their
-    /// omitted persistent baseline or an explicit Standard root selection;
-    /// API roots must remain explicitly Priority.
+    /// root is being bootstrapped. Every lane may use either its omitted
+    /// persistent baseline or an explicit Standard root selection; no lane may
+    /// bootstrap directly onto Fast.
     pub(crate) fn allows_bootstrap_service_tier(self, service_tier: Option<&str>) -> bool {
         service_tier == self.required_config_service_tier()
             || service_tier == Some(self.required_root_service_tier())

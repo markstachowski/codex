@@ -318,15 +318,16 @@ fn locked_model_policy_lane_contracts_are_exact() {
             lane.allows_user_service_tier_selection(),
             allows_user_service_tier_selection
         );
-        let expected_new_root_tier = if lane == ModelPolicyLane::Api {
-            ServiceTier::Fast.request_value()
-        } else {
-            SERVICE_TIER_DEFAULT_REQUEST_VALUE
-        };
-        assert_eq!(lane.required_root_service_tier(), expected_new_root_tier);
+        // Every lane starts a root on Standard. Fast is an explicit per-root
+        // opt-in, never a startup default, so the API lane no longer diverges.
         assert_eq!(
-            lane.required_config_service_tier(),
-            (lane == ModelPolicyLane::Api).then_some(ServiceTier::Fast.request_value())
+            lane.required_root_service_tier(),
+            SERVICE_TIER_DEFAULT_REQUEST_VALUE
+        );
+        assert_eq!(lane.required_config_service_tier(), None);
+        assert!(
+            !lane.allows_bootstrap_service_tier(Some(ServiceTier::Fast.request_value())),
+            "no lane may bootstrap directly onto Fast"
         );
         assert_eq!(lane.allows_non_root_sessions(), allows_non_root_sessions);
     }
@@ -360,37 +361,30 @@ fn locked_model_policy_lane_resolution_requires_managed_marker() {
 }
 
 #[test]
-fn locked_model_policy_bootstrap_service_tiers_are_lane_specific() {
-    for accepted in [None, Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)] {
-        assert!(
-            ModelPolicyLane::Subscription.allows_bootstrap_service_tier(accepted),
-            "subscription should accept {accepted:?}"
-        );
-        assert!(
-            ModelPolicyLane::Spark.allows_bootstrap_service_tier(accepted),
-            "Spark should accept {accepted:?}"
-        );
-    }
+fn locked_model_policy_bootstrap_service_tiers_are_standard_only() {
+    // Uniform across lanes since the API lane stopped starting roots on Fast:
+    // a managed root may bootstrap with the key omitted or explicitly Standard,
+    // and no lane may bootstrap straight onto Fast or any unmanaged tier.
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        for accepted in [None, Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)] {
+            assert!(
+                lane.allows_bootstrap_service_tier(accepted),
+                "{} should accept {accepted:?}",
+                lane.as_str()
+            );
+        }
 
-    for rejected in [Some(ServiceTier::Fast.request_value()), Some("flex")] {
-        assert!(
-            !ModelPolicyLane::Subscription.allows_bootstrap_service_tier(rejected),
-            "subscription should reject {rejected:?}"
-        );
-        assert!(
-            !ModelPolicyLane::Spark.allows_bootstrap_service_tier(rejected),
-            "Spark should reject {rejected:?}"
-        );
-    }
-
-    assert!(
-        ModelPolicyLane::Api.allows_bootstrap_service_tier(Some(ServiceTier::Fast.request_value()))
-    );
-    for rejected in [None, Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE), Some("flex")] {
-        assert!(
-            !ModelPolicyLane::Api.allows_bootstrap_service_tier(rejected),
-            "API should reject {rejected:?}"
-        );
+        for rejected in [Some(ServiceTier::Fast.request_value()), Some("flex")] {
+            assert!(
+                !lane.allows_bootstrap_service_tier(rejected),
+                "{} should reject {rejected:?}",
+                lane.as_str()
+            );
+        }
     }
 }
 
