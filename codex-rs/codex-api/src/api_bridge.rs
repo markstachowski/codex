@@ -124,6 +124,27 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         }
                     }
 
+                    // Flex-tier capacity exhaustion is a documented, unbilled,
+                    // retry-after-wait signal (`resource_unavailable`), not a
+                    // rate limit. Classify it distinctly so callers can wait
+                    // instead of reporting a retry limit that never ran.
+                    // Matched on the body's error code alone; anything else
+                    // keeps today's mapping byte-for-byte.
+                    if serde_json::from_str::<serde_json::Value>(&body_text)
+                        .ok()
+                        .and_then(|body| {
+                            body.get("error")?
+                                .get("code")
+                                .map(|code| code.as_str() == Some("resource_unavailable"))
+                        })
+                        .unwrap_or(false)
+                    {
+                        return CodexErr::ResourceUnavailable(RetryLimitReachedError {
+                            status,
+                            request_id: extract_request_tracking_id(headers.as_ref()),
+                        });
+                    }
+
                     CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
