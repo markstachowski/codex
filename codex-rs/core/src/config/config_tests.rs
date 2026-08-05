@@ -474,6 +474,55 @@ fn locked_model_policy_bootstrap_service_tiers_are_standard_only() {
 }
 
 #[test]
+fn locked_model_policy_reasoning_mode_is_derived_from_the_model() {
+    // Pro belongs to the model, not the lane: the API rejects the whole
+    // request when `reasoning.mode` reaches a model that does not implement
+    // it (verified live 2026-08-05 -- gpt-5.4-mini answers 400).
+    for pro_capable in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        assert_eq!(
+            ModelPolicyLane::Api.required_reasoning_mode_for_model(pro_capable),
+            Some(ReasoningMode::Pro),
+            "API should derive Pro for {pro_capable}"
+        );
+    }
+    for incapable in ["gpt-5.4-mini", "gpt-5.1-codex-mini", "o3"] {
+        assert_eq!(
+            ModelPolicyLane::Api.required_reasoning_mode_for_model(incapable),
+            None,
+            "API must omit the mode for {incapable} rather than 400 the request"
+        );
+    }
+
+    // Non-API lanes never send a mode, whatever the model.
+    for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Spark] {
+        for model in ["gpt-5.6-sol", "gpt-5.4-mini", SPARK_MODEL] {
+            assert_eq!(lane.required_reasoning_mode_for_model(model), None);
+        }
+    }
+
+    // Behaviour-preservation guard for the hoist: for each lane's own managed
+    // model, the derived mode must equal what the lane-keyed predicate said.
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        assert_eq!(
+            lane.required_reasoning_mode_for_model(lane.required_model()),
+            lane.required_reasoning_mode(),
+            "{} changed behaviour for its own managed model",
+            lane.as_str()
+        );
+        // Review always resolves to Sol, so it must still derive Pro on the
+        // API lane even when a root has selected a different model.
+        assert_eq!(
+            ModelPolicyLane::Api.required_reasoning_mode_for_model(lane.required_review_model()),
+            Some(ReasoningMode::Pro)
+        );
+    }
+}
+
+#[test]
 fn locked_model_policy_scopes_fast_to_explicit_subscription_and_api_roots() {
     for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
         lane.validate_service_tier(
