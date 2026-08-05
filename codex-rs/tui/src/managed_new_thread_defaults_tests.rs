@@ -193,9 +193,11 @@ async fn managed_lanes_reset_new_threads_to_required_defaults() {
 }
 
 #[tokio::test]
-async fn api_fast_toggle_is_conversation_local_and_fresh_roots_return_to_priority() {
+async fn api_fast_toggle_is_conversation_local_and_fresh_roots_return_to_standard() {
     let mut config = test_config().await;
-    config.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+    // Start from a conversation that opted into Fast: the selection must not
+    // leak into the next root, which returns to the lane's Standard baseline.
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
 
     apply_managed_new_thread_defaults_for_lane(
         &mut config,
@@ -207,7 +209,7 @@ async fn api_fast_toggle_is_conversation_local_and_fresh_roots_return_to_priorit
 
     assert_eq!(
         config.service_tier.as_deref(),
-        Some(ServiceTier::Fast.request_value())
+        Some(ModelPolicyLane::Api.required_root_service_tier())
     );
 }
 
