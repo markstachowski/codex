@@ -206,6 +206,58 @@ fn map_api_error_maps_usage_limit_limit_name_header() {
 }
 
 #[test]
+fn map_api_error_classifies_flex_capacity_resource_unavailable() {
+    // Documented flex-capacity shape (2026-08-05): 429 with error.code
+    // `resource_unavailable`, unbilled and retryable after a short wait. It
+    // must classify as its own state, never as a retry-limit failure.
+    let body = serde_json::json!({
+        "error": {
+            "code": "resource_unavailable",
+            "message": "Resource temporarily unavailable. Please try again later.",
+            "type": "server_error",
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    let CodexErrorDetails::ResourceUnavailable(details) = err.details() else {
+        panic!("expected CodexErrorDetails::ResourceUnavailable, got {err:?}");
+    };
+    assert_eq!(details.status, http::StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[test]
+fn map_api_error_keeps_plain_429_mapping_byte_for_byte() {
+    // Any 429 without the capacity code keeps today's RetryLimit mapping —
+    // the classification must not widen beyond `resource_unavailable`.
+    for body in [
+        None,
+        Some("not json".to_string()),
+        Some(
+            serde_json::json!({
+                "error": { "code": "rate_limit_exceeded", "message": "slow down" }
+            })
+            .to_string(),
+        ),
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body,
+        }));
+        let CodexErrorDetails::RetryLimit(_) = err.details() else {
+            panic!("expected CodexErrorDetails::RetryLimit, got {err:?}");
+        };
+    }
+}
+
+#[test]
 fn map_api_error_does_not_fallback_limit_name_to_limit_id() {
     let mut headers = HeaderMap::new();
     headers.insert(

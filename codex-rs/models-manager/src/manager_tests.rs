@@ -41,12 +41,12 @@ fn model_policy_picker_contract_keeps_subscription_catalog() {
         picker_contract_for_lane(Some("subscription")),
         PickerContract::Subscription
     );
+    // The API lane opened root model selection on 2026-08-05: its locked
+    // catalog file is the model boundary, so it shares the filtered-catalog
+    // contract instead of a single-model pin.
     assert_eq!(
         picker_contract_for_lane(Some("api")),
-        PickerContract::Exact {
-            model: SOL_MODEL,
-            effort: ReasoningEffort::Ultra,
-        }
+        PickerContract::Subscription
     );
     assert_eq!(
         picker_contract_for_lane(Some("spark")),

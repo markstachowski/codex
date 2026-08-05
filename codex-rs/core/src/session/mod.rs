@@ -686,16 +686,20 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        // Resume restores the root's own prior selection on any lane that
+        // permits selection; fresh roots still reset to the lane defaults.
+        let locked_lane = crate::config::locked_model_policy_lane()
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
         let restored_model_selection = if !session_source.is_non_root_agent()
-            && crate::config::locked_model_policy_lane()
-                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?
-                == Some(crate::config::ModelPolicyLane::Subscription)
+            && locked_lane.is_some_and(super::config::ModelPolicyLane::allows_user_model_selection)
         {
             conversation_history.get_resumed_model_selection()
         } else {
             None
         };
-        if let Some((restored_model, restored_effort)) = restored_model_selection.as_ref() {
+        if let (Some((restored_model, restored_effort)), Some(lane)) =
+            (restored_model_selection.as_ref(), locked_lane)
+        {
             let available_models = match available_models_snapshot.as_ref() {
                 Some(available_models) => available_models.clone(),
                 None => {
@@ -707,7 +711,8 @@ impl Session {
                         .await
                 }
             };
-            session::validate_subscription_root_model_selection(
+            session::validate_root_model_selection_for_lane(
+                lane,
                 restored_model,
                 restored_effort.as_ref(),
                 &available_models,
@@ -1878,17 +1883,20 @@ impl Session {
         if !changed {
             return Ok(());
         }
-        let available_models =
-            if lane == crate::config::ModelPolicyLane::Subscription && !is_non_root_agent {
-                Some(
-                    self.services
-                        .models_manager
-                        .list_models(RefreshStrategy::Offline, http_client_factory)
-                        .await,
-                )
-            } else {
-                None
-            };
+        // Every selecting lane validates against the picker catalog; passing
+        // None here makes the catalog-backed validator fail closed, which is
+        // how the API lane's first live model switch was rejected (E2E,
+        // 2026-08-05).
+        let available_models = if lane.allows_user_model_selection() && !is_non_root_agent {
+            Some(
+                self.services
+                    .models_manager
+                    .list_models(RefreshStrategy::Offline, http_client_factory)
+                    .await,
+            )
+        } else {
+            None
+        };
         session::validate_model_selection_update_for_lane(
             lane,
             is_non_root_agent,
