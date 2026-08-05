@@ -4611,4 +4611,18 @@ fn locked_spawn_service_tier_rejects_child_fast_overrides() {
         .expect_err("role-derived Fast must be rejected for a child");
     locked_spawn_service_tier_for_lane(lane, None, Some("priority"))
         .expect_err("an explicit child Fast request must be rejected");
+
+    // Flex (API-lane root tier since 2026-08-05) follows the same child
+    // contract as Fast: a flex root's children stay on Standard, and neither a
+    // role config nor the child itself can select flex.
+    let api = crate::config::ModelPolicyLane::Api;
+    assert_eq!(
+        locked_spawn_service_tier_for_lane(api, None, None)
+            .expect("a flex-era API child still starts Standard"),
+        codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE
+    );
+    locked_spawn_service_tier_for_lane(api, Some("flex"), None)
+        .expect_err("role-derived flex must be rejected for a child");
+    locked_spawn_service_tier_for_lane(api, None, Some("flex"))
+        .expect_err("an explicit child flex request must be rejected");
 }

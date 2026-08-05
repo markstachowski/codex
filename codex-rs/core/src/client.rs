@@ -78,11 +78,13 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningMode as ReasoningModeConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::openai_models::is_user_selectable_wire_effort;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -624,12 +626,25 @@ impl ModelClient {
         }
 
         if user_selecting {
-            if reasoning.effort.is_none() {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "{} model policy requires an explicit reasoning effort for `{}`",
-                    lane.as_str(),
-                    request.model
-                )));
+            match reasoning.effort.as_ref() {
+                None => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "{} model policy requires an explicit reasoning effort for `{}`",
+                        lane.as_str(),
+                        request.model
+                    )));
+                }
+                // Fail closed on wire-invalid efforts instead of letting a
+                // config- or RPC-supplied `minimal`/literal-`ultra` become a
+                // live 400 on every request (probed 2026-08-05).
+                Some(effort) if !is_user_selectable_wire_effort(effort) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "{} model policy rejected wire reasoning effort {effort:?} for `{}`; selectable efforts are low, medium, high, xhigh, and max",
+                        lane.as_str(),
+                        request.model
+                    )));
+                }
+                Some(_) => {}
             }
         } else {
             let required_effort = lane.required_wire_effort();
@@ -1648,6 +1663,13 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        // Flex is best-effort by contract: a 429 `resource_unavailable` is an
+        // unbilled "no spare capacity this instant" signal, not a failure.
+        // Wait briefly and retry the SAME tier a bounded number of times; on
+        // exhaustion the honest error surfaces. Never silently change tier —
+        // what a turn costs is the operator's decision alone.
+        const FLEX_CAPACITY_MAX_RETRIES: u32 = 4;
+        let mut flex_capacity_attempts: u32 = 0;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let transport = self
@@ -1747,6 +1769,26 @@ impl ModelClientSession {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
+                    if matches!(
+                        err.details(),
+                        codex_protocol::error::CodexErrorDetails::ResourceUnavailable(_)
+                    ) && service_tier.as_deref() == Some(ServiceTier::Flex.request_value())
+                        && flex_capacity_attempts < FLEX_CAPACITY_MAX_RETRIES
+                    {
+                        flex_capacity_attempts += 1;
+                        // 2s/4s/8s/16s — capacity blips at single-user volume
+                        // clear in seconds, and every retry is unbilled.
+                        let delay =
+                            Duration::from_secs(2u64 << (flex_capacity_attempts - 1).min(3));
+                        tracing::warn!(
+                            attempt = flex_capacity_attempts,
+                            max = FLEX_CAPACITY_MAX_RETRIES,
+                            delay_secs = delay.as_secs(),
+                            "flex capacity unavailable; retrying the same tier"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     return Err(err);
                 }
             }

@@ -73,6 +73,24 @@ pub fn is_pro_capable_model(model: &str) -> bool {
     )
 }
 
+/// Wire-valid reasoning efforts an explicit user-selected root may send.
+///
+/// Probed live on 2026-08-05 against gpt-5.6 sol/terra/luna: low through max
+/// all return 200; `minimal` is rejected (`unsupported_value`) and a literal
+/// `ultra` is rejected (`invalid_value`) — `ultra` exists only as a client
+/// label that must be translated to `max` before egress. Gating here keeps a
+/// config- or RPC-supplied invalid effort from becoming a live 400 loop.
+pub fn is_user_selectable_wire_effort(effort: &ReasoningEffort) -> bool {
+    matches!(
+        effort,
+        ReasoningEffort::Low
+            | ReasoningEffort::Medium
+            | ReasoningEffort::High
+            | ReasoningEffort::XHigh
+            | ReasoningEffort::Max
+    )
+}
+
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
 #[derive(Debug, Default, Clone, PartialEq, Eq, TS, Hash)]
 #[ts(type = "string")]

@@ -416,5 +416,15 @@ mod managed_service_tier_tests {
             managed_background_service_tier_for_lane(Some("priority".to_string()), None).as_deref(),
             Some("priority")
         );
+        // A flex parent (API-lane root tier since 2026-08-05) clears the same
+        // way: background work never inherits a non-Standard tier.
+        assert_eq!(
+            managed_background_service_tier_for_lane(
+                Some("flex".to_string()),
+                Some(codex_core::config::ModelPolicyLane::Api),
+            )
+            .as_deref(),
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+        );
     }
 }

@@ -299,8 +299,20 @@ impl ModelPolicyLane {
 
     /// Whether an explicit root-session model selection may differ from the
     /// managed default. Background work and child agents remain pinned.
+    ///
+    /// The API lane joined 2026-08-05: its catalog file is the locked model
+    /// list (gpt-5.6 sol/terra/luna), so root selection is still bounded by a
+    /// reviewed artifact rather than by whatever the account can reach.
     pub const fn allows_user_model_selection(self) -> bool {
-        matches!(self, Self::Subscription)
+        matches!(self, Self::Subscription | Self::Api)
+    }
+
+    /// Whether an explicit root may select the flex service tier. Metered
+    /// API-key billing is the lane where a cheaper best-effort tier makes
+    /// sense; subscription and Spark stay on their existing tier set so this
+    /// change cannot alter their behavior.
+    pub const fn allows_flex_selection(self) -> bool {
+        matches!(self, Self::Api)
     }
 
     /// Whether an explicit root-session `/fast` selection may opt into the
@@ -342,13 +354,15 @@ impl ModelPolicyLane {
     }
 
     pub(crate) fn validate_user_selected_model(self, model: &str) -> std::io::Result<()> {
-        if matches!(self, Self::Subscription)
-            && (is_spark_model_family(model) || is_auto_routing_model_family(model))
-        {
+        // Reserved families stay rejected on every lane that permits
+        // selection: Spark has a dedicated lane and usage limit, and automatic
+        // routing would make the running model unprovable.
+        if is_spark_model_family(model) || is_auto_routing_model_family(model) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "subscription model policy rejected reserved model `{model}`; use the dedicated Spark lane for Spark and select an explicit model instead of automatic routing"
+                    "{} model policy rejected reserved model `{model}`; use the dedicated Spark lane for Spark and select an explicit model instead of automatic routing",
+                    self.as_str()
                 ),
             ));
         }
@@ -406,12 +420,22 @@ impl ModelPolicyLane {
         {
             return Ok(());
         }
+        // Flex is API-lane only and root only: cheaper best-effort capacity is
+        // a metered-billing concept, and children/background stay on Standard
+        // exactly as they do for Fast.
+        if allow_user_service_tier_selection
+            && self.allows_flex_selection()
+            && service_tier == ServiceTier::Flex.request_value()
+        {
+            return Ok(());
+        }
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{} model policy rejected service tier `{service_tier}`; only an explicit subscription or API root may select `{}` and all other managed sessions require `{SERVICE_TIER_DEFAULT_REQUEST_VALUE}`",
+                "{} model policy rejected service tier `{service_tier}`; explicit subscription or API roots may select `{}`, explicit API roots may select `{}`, and all other managed sessions require `{SERVICE_TIER_DEFAULT_REQUEST_VALUE}`",
                 self.as_str(),
-                ServiceTier::Fast.request_value()
+                ServiceTier::Fast.request_value(),
+                ServiceTier::Flex.request_value()
             ),
         ))
     }
