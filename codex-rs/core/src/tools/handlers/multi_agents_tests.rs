@@ -4654,7 +4654,6 @@ fn locked_spawn_service_tier_rejects_child_fast_overrides() {
     control
         .resolve_child_service_tier(Some(lane), Some("priority"))
         .expect_err("role-derived Fast must be rejected for a child");
-
     // Flex (API-lane root tier since 2026-08-05) follows the same child
     // contract as Fast: a flex root's children stay on Standard, and a role
     // config cannot select flex for them.
