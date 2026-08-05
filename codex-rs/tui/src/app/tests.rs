@@ -7392,12 +7392,16 @@ async fn changing_cyber_model_reasoning_preserves_selected_permissions() {
                         reasoning_effort: Some(Some(effort.clone())),
                         developer_instructions: None,
                     });
+                // The fork removed the unvalidated ApplyAdvancedReasoning
+                // path; the popup routes through the validated selection
+                // event, which exercises the same settings update.
                 app.handle_event(
                     &mut tui,
                     &mut app_server,
-                    AppEvent::ApplyAdvancedReasoning {
+                    AppEvent::ApplyThreadModelSelection {
                         model: model_name.clone(),
-                        effort: effort.clone(),
+                        effort: Some(effort.clone()),
+                        scope: crate::app_event::ModelSelectionScope::Conversation,
                     },
                 )
                 .await
