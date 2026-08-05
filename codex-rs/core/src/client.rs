@@ -520,6 +520,18 @@ impl ModelClient {
         locked_model_policy_lane().map_err(|err| CodexErr::InvalidRequest(err.to_string()))
     }
 
+    /// Reasoning mode for an outbound request.
+    ///
+    /// A managed lane derives this from the model actually being sent, so the
+    /// configured value can never drift from what the model accepts. Unmanaged
+    /// sessions keep stock behaviour and use the configured mode.
+    fn locked_reasoning_mode_for(&self, model: &str) -> Result<Option<ReasoningModeConfig>> {
+        match self.locked_policy_lane()? {
+            Some(lane) => Ok(lane.required_reasoning_mode_for_model(model)),
+            None => Ok(self.model_reasoning_mode),
+        }
+    }
+
     fn validate_locked_client_setup(&self, setup: &CurrentClientSetup) -> Result<()> {
         let Some(lane) = self.locked_policy_lane()? else {
             return Ok(());
@@ -574,44 +586,13 @@ impl ModelClient {
                 lane.as_str()
             )));
         }
-        if lane.allows_user_model_selection() && !is_non_root_agent {
+        // An explicit root may select its own model; everything else -- child
+        // agents, background work, review, memory -- stays on the managed model.
+        let user_selecting = lane.allows_user_model_selection() && !is_non_root_agent;
+        if user_selecting {
             lane.validate_user_selected_model(request.model.as_str())
                 .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-            let Some(reasoning) = request.reasoning.as_ref() else {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "{} model policy requires an explicit reasoning payload",
-                    lane.as_str()
-                )));
-            };
-            if reasoning.effort.is_none() {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "{} model policy requires an explicit reasoning effort for `{}`",
-                    lane.as_str(),
-                    request.model
-                )));
-            }
-            if request
-                .reasoning
-                .as_ref()
-                .is_some_and(|reasoning| reasoning.mode.is_some())
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "{} model policy rejected reasoning mode {:?}; required None",
-                    lane.as_str(),
-                    request
-                        .reasoning
-                        .as_ref()
-                        .and_then(|reasoning| reasoning.mode)
-                )));
-            }
-            lane.validate_service_tier(
-                request.service_tier.as_deref(),
-                /*allow_user_service_tier_selection*/ true,
-            )
-            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-            return Ok(());
-        }
-        if request.model != lane.required_model() {
+        } else if request.model != lane.required_model() {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejected request model `{}`; required `{}`",
                 lane.as_str(),
@@ -619,29 +600,49 @@ impl ModelClient {
                 lane.required_model()
             )));
         }
+
         let Some(reasoning) = request.reasoning.as_ref() else {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy requires an explicit reasoning payload",
                 lane.as_str()
             )));
         };
-        let required_effort = lane.required_wire_effort();
-        if reasoning.effort.as_ref() != Some(&required_effort) {
+
+        // Hoisted above the selection fork on purpose. This invariant used to
+        // live inside both branches, where an early return could skip it and a
+        // later edit could let the two copies disagree. Derived from the model
+        // actually being sent, so config cannot decide it.
+        let required_mode = lane.required_reasoning_mode_for_model(request.model.as_str());
+        if reasoning.mode != required_mode {
             return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy rejected wire reasoning effort {:?}; required {}",
-                lane.as_str(),
-                reasoning.effort,
-                required_effort
-            )));
-        }
-        if reasoning.mode != lane.required_reasoning_mode() {
-            return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy rejected reasoning mode {:?}; required {:?}",
+                "{} model policy rejected reasoning mode {:?} for `{}`; required {:?}",
                 lane.as_str(),
                 reasoning.mode,
-                lane.required_reasoning_mode()
+                request.model,
+                required_mode
             )));
         }
+
+        if user_selecting {
+            if reasoning.effort.is_none() {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "{} model policy requires an explicit reasoning effort for `{}`",
+                    lane.as_str(),
+                    request.model
+                )));
+            }
+        } else {
+            let required_effort = lane.required_wire_effort();
+            if reasoning.effort.as_ref() != Some(&required_effort) {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "{} model policy rejected wire reasoning effort {:?}; required {}",
+                    lane.as_str(),
+                    reasoning.effort,
+                    required_effort
+                )));
+            }
+        }
+
         lane.validate_service_tier(
             request.service_tier.as_deref(),
             /*allow_user_service_tier_selection*/ !is_non_root_agent,
@@ -904,13 +905,14 @@ impl ModelClient {
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
+        let memory_reasoning_mode = self.locked_reasoning_mode_for(&model_info.slug)?;
         let payload = ApiMemorySummarizeInput {
             model: model_info.slug.clone(),
             raw_memories,
             reasoning: effort
                 .map(reasoning_effort_for_request)
                 .map(|effort| Reasoning {
-                    mode: self.model_reasoning_mode,
+                    mode: memory_reasoning_mode,
                     effort: Some(effort),
                     summary: None,
                     context: None,
@@ -1012,9 +1014,9 @@ impl ModelClient {
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-    ) -> Reasoning {
-        Reasoning {
-            mode: self.model_reasoning_mode,
+    ) -> Result<Reasoning> {
+        Ok(Reasoning {
+            mode: self.locked_reasoning_mode_for(&model_info.slug)?,
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
                 .map(reasoning_effort_for_request),
@@ -1026,7 +1028,7 @@ impl ModelClient {
             context: model_info
                 .use_responses_lite
                 .then_some(ReasoningContext::AllTurns),
-        }
+        })
     }
 
     fn build_responses_request(
@@ -1082,7 +1084,7 @@ impl ModelClient {
                 Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
             )
         };
-        let reasoning = self.build_reasoning(model_info, effort, summary);
+        let reasoning = self.build_reasoning(model_info, effort, summary)?;
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
