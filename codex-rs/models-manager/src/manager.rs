@@ -32,6 +32,9 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODEL_POLICY_LANE_ENV: &str = "CDX_MODEL_POLICY_LANE";
+// Test-only since the API lane moved to the filtered-catalog contract; the
+// Exact contract machinery it exercises remains live for Spark.
+#[cfg(test)]
 const SOL_MODEL: &str = "gpt-5.6-sol";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 
@@ -50,10 +53,10 @@ fn picker_contract_for_lane(lane: Option<&str>) -> PickerContract {
     match lane {
         None => PickerContract::Upstream,
         Some("subscription") => PickerContract::Subscription,
-        Some("api") => PickerContract::Exact {
-            model: SOL_MODEL,
-            effort: ReasoningEffort::Ultra,
-        },
+        // The API lane's catalog file IS the locked model list (gpt-5.6
+        // sol/terra/luna), so the filtered-catalog contract offers exactly the
+        // reviewed set while still excluding reserved families.
+        Some("api") => PickerContract::Subscription,
         Some("spark") => PickerContract::Exact {
             model: SPARK_MODEL,
             effort: ReasoningEffort::XHigh,
