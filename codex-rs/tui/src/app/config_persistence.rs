@@ -762,15 +762,23 @@ impl App {
 
     pub(super) fn on_update_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
         let current_model = self.chat_widget.current_model().to_string();
-        let compatible_plan_effort = self.compatible_plan_reasoning_effort_for_model(
-            current_model.as_str(),
-            effort.clone(),
-            /*preserve_current_override*/ true,
-        );
+        let clear_ephemeral_plan_effort = effort != Some(ReasoningEffortConfig::Ultra)
+            && self.chat_widget.config_ref().plan_mode_reasoning_effort
+                == Some(ReasoningEffortConfig::Ultra)
+            && self.config.plan_mode_reasoning_effort != Some(ReasoningEffortConfig::Ultra);
+        let compatible_plan_effort = if clear_ephemeral_plan_effort {
+            effort.clone()
+        } else {
+            self.compatible_plan_reasoning_effort_for_model(
+                current_model.as_str(),
+                effort.clone(),
+                /*preserve_current_override*/ true,
+            )
+        };
         // TODO(aibrahim): Remove this and don't use config as a state object.
         // Instead, explicitly pass the stored collaboration mode's effort into new sessions.
         self.config.model_reasoning_effort = effort.clone();
-        self.chat_widget.set_reasoning_effort(effort.clone());
+        self.chat_widget.set_reasoning_effort(effort);
         if self.chat_widget.config_ref().plan_mode_reasoning_effort != compatible_plan_effort {
             self.chat_widget
                 .set_plan_mode_reasoning_effort(compatible_plan_effort);
