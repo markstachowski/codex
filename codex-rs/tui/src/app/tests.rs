@@ -7444,36 +7444,20 @@ async fn changing_cyber_model_reasoning_preserves_selected_permissions() {
                         reasoning_effort: Some(Some(effort.clone())),
                         developer_instructions: None,
                     });
-                // The fork removed the unvalidated ApplyAdvancedReasoning
-                // path; the popup routes through the validated selection
-                // event, which exercises the same settings update.
-                app.handle_event(
-                    &mut tui,
-                    &mut app_server,
-                    AppEvent::ApplyThreadModelSelection {
-                        model: model_name.clone(),
-                        effort: Some(effort.clone()),
-                        scope: crate::app_event::ModelSelectionScope::Conversation,
-                    },
-                )
-                .await
-                .expect("advanced reasoning selection should succeed");
-            } else {
-                app.handle_event(
-                    &mut tui,
-                    &mut app_server,
-                    AppEvent::UpdateModel(model_name.clone()),
-                )
-                .await
-                .expect("same-model selection should succeed");
-                app.handle_event(
-                    &mut tui,
-                    &mut app_server,
-                    AppEvent::UpdateReasoningEffort(Some(effort.clone())),
-                )
-                .await
-                .expect("reasoning selection should succeed");
             }
+            // The fork removed the split, unvalidated model/effort paths. All picker selections
+            // use one validated event so permission state is preserved atomically.
+            app.handle_event(
+                &mut tui,
+                &mut app_server,
+                AppEvent::ApplyThreadModelSelection {
+                    model: model_name.clone(),
+                    effort: Some(effort.clone()),
+                    scope: crate::app_event::ModelSelectionScope::Conversation,
+                },
+            )
+            .await
+            .expect("reasoning selection should succeed");
 
             let settings = next_thread_settings_updated(&mut app_server, thread_id)
                 .await
