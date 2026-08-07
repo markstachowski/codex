@@ -253,23 +253,17 @@ async fn accepted_model_migration_persists_target_default_reasoning_effort() {
             if from_model == "gpt-5.2" && to_model == "gpt-5.4"
     );
 
-    let update_model = rx.try_recv().expect("update model event");
+    let apply_selection = rx.try_recv().expect("apply model selection event");
     assert_matches!(
-        update_model,
-        AppEvent::UpdateModel(model) if model == "gpt-5.4"
+        apply_selection,
+        AppEvent::ApplyThreadModelSelection { model, effort, scope }
+            if model == "gpt-5.4"
+                && effort == Some(ReasoningEffortConfig::Medium)
+                && scope == crate::app_event::ModelSelectionScope::Conversation
     );
-
-    let update_effort = rx.try_recv().expect("update effort event");
-    assert_matches!(
-        update_effort,
-        AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Medium))
-    );
-
-    let persist_selection = rx.try_recv().expect("persist model selection event");
-    assert_matches!(
-        persist_selection,
-        AppEvent::PersistModelSelection { model, effort }
-            if model == "gpt-5.4" && effort == Some(ReasoningEffortConfig::Medium)
+    assert!(
+        rx.try_recv().is_err(),
+        "selection should be applied atomically"
     );
 }
 
