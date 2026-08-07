@@ -1380,6 +1380,8 @@ impl App {
                 effort,
                 scope,
             } => {
+                let model_changed = self.chat_widget.current_model() != model
+                    || self.chat_widget.current_collaboration_mode().model() != model;
                 let desired_mode = self
                     .chat_widget
                     .effective_collaboration_mode()
@@ -1398,15 +1400,18 @@ impl App {
                     // against the picker catalog. Spark stays on the
                     // rejection arm below.
                     Ok(Some(lane)) if lane.allows_user_model_selection() => {
-                        let Some(mut params) =
+                        let Some(mut params) = (if model_changed {
                             self.active_thread_model_setting_update_params(model.clone())
-                        else {
+                        } else {
+                            self.active_thread_reasoning_setting_update_params(effort.clone())
+                        }) else {
                             self.chat_widget.add_error_message(
                                 "Cannot apply a model selection before a root thread is active."
                                     .to_string(),
                             );
                             return Ok(AppRunControl::Continue);
                         };
+                        params.model = Some(model.clone());
                         params.effort = effort.clone();
                         params.collaboration_mode = Some(desired_mode.clone());
                         match app_server.thread_settings_update(params).await {
@@ -1463,9 +1468,12 @@ impl App {
                                 self.on_update_plan_mode_reasoning_effort(effort.clone());
                             }
                         }
-                        if let Some(mut params) =
+                        if let Some(mut params) = if model_changed {
                             self.active_thread_model_setting_update_params(model.clone())
-                        {
+                        } else {
+                            self.active_thread_reasoning_setting_update_params(effort.clone())
+                        } {
+                            params.model = Some(model.clone());
                             params.effort = effort.clone();
                             params.collaboration_mode = Some(desired_mode);
                             self.send_thread_settings_update(app_server, params).await;
