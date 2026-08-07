@@ -705,7 +705,7 @@ async fn plan_reasoning_scope_popup_plan_only_does_not_update_all_modes_reasonin
                 model,
                 effort: Some(ReasoningEffortConfig::High),
                 scope: crate::app_event::ModelSelectionScope::PlanOnly,
-            } if model == "gpt-5.4"
+            } if model == "gpt-5.5"
         )),
         "expected plan-only selection to be applied; events: {events:?}"
     );

@@ -427,23 +427,17 @@ async fn accepted_model_migration_persists_target_default_reasoning_effort() -> 
                 if from_model == model && to_model == replacement
         );
 
-        let update_model = rx.try_recv().expect("update model event");
+        let apply_selection = rx.try_recv().expect("apply model selection event");
         assert_matches!(
-            update_model,
-            AppEvent::UpdateModel(updated_model) if updated_model == replacement
+            apply_selection,
+            AppEvent::ApplyThreadModelSelection { model, effort, scope }
+                if model == replacement
+                    && effort == Some(target_effort)
+                    && scope == crate::app_event::ModelSelectionScope::Conversation
         );
-
-        let update_effort = rx.try_recv().expect("update effort event");
-        assert_matches!(
-            update_effort,
-            AppEvent::UpdateReasoningEffort(Some(effort)) if effort == target_effort
-        );
-
-        let persist_selection = rx.try_recv().expect("persist model selection event");
-        assert_matches!(
-            persist_selection,
-            AppEvent::PersistModelSelection { model: selected_model, effort }
-                if selected_model == replacement && effort == Some(target_effort)
+        assert!(
+            rx.try_recv().is_err(),
+            "selection should be applied atomically"
         );
     }
     assert_snapshot!(migration_copies.join("\n"), @r"
