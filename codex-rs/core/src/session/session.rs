@@ -1825,7 +1825,7 @@ impl Session {
             )
             .await?;
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
-            sess.schedule_startup_prewarm(sess.get_prompt_base_instructions().await.text)
+            sess.schedule_startup_prewarm(sess.get_prompt_base_instructions().await)
                 .await;
             let session_start_source = match &initial_history {
                 InitialHistory::Forked(_) if forked_from_id.is_some() => {

@@ -7,6 +7,7 @@ use crate::client_common::ResponseEvent;
 use crate::compact::CompactedHistoryMetadata;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
+use crate::compact::CompactionAttemptContext;
 use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
@@ -15,6 +16,7 @@ use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
+use crate::config::locked_model_policy_lane;
 use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -76,10 +78,15 @@ const MAX_RETAINED_AGENT_MESSAGE_TOKENS: i64 = 10_000;
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "auto-compaction keeps request snapshots and trigger metadata explicit"
+)]
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
+    cancellation_token: &CancellationToken,
     client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
@@ -95,6 +102,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         &sess,
         &step_context,
         fallback_step_context.as_ref(),
+        cancellation_token,
         Some(client_session),
         initial_context_injection,
         compaction_metadata,
@@ -104,12 +112,10 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
 
 pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
-    // Standalone compaction is its own request boundary, so it captures a fresh step.
-    let step_context = sess
-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
-        .await?;
+    let turn_context = Arc::clone(&step_context.turn);
     sess.emit_turn_started(&turn_context).await;
 
     let compaction_metadata = CompactionTurnMetadata::new(
@@ -122,6 +128,7 @@ pub(crate) async fn run_remote_compact_task(
         &sess,
         &step_context,
         /*fallback_step_context*/ None,
+        cancellation_token,
         /*client_session*/ None,
         InitialContextInjection::DoNotInject,
         compaction_metadata,
@@ -133,6 +140,7 @@ async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
     fallback_step_context: Option<&Arc<StepContext>>,
+    cancellation_token: &CancellationToken,
     client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
@@ -175,6 +183,7 @@ async fn run_remote_compact_task_inner(
         sess,
         step_context,
         fallback_step_context,
+        cancellation_token,
         client_session,
         initial_context_injection,
         compaction_metadata,
@@ -212,23 +221,32 @@ async fn run_remote_compact_task_inner(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "remote compaction keeps fallback authority and lifecycle analytics explicit"
+)]
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
     fallback_step_context: Option<&Arc<StepContext>>,
+    cancellation_token: &CancellationToken,
     mut client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
-    let turn_context = &step_context.turn;
+    let lane = locked_model_policy_lane()?;
+    let primary_attempt =
+        CompactionAttemptContext::prepare(sess, step_context, lane, cancellation_token).await?;
+    let turn_context = &primary_attempt.lifecycle_turn;
+    let request_step = &primary_attempt.request_step;
     let context_compaction_item = ContextCompactionItem::new();
     let compaction_id = context_compaction_item.id.clone();
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
-        turn_context.sub_id.as_str(),
+        request_step.turn.sub_id.as_str(),
         compaction_id.as_str(),
-        turn_context.model_info().slug.as_str(),
-        turn_context.provider.info().name.as_str(),
+        request_step.settings.model_info.slug.as_str(),
+        request_step.turn.provider.info().name.as_str(),
     );
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
@@ -236,15 +254,15 @@ async fn run_remote_compact_task_inner_impl(
 
     let attempt = run_remote_compact_v2_attempt(
         sess,
-        step_context,
+        &primary_attempt,
         client_session.as_deref_mut(),
         &compaction_trace,
         compaction_metadata,
         analytics_details,
     )
     .await;
-    let (attempt, compaction_turn_context) = match attempt {
-        Ok(attempt) => (attempt, turn_context),
+    let (attempt, compaction_turn_context, installed_trace) = match attempt {
+        Ok(attempt) => (attempt, Arc::clone(turn_context), compaction_trace.clone()),
         Err(error) => {
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
@@ -254,17 +272,25 @@ async fn run_remote_compact_task_inner_impl(
             }
             sess.set_last_known_step_context(fallback_step_context)
                 .await;
-            let fallback_turn_context = &fallback_step_context.turn;
+            let fallback_attempt = CompactionAttemptContext::prepare(
+                sess,
+                fallback_step_context,
+                lane,
+                cancellation_token,
+            )
+            .await?;
+            let fallback_turn_context = &fallback_attempt.lifecycle_turn;
+            let fallback_request_step = &fallback_attempt.request_step;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
-                    fallback_turn_context.sub_id.as_str(),
+                    fallback_request_step.turn.sub_id.as_str(),
                     compaction_id.as_str(),
-                    fallback_turn_context.model_info().slug.as_str(),
-                    fallback_turn_context.provider.info().name.as_str(),
+                    fallback_request_step.settings.model_info.slug.as_str(),
+                    fallback_request_step.turn.provider.info().name.as_str(),
                 );
             let fallback_result = run_remote_compact_v2_attempt(
                 sess,
-                fallback_step_context,
+                &fallback_attempt,
                 client_session,
                 &fallback_compaction_trace,
                 compaction_metadata,
@@ -273,14 +299,18 @@ async fn run_remote_compact_task_inner_impl(
             .await;
             record_model_fallback(
                 &sess.services.session_telemetry,
-                turn_context.model_info().slug.as_str(),
-                fallback_turn_context.model_info().slug.as_str(),
+                request_step.settings.model_info.slug.as_str(),
+                fallback_request_step.settings.model_info.slug.as_str(),
                 compaction_metadata.reason(),
                 compaction_metadata.implementation(),
                 fallback_result.as_ref().err(),
             );
             match fallback_result {
-                Ok(attempt) => (attempt, fallback_turn_context),
+                Ok(attempt) => (
+                    attempt,
+                    Arc::clone(fallback_turn_context),
+                    fallback_compaction_trace,
+                ),
                 Err(_) => return Err(error),
             }
         }
@@ -330,7 +360,7 @@ async fn run_remote_compact_task_inner_impl(
             .iter()
             .map(|envelope| envelope.item.clone())
             .collect::<Vec<_>>();
-        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+        installed_trace.record_installed(&CompactionCheckpointTracePayload {
             input_history: trace_input_history,
             replacement_history: &replacement_history,
         });
@@ -348,9 +378,10 @@ async fn run_remote_compact_task_inner_impl(
         },
     )
     .await;
-    sess.recompute_token_usage(compaction_turn_context).await;
+    sess.recompute_token_usage(compaction_turn_context.as_ref())
+        .await;
 
-    sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
+    sess.emit_turn_item_completed(compaction_turn_context.as_ref(), compaction_item)
         .await;
     Ok(())
 }
@@ -363,13 +394,14 @@ struct RemoteCompactionV2Output {
 
 async fn run_remote_compaction_request_v2(
     sess: &Session,
-    step_context: &StepContext,
+    request_step: &StepContext,
+    lifecycle_turn: &TurnContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
 ) -> CodexResult<RemoteCompactionV2Output> {
-    let turn_context = &step_context.turn;
-    let max_retries = turn_context
+    let max_retries = request_step
+        .turn
         .provider
         .info()
         .stream_max_retries()
@@ -379,21 +411,25 @@ async fn run_remote_compaction_request_v2(
         let result = match client_session
             .stream(
                 prompt,
-                turn_context.model_info(),
-                &turn_context.session_telemetry,
-                sess.reasoning_effort_for_request(
-                    &turn_context.initial_settings,
-                    RequestEffortUsage::Compaction,
-                )
-                .await,
-                turn_context.reasoning_summary(),
-                step_context.settings.service_tier.clone(),
+                &request_step.settings.model_info,
+                &request_step.session_telemetry,
+                if crate::config::locked_model_policy_lane()?.is_some() {
+                    request_step.settings.reasoning_effort().cloned()
+                } else {
+                    sess.reasoning_effort_for_request(
+                        &request_step.settings,
+                        RequestEffortUsage::Compaction,
+                    )
+                    .await
+                },
+                request_step.settings.reasoning_summary,
+                request_step.settings.service_tier.clone(),
                 responses_metadata,
                 &InferenceTraceContext::disabled(),
             )
             .await
         {
-            Ok(stream) => collect_compaction_output(sess, turn_context, stream).await,
+            Ok(stream) => collect_compaction_output(sess, lifecycle_turn, stream).await,
             Err(err) => Err(err),
         };
 
@@ -407,7 +443,7 @@ async fn run_remote_compaction_request_v2(
                     err,
                     client_session,
                     sess,
-                    turn_context,
+                    lifecycle_turn,
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
                 .await?;

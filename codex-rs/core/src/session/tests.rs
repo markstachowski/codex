@@ -63,6 +63,7 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AgentMessageInputContent;
@@ -130,7 +131,14 @@ use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
+use codex_network_proxy::ConfigReloader;
+use codex_network_proxy::ConfigReloaderFuture;
+use codex_network_proxy::ConfigState;
+use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::NetworkProxyConfig;
+use codex_network_proxy::NetworkProxyConstraints;
+use codex_network_proxy::NetworkProxyState;
+use codex_network_proxy::build_config_state;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::TelemetryAuthMode;
@@ -139,6 +147,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
@@ -241,6 +250,45 @@ pub(crate) fn update_turn_settings_for_test(
     let settings = Arc::new(settings);
     turn.initial_settings = Arc::clone(&settings);
     turn.current_settings.store(settings);
+}
+
+#[derive(Clone)]
+struct FixedNetworkProxyReloader {
+    state: ConfigState,
+}
+
+impl ConfigReloader for FixedNetworkProxyReloader {
+    fn source_label(&self) -> String {
+        "fixed session test config".to_string()
+    }
+
+    fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+        let state = self.state.clone();
+        Box::pin(async move { Ok(state) })
+    }
+}
+
+async fn test_network_proxy() -> NetworkProxy {
+    let state = build_config_state(
+        NetworkProxyConfig::default(),
+        NetworkProxyConstraints::default(),
+    )
+    .expect("build test network proxy state");
+    NetworkProxy::builder()
+        .state(Arc::new(NetworkProxyState::with_reloader(
+            state.clone(),
+            Arc::new(FixedNetworkProxyReloader { state }),
+        )))
+        .managed_by_codex(/*managed_by_codex*/ false)
+        .http_addr("127.0.0.1:43128".parse().expect("test HTTP proxy address"))
+        .socks_addr("127.0.0.1:48081".parse().expect("test SOCKS proxy address"))
+        .build()
+        .await
+        .expect("build test network proxy")
 }
 
 impl StepContext {
@@ -4898,13 +4946,13 @@ async fn turn_context_with_model_updates_model_fields() {
 #[tokio::test]
 async fn server_model_match_uses_request_step_model() {
     let (session, turn_context) = make_session_and_context().await;
-    let nested_turn_model = turn_context.model_info.slug.clone();
+    let nested_turn_model = turn_context.model_info().slug.clone();
     let mut step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let mut step_model = turn_context.model_info.as_ref().clone();
+    let mut step_model = turn_context.model_info().as_ref().clone();
     step_model.slug = "step-authority-model".to_string();
-    Arc::get_mut(&mut step_context)
-        .expect("new test step context should be uniquely owned")
-        .model_info = Arc::new(step_model);
+    let step =
+        Arc::get_mut(&mut step_context).expect("new test step context should be uniquely owned");
+    Arc::make_mut(&mut step.settings).model_info = Arc::new(step_model);
 
     session
         .enforce_server_model_match(step_context.as_ref(), "step-authority-model")
@@ -4919,6 +4967,199 @@ async fn server_model_match_uses_request_step_model() {
         message.contains("requested `step-authority-model`"),
         "{message}"
     );
+}
+
+#[tokio::test]
+async fn managed_background_step_validation_rejects_step_only_approval_drift() {
+    let (session, turn_context) = make_session_and_context().await;
+    let lane = crate::config::ModelPolicyLane::Subscription;
+    let mut step_context = session
+        .capture_managed_background_step_context(
+            Arc::clone(&turn_context),
+            lane,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("coherent managed background step");
+    step_context
+        .validate_managed_background(lane)
+        .expect("captured managed background step must be coherent");
+
+    let step = Arc::get_mut(&mut step_context)
+        .expect("new managed background step should be uniquely owned");
+    let settings = Arc::make_mut(&mut step.settings);
+    let approval_policy = if settings.approval_policy() == AskForApproval::Never {
+        AskForApproval::OnRequest
+    } else {
+        AskForApproval::Never
+    };
+    update_selected_settings_for_test(settings, |selected| {
+        selected.approval_policy = codex_config::Constrained::allow_any(approval_policy);
+    });
+    let error = step
+        .validate_managed_background(lane)
+        .expect_err("step-only approval drift must fail closed");
+    assert!(
+        error.to_string().contains("snapshot is incoherent"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn managed_background_step_validation_rejects_step_only_reviewer_drift() {
+    let (session, turn_context) = make_session_and_context().await;
+    let lane = crate::config::ModelPolicyLane::Subscription;
+    let mut step_context = session
+        .capture_managed_background_step_context(
+            Arc::clone(&turn_context),
+            lane,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("coherent managed background step");
+    let step = Arc::get_mut(&mut step_context)
+        .expect("new managed background step should be uniquely owned");
+    let settings = Arc::make_mut(&mut step.settings);
+    let approvals_reviewer = if settings.approvals_reviewer() == ApprovalsReviewer::User {
+        ApprovalsReviewer::AutoReview
+    } else {
+        ApprovalsReviewer::User
+    };
+    update_selected_settings_for_test(settings, |selected| {
+        selected.approvals_reviewer = approvals_reviewer;
+    });
+    let error = step
+        .validate_managed_background(lane)
+        .expect_err("step-only reviewer drift must fail closed");
+    assert!(
+        error.to_string().contains("snapshot is incoherent"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn managed_background_step_preserves_source_turn_environment_authority() {
+    let (session, mut source_turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let source_workspace_dir = tempfile::tempdir().expect("create source workspace");
+    let live_workspace_dir = tempfile::tempdir().expect("create live workspace");
+    let source_workspace = source_workspace_dir.path().abs();
+    let live_workspace = live_workspace_dir.path().abs();
+    let source_profile = ActivePermissionProfile::read_only();
+    let mut source_shell_policy = ShellEnvironmentPolicy::default();
+    source_shell_policy
+        .r#set
+        .insert("AUTHORITY_PROBE".to_string(), "source".to_string());
+    let mut live_shell_policy = ShellEnvironmentPolicy::default();
+    live_shell_policy
+        .r#set
+        .insert("AUTHORITY_PROBE".to_string(), "live".to_string());
+
+    let source_environment = source_turn
+        .environments
+        .primary()
+        .expect("source primary environment")
+        .clone();
+    let mut source_environment_config = source_environment.config().clone();
+    source_environment_config.allow_login_shell = false;
+    source_environment_config.shell_environment_policy = source_shell_policy.clone();
+    source_environment_config.permission_profile =
+        PermissionProfileSnapshot::active(PermissionProfile::read_only(), source_profile.clone());
+    source_turn.environments.environments[0] = TurnEnvironmentState::Ready(TurnEnvironment::new(
+        TurnEnvironmentSelection {
+            environment_id: source_environment.selection.environment_id,
+            cwd: source_environment.selection.cwd,
+            workspace_roots: vec![PathUri::from_abs_path(&source_workspace)],
+            config: EnvironmentConfigState::Ready(source_environment_config),
+        },
+        source_environment.config_origin,
+        source_environment.environment,
+        source_environment.shell,
+    ));
+    let source_config = Arc::make_mut(&mut source_turn.config);
+    source_config.permissions.allow_login_shell = false;
+    source_config.permissions.shell_environment_policy = source_shell_policy.clone();
+    source_config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())
+        .expect("set source permission profile");
+    source_turn.network = Some(test_network_proxy().await);
+
+    let mut live_selection = session
+        .services
+        .turn_environments
+        .selections()
+        .into_iter()
+        .next()
+        .expect("live primary environment selection");
+    live_selection.workspace_roots = vec![PathUri::from_abs_path(&live_workspace)];
+    let mut live_environment_config = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .inferred_environment_config();
+    live_environment_config.allow_login_shell = true;
+    live_environment_config.shell_environment_policy = live_shell_policy;
+    live_environment_config.permission_profile =
+        PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
+    live_selection.config = EnvironmentConfigState::Ready(live_environment_config.clone());
+    session
+        .services
+        .turn_environments
+        .update_selections(&[live_selection], &live_environment_config);
+    let live_snapshot = session.services.turn_environments.snapshot().await;
+    assert_eq!(
+        live_snapshot.primary_workspace_roots(),
+        vec![live_workspace],
+        "the live environment must diverge before managed capture"
+    );
+
+    let source_turn = Arc::new(source_turn);
+    let managed_turn = session
+        .new_managed_background_turn_from_turn(
+            source_turn.as_ref(),
+            crate::config::ModelPolicyLane::Subscription,
+        )
+        .await;
+    let managed_step = session
+        .capture_step_context(Arc::clone(&managed_turn), &CancellationToken::new())
+        .await
+        .expect("capture managed background step");
+    let managed_environment = managed_step
+        .environments
+        .primary()
+        .expect("managed primary environment");
+
+    assert_eq!(
+        managed_step.environments.primary_workspace_roots(),
+        vec![source_workspace.clone()]
+    );
+    assert_eq!(
+        managed_turn.config.workspace_roots,
+        vec![source_workspace.clone()]
+    );
+    assert_eq!(
+        managed_turn.permission_profile(),
+        source_turn.permission_profile()
+    );
+    assert_eq!(
+        managed_environment.active_permission_profile(),
+        Some(source_profile)
+    );
+    assert_eq!(
+        managed_environment.shell_environment_policy(),
+        &source_shell_policy
+    );
+    assert!(!managed_turn.config.permissions.allow_login_shell);
+    assert_eq!(
+        managed_turn.config.permissions.shell_environment_policy,
+        source_shell_policy
+    );
+    assert_eq!(managed_turn.network, source_turn.network);
+    managed_step
+        .validate_managed_background(crate::config::ModelPolicyLane::Subscription)
+        .expect("source-authoritative managed step must remain inference-coherent");
 }
 
 pub(crate) struct ModelPolicyLaneEnvGuard {
@@ -11748,6 +11989,7 @@ async fn remote_compaction_v2_retains_only_the_selected_step(first_attempt: Firs
         Arc::clone(&session),
         Arc::clone(&primary),
         Some(Arc::clone(&fallback)),
+        &CancellationToken::new(),
         &mut client_session,
         InitialContextInjection::DoNotInject,
         CompactionReason::ModelDownshift,

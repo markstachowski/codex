@@ -346,6 +346,7 @@ pub(crate) async fn run_turn(
             Arc::clone(&first_step_context),
             /*fallback_step_context*/ None,
             &mut client_session,
+            &cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
@@ -615,6 +616,7 @@ pub(crate) async fn run_turn(
                         Arc::clone(&step_context),
                         /*fallback_step_context*/ None,
                         &mut client_session,
+                        &cancellation_token,
                         InitialContextInjection::BeforeLastUserMessage {
                             world_state: Arc::clone(&world_state),
                             step_context: Arc::clone(&step_context),
@@ -726,6 +728,7 @@ pub(crate) async fn run_turn(
                     Arc::clone(&step_context),
                     /*fallback_step_context*/ None,
                     &mut client_session,
+                    &cancellation_token,
                     InitialContextInjection::BeforeLastUserMessage {
                         world_state: Arc::clone(&world_state),
                         step_context: Arc::clone(&step_context),
@@ -1250,6 +1253,7 @@ async fn run_pre_sampling_compact(
             step_context,
             /*fallback_step_context*/ None,
             client_session,
+            cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
@@ -1341,6 +1345,7 @@ async fn maybe_run_previous_model_inline_compact(
             step_context,
             fallback_step_context,
             client_session,
+            cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
@@ -1389,6 +1394,7 @@ async fn maybe_run_previous_model_inline_compact(
             step_context,
             fallback_step_context,
             client_session,
+            cancellation_token,
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
@@ -1403,11 +1409,16 @@ async fn maybe_run_previous_model_inline_compact(
     skip_all,
     fields(reason = ?reason, phase = ?phase)
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "auto-compaction dispatch keeps request snapshots and trigger metadata explicit"
+)]
 async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
     client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -1437,6 +1448,7 @@ async fn run_auto_compact(
                 Arc::clone(sess),
                 step_context,
                 fallback_step_context,
+                cancellation_token,
                 client_session,
                 initial_context_injection,
                 reason,
@@ -1452,7 +1464,8 @@ async fn run_auto_compact(
             );
             run_inline_auto_compact_task(
                 Arc::clone(sess),
-                Arc::clone(turn_context),
+                step_context,
+                cancellation_token,
                 initial_context_injection,
                 reason,
                 phase,

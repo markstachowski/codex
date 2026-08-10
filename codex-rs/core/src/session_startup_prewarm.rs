@@ -12,6 +12,9 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_base_instructions_for_model;
 use crate::guardian::routes_approval_to_guardian;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
@@ -184,7 +187,10 @@ impl SessionStartupPrewarmHandle {
 }
 
 impl Session {
-    pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
+    pub(crate) async fn schedule_startup_prewarm(
+        self: &Arc<Self>,
+        base_instructions: BaseInstructions,
+    ) {
         if self.features().enabled(Feature::CodeModePrewarm)
             && self.services.code_mode_service.is_available()
         {
@@ -214,9 +220,17 @@ impl Session {
         let startup_prewarm_session = Arc::clone(self);
         let startup_prewarm = tokio::spawn(
             async move {
-                let result =
-                    schedule_startup_prewarm_inner(startup_prewarm_session, base_instructions)
-                        .await;
+                let result = match locked_model_policy_lane() {
+                    Ok(lane) => {
+                        schedule_startup_prewarm_inner(
+                            startup_prewarm_session,
+                            base_instructions,
+                            lane,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err.into()),
+                };
                 let status = if result.is_ok() { "ready" } else { "failed" };
                 session_telemetry.record_startup_phase(
                     "startup_prewarm_total",
@@ -262,20 +276,41 @@ impl Session {
 
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
-    base_instructions: String,
+    base_instructions: BaseInstructions,
+    lane: Option<ModelPolicyLane>,
 ) -> CodexResult<ModelClientSession> {
     let prewarm_started_at = Instant::now();
-    let startup_turn_context = session
-        .new_startup_prewarm_turn_with_sub_id(INITIAL_SUBMIT_ID.to_owned())
+    let startup_turn_contexts = session
+        .new_startup_prewarm_turn_contexts_with_sub_id(INITIAL_SUBMIT_ID.to_owned(), lane)
         .await;
+    let startup_turn_context = startup_turn_contexts.request;
+    let guardian_parent_turn = startup_turn_contexts.guardian_parent;
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_create_turn_context",
         prewarm_started_at.elapsed(),
         /*status*/ None,
     );
-    if routes_approval_to_guardian(&startup_turn_context) {
+    let startup_cancellation_token = CancellationToken::new();
+    let built_tools_started_at = Instant::now();
+    // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
+    let step_context = session
+        .capture_step_context(
+            Arc::clone(&startup_turn_context),
+            &startup_cancellation_token,
+        )
+        .await?;
+    if let Some(lane) = lane {
+        step_context.validate_managed_background(lane)?;
+    }
+    let base_instructions = managed_background_base_instructions_for_model(
+        base_instructions,
+        &step_context.settings.model_info,
+        startup_turn_context.personality(),
+    );
+    // Guardian still enforces Turn/config-owned approval policy. Do not start its
+    // background session until the managed Step/Turn parity boundary has passed.
+    if routes_approval_to_guardian(&guardian_parent_turn) {
         let guardian_session = Arc::clone(&session);
-        let guardian_parent_turn = Arc::clone(&startup_turn_context);
         drop(tokio::spawn(async move {
             if let Err(err) = crate::guardian::prewarm_guardian_review_session(
                 guardian_session,
@@ -287,36 +322,23 @@ async fn schedule_startup_prewarm_inner(
             }
         }));
     }
-    let startup_cancellation_token = CancellationToken::new();
-    let built_tools_started_at = Instant::now();
-    // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
-    let step_context = session
-        .capture_step_context(
-            Arc::clone(&startup_turn_context),
-            &startup_cancellation_token,
-        )
-        .await?;
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_tools",
         built_tools_started_at.elapsed(),
         /*status*/ None,
     );
     let build_prompt_started_at = Instant::now();
-    let startup_prompt = build_prompt(
-        Vec::new(),
-        step_context.as_ref(),
-        BaseInstructions {
-            text: base_instructions,
-            provenance: None,
-        },
-    );
+    let startup_prompt = build_prompt(Vec::new(), step_context.as_ref(), base_instructions);
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_prompt",
         build_prompt_started_at.elapsed(),
         /*status*/ None,
     );
     let responses_metadata = session
-        .responses_metadata(&startup_turn_context, CodexResponsesRequestKind::Prewarm)
+        .responses_metadata(
+            step_context.turn.as_ref(),
+            CodexResponsesRequestKind::Prewarm,
+        )
         .await;
     let mut client_session = session.services.model_client.new_session();
     let websocket_warmup_started_at = Instant::now();
@@ -341,3 +363,7 @@ async fn schedule_startup_prewarm_inner(
     );
     Ok(client_session)
 }
+
+#[cfg(test)]
+#[path = "session_startup_prewarm_tests.rs"]
+mod tests;

@@ -5,6 +5,9 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_base_instructions_for_model;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
@@ -54,6 +57,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 pub use codex_prompts::SUMMARIZATION_PROMPT;
@@ -75,6 +79,43 @@ pub(crate) enum InitialContextInjection {
         step_context: Arc<StepContext>,
     },
     DoNotInject,
+}
+
+/// Separates the turn that owns compaction lifecycle state from the exact snapshot serialized by
+/// one compaction request.
+///
+/// Unmanaged attempts retain the caller's `StepContext` byte-for-byte. Managed attempts capture a
+/// coherent background step while events, hooks, history replacement, and reference-context
+/// bookkeeping remain attached to the source turn.
+pub(crate) struct CompactionAttemptContext {
+    pub(crate) request_step: Arc<StepContext>,
+    pub(crate) lifecycle_turn: Arc<TurnContext>,
+}
+
+impl CompactionAttemptContext {
+    pub(crate) async fn prepare(
+        sess: &Arc<Session>,
+        source_step: &Arc<StepContext>,
+        lane: Option<ModelPolicyLane>,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Self> {
+        let lifecycle_turn = Arc::clone(&source_step.turn);
+        let request_step = match lane {
+            Some(lane) => {
+                sess.capture_managed_background_step_context(
+                    Arc::clone(&lifecycle_turn),
+                    lane,
+                    cancellation_token,
+                )
+                .await?
+            }
+            None => Arc::clone(source_step),
+        };
+        Ok(Self {
+            request_step,
+            lifecycle_turn,
+        })
+    }
 }
 
 /// Metadata for a new compaction checkpoint, kept separate from its replacement history.
@@ -113,12 +154,14 @@ pub(crate) async fn build_compaction_initial_context(
 
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
+    cancellation_token: &CancellationToken,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
-    let prompt = turn_context
+    let prompt = step_context
+        .turn
         .config
         .compact_prompt
         .as_deref()
@@ -132,9 +175,11 @@ pub(crate) async fn run_inline_auto_compact_task(
 
     run_compact_task_inner(
         sess,
-        turn_context,
+        step_context,
         input,
         initial_context_injection,
+        locked_model_policy_lane()?,
+        cancellation_token,
         CompactionTrigger::Auto,
         reason,
         phase,
@@ -145,15 +190,19 @@ pub(crate) async fn run_inline_auto_compact_task(
 
 pub(crate) async fn run_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
     input: Vec<UserInput>,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    let turn_context = Arc::clone(&step_context.turn);
     sess.emit_turn_started(&turn_context).await;
     run_compact_task_inner(
         sess.clone(),
-        turn_context,
+        step_context,
         input,
         InitialContextInjection::DoNotInject,
+        locked_model_policy_lane()?,
+        cancellation_token,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -164,13 +213,16 @@ pub(crate) async fn run_compact_task(
 
 async fn run_compact_task_inner(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    lane: Option<ModelPolicyLane>,
+    cancellation_token: &CancellationToken,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
+    let turn_context = Arc::clone(&step_context.turn);
     let compaction_metadata =
         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
     let attempt = CompactionAnalyticsAttempt::begin(
@@ -200,9 +252,11 @@ async fn run_compact_task_inner(
     }
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
-        Arc::clone(&turn_context),
+        &step_context,
         input,
         initial_context_injection,
+        lane,
+        cancellation_token,
         compaction_metadata,
     )
     .await;
@@ -235,23 +289,29 @@ async fn run_compact_task_inner(
 
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    source_step: &Arc<StepContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    lane: Option<ModelPolicyLane>,
+    cancellation_token: &CancellationToken,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
+    let attempt_context =
+        CompactionAttemptContext::prepare(&sess, source_step, lane, cancellation_token).await?;
+    let request_step = &attempt_context.request_step;
+    let turn_context = &attempt_context.lifecycle_turn;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
+    sess.emit_turn_item_started(turn_context.as_ref(), &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
     history.record_items(
         &[initial_input_for_turn.into()],
-        turn_context.model_info().truncation_policy.into(),
+        request_step.model_info.truncation_policy.into(),
     );
 
-    let max_retries = turn_context.provider.info().stream_max_retries();
+    let max_retries = request_step.turn.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
@@ -259,20 +319,25 @@ async fn run_compact_task_inner_impl(
     // survives retries within this compact turn.
     let responses_metadata = sess
         .responses_metadata(
-            turn_context.as_ref(),
+            request_step.turn.as_ref(),
             CodexResponsesRequestKind::Compaction(compaction_metadata),
         )
         .await;
+    let base_instructions = managed_background_base_instructions_for_model(
+        sess.get_prompt_base_instructions().await,
+        &request_step.model_info,
+        request_step.turn.personality,
+    );
 
     let compaction_response_id = loop {
         // Clone is required because of the loop
         let turn_input = history
             .clone()
-            .for_prompt(&turn_context.model_info().input_modalities);
+            .for_prompt(&request_step.model_info.input_modalities);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
-            base_instructions: sess.get_prompt_base_instructions().await,
+            base_instructions: base_instructions.clone(),
             ..Default::default()
         };
         let attempt_result = drain_to_completed(
@@ -281,6 +346,7 @@ async fn run_compact_task_inner_impl(
             &mut client_session,
             &responses_metadata,
             &prompt,
+            request_step.as_ref(),
         )
         .await;
 
@@ -301,7 +367,7 @@ async fn run_compact_task_inner_impl(
                 // Pre-turn failures are reported after preserving the incoming prompt.
                 if !matches!(compaction_metadata.phase(), CompactionPhase::PreTurn) {
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    sess.send_event(turn_context.as_ref(), event).await;
                 }
                 return Err(e);
             }
@@ -319,7 +385,7 @@ async fn run_compact_task_inner_impl(
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 if !matches!(compaction_metadata.phase(), CompactionPhase::PreTurn) {
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    sess.send_event(turn_context.as_ref(), event).await;
                 }
                 return Err(e);
             }
@@ -339,7 +405,7 @@ async fn run_compact_task_inner_impl(
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     if !matches!(compaction_metadata.phase(), CompactionPhase::PreTurn) {
                         let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                        sess.send_event(&turn_context, event).await;
+                        sess.send_event(turn_context.as_ref(), event).await;
                     }
                     return Err(e);
                 }
@@ -392,14 +458,14 @@ async fn run_compact_task_inner_impl(
         },
     )
     .await;
-    sess.recompute_token_usage(&turn_context).await;
+    sess.recompute_token_usage(turn_context.as_ref()).await;
 
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
+    sess.emit_turn_item_completed(turn_context.as_ref(), compaction_item)
         .await;
     let warning = EventMsg::Warning(WarningEvent {
         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
     });
-    sess.send_event(&turn_context, warning).await;
+    sess.send_event(turn_context.as_ref(), warning).await;
     Ok(summary_suffix)
 }
 
@@ -756,23 +822,28 @@ fn build_compacted_history_with_limit(
 
 async fn drain_to_completed(
     sess: &Session,
-    turn_context: &TurnContext,
+    lifecycle_turn: &TurnContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
+    request_step: &StepContext,
 ) -> CodexResult<String> {
     let mut stream = client_session
         .stream(
             prompt,
-            turn_context.model_info(),
-            &turn_context.session_telemetry,
-            sess.reasoning_effort_for_request(
-                &turn_context.initial_settings,
-                RequestEffortUsage::Compaction,
-            )
-            .await,
-            turn_context.reasoning_summary(),
-            turn_context.config.service_tier.clone(),
+            &request_step.settings.model_info,
+            &request_step.session_telemetry,
+            if crate::config::locked_model_policy_lane()?.is_some() {
+                request_step.settings.reasoning_effort().cloned()
+            } else {
+                sess.reasoning_effort_for_request(
+                    &request_step.settings,
+                    RequestEffortUsage::Compaction,
+                )
+                .await
+            },
+            request_step.settings.reasoning_summary,
+            request_step.settings.service_tier.clone(),
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.
@@ -789,8 +860,8 @@ async fn drain_to_completed(
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 sess.record_conversation_items(
-                    turn_context,
-                    turn_context.model_info(),
+                    lifecycle_turn,
+                    &request_step.settings.model_info,
                     std::slice::from_ref(&item),
                 )
                 .await;
@@ -799,7 +870,7 @@ async fn drain_to_completed(
                 sess.set_server_reasoning_included(included).await;
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
-                sess.update_rate_limits(turn_context, snapshot).await;
+                sess.update_rate_limits(lifecycle_turn, snapshot).await;
             }
             Ok(ResponseEvent::Completed {
                 response_id,
@@ -808,13 +879,13 @@ async fn drain_to_completed(
                 ..
             }) => {
                 sess.record_observed_response_completed(
-                    turn_context,
+                    lifecycle_turn,
                     &response_id,
                     token_usage.as_ref(),
                     usage_metadata.as_ref(),
                 )
                 .await;
-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
+                sess.update_token_usage_info(lifecycle_turn, token_usage.as_ref())
                     .await?;
                 return Ok(response_id);
             }

@@ -1000,6 +1000,17 @@ impl TurnEnvironmentSnapshot {
         self.turn_environments().next()
     }
 
+    /// Returns the workspace roots captured for the primary selection, including while its
+    /// environment is still starting.
+    pub(crate) fn primary_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
+        let selection = match self.environments.first() {
+            Some(TurnEnvironmentState::Ready(environment)) => &environment.selection,
+            Some(TurnEnvironmentState::Starting(environment)) => &environment.selection,
+            None => return Vec::new(),
+        };
+        ThreadEnvironments::primary_workspace_roots_for(std::slice::from_ref(selection))
+    }
+
     /// Returns the primary environment's resolved permissions, or the provided fallback.
     pub(crate) fn permission_profile_or_else(
         &self,

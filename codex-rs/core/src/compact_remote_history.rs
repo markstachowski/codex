@@ -4,13 +4,13 @@ use crate::context::ContextualUserFragment;
 use crate::context::ImageResizeNotice;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_item_token_count;
-use crate::session::turn_context::TurnContext;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_utils_output_truncation::approx_token_count;
 
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
@@ -67,10 +67,12 @@ fn is_attached_notice(notice: &ResponseItem) -> bool {
 
 pub(crate) fn trim_function_call_history_to_fit_context_window(
     history: &mut ContextManager,
-    turn_context: &TurnContext,
+    model_info: &ModelInfo,
     base_instructions: &BaseInstructions,
 ) -> (usize, i64) {
-    let Some(context_window) = turn_context.model_context_window() else {
+    let Some(context_window) = model_info.resolved_context_window().map(|context_window| {
+        context_window.saturating_mul(model_info.effective_context_window_percent) / 100
+    }) else {
         return (0, 0);
     };
     // Keep the unclamped total so replacing an item cannot lose an overflow hidden by i64

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::agents_md::LoadedAgentsMd;
+use crate::config::ModelPolicyLane;
 use crate::config::TokenBudgetConfig;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::step_settings::ResolvedStepSettings;
@@ -12,6 +13,9 @@ use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::McpBinding;
 use codex_otel::SessionTelemetry;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::TurnContextItem;
 
 /// Request-scoped state that may change between model sampling requests.
@@ -42,5 +46,57 @@ impl StepContext {
         let mut item = self.turn.to_turn_context_item();
         item.summary = self.settings.reasoning_summary;
         item
+    }
+}
+
+impl StepContext {
+    /// Proves that a managed background request was captured from one coherent turn.
+    ///
+    /// Approval enforcement intentionally remains Turn/config-owned, so parity here
+    /// is a security boundary rather than a debug-only assertion.
+    pub(crate) fn validate_managed_background(&self, lane: ModelPolicyLane) -> CodexResult<()> {
+        let required_model = lane.required_background_model();
+        let required_effort = Some(lane.required_background_local_effort());
+        let required_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE);
+        let step_model = self.settings.model_info.slug.as_str();
+        let turn_model = self.turn.model_info().slug.as_str();
+        let config_model = self.turn.config.model.as_deref();
+        let step_effort = self.settings.reasoning_effort().cloned();
+        let turn_effort = self.turn.reasoning_effort().cloned();
+        let config_effort = self.turn.config.model_reasoning_effort.clone();
+        let step_summary = self.settings.reasoning_summary;
+        let turn_summary = self.turn.reasoning_summary();
+        let config_summary = self.turn.config.model_reasoning_summary;
+        let step_tier = self.settings.service_tier.as_deref();
+        let turn_tier = self.turn.initial_settings.service_tier.as_deref();
+        let config_tier = self.turn.config.service_tier.as_deref();
+        let step_approval = self.settings.approval_policy();
+        let turn_approval = self.turn.initial_settings.approval_policy();
+        let config_approval = self.turn.approval_policy();
+        let step_reviewer = self.settings.approvals_reviewer();
+        let turn_reviewer = self.turn.initial_settings.approvals_reviewer();
+        let config_reviewer = self.turn.config.approvals_reviewer;
+        let coherent = step_model == required_model
+            && turn_model == required_model
+            && config_model == Some(required_model)
+            && step_effort == required_effort
+            && turn_effort == required_effort
+            && config_effort == required_effort
+            && step_summary == turn_summary
+            && config_summary == Some(step_summary)
+            && step_tier == required_tier
+            && turn_tier == required_tier
+            && config_tier == required_tier
+            && step_approval == turn_approval
+            && step_approval == config_approval
+            && step_reviewer == turn_reviewer
+            && step_reviewer == config_reviewer;
+        if coherent {
+            return Ok(());
+        }
+        Err(CodexErr::InvalidRequest(format!(
+            "{} managed background snapshot is incoherent: step_model={step_model} turn_model={turn_model} config_model={config_model:?} step_effort={step_effort:?} turn_effort={turn_effort:?} config_effort={config_effort:?} step_summary={step_summary:?} turn_summary={turn_summary:?} config_summary={config_summary:?} step_tier={step_tier:?} turn_tier={turn_tier:?} config_tier={config_tier:?} step_approval={step_approval:?} turn_approval={turn_approval:?} config_approval={config_approval:?} step_reviewer={step_reviewer:?} turn_reviewer={turn_reviewer:?} config_reviewer={config_reviewer:?}",
+            lane.as_str(),
+        )))
     }
 }

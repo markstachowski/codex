@@ -30,13 +30,18 @@ impl SessionTask for CompactTask {
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
         if ctx.config.features.enabled(Feature::TokenBudget) {
             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
             return Ok(None);
         }
+        // Manual compaction has its own request boundary. Capture the source step once, then let
+        // the selected transport derive at most one managed request step from that snapshot.
+        let step_context = session
+            .capture_step_context(Arc::clone(&ctx), &cancellation_token)
+            .await?;
 
         let result = match ctx.provider.capabilities().remote_compaction {
             RemoteCompactionSupport::V2 => {
@@ -45,7 +50,12 @@ impl SessionTask for CompactTask {
                     "remote_v2",
                     /*manual*/ true,
                 );
-                crate::compact_remote_v2::run_remote_compact_task(session.clone(), ctx).await
+                crate::compact_remote_v2::run_remote_compact_task(
+                    session.clone(),
+                    step_context,
+                    &cancellation_token,
+                )
+                .await
             }
             RemoteCompactionSupport::Unsupported => {
                 emit_compact_metric(
@@ -63,7 +73,13 @@ impl SessionTask for CompactTask {
                     // Compaction prompt is synthesized; no UI element ranges to preserve.
                     text_elements: Vec::new(),
                 }];
-                crate::compact::run_compact_task(session.clone(), ctx, input).await
+                crate::compact::run_compact_task(
+                    session.clone(),
+                    step_context,
+                    input,
+                    &cancellation_token,
+                )
+                .await
             }
         };
         if let Err(err) = result

@@ -339,6 +339,36 @@ enum TurnMultiAgentRuntime {
     Preview,
 }
 
+pub(crate) struct StartupPrewarmTurnContexts {
+    pub(crate) guardian_parent: Arc<TurnContext>,
+    pub(crate) request: Arc<TurnContext>,
+}
+
+#[derive(Clone)]
+struct TurnContextRuntimeSnapshot {
+    environments: TurnEnvironmentSnapshot,
+    network: Option<NetworkProxy>,
+}
+
+impl TurnContextRuntimeSnapshot {
+    fn from_turn(turn: &TurnContext) -> Self {
+        Self {
+            environments: turn.environments.clone(),
+            network: turn.network.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnContextConstructionPolicy {
+    /// Ordinary turns publish their concrete model as the thread's current model metadata.
+    PublishModel,
+    /// Startup preview work must not replace the interactive root model metadata.
+    PreserveInteractiveModel,
+    /// Managed background work also retains its explicit internal Standard tier.
+    ManagedBackground,
+}
+
 impl TurnContext {
     /// Captures current model metadata without preparing a step.
     pub(crate) fn capture_current_model_info(&self) -> Arc<ModelInfo> {
@@ -721,13 +751,22 @@ impl Session {
         session_configuration: &SessionConfiguration,
         cwd: AbsolutePathBuf,
     ) -> Config {
+        let workspace_roots = self.services.turn_environments.primary_workspace_roots();
+        self.build_per_turn_config_with_workspace_roots(session_configuration, cwd, workspace_roots)
+    }
+
+    fn build_per_turn_config_with_workspace_roots(
+        &self,
+        session_configuration: &SessionConfiguration,
+        cwd: AbsolutePathBuf,
+        workspace_roots: Vec<AbsolutePathBuf>,
+    ) -> Config {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
         let config = session_configuration.original_config_do_not_use.clone();
         let mut per_turn_config = (*config).clone();
         per_turn_config.cwd = cwd;
         per_turn_config.permissions.approval_policy =
             session_configuration.step_settings.approval_policy.clone();
-        let workspace_roots = self.services.turn_environments.primary_workspace_roots();
         per_turn_config.workspace_roots = workspace_roots.clone();
         per_turn_config
             .permissions
@@ -741,6 +780,8 @@ impl Session {
         per_turn_config.service_tier = session_configuration.step_settings.service_tier.clone();
         per_turn_config.personality = session_configuration.step_settings.personality;
         per_turn_config.approvals_reviewer = session_configuration.step_settings.approvals_reviewer;
+        per_turn_config.model =
+            Some(session_configuration.step_settings.collaboration_mode.model().to_string());
         session_configuration
             .apply_permission_profile_to_permissions(&mut per_turn_config.permissions);
         let permission_profile = session_configuration.permission_profile();
@@ -967,6 +1008,8 @@ impl Session {
             options,
             TurnMultiAgentRuntime::ResolveAndStore,
             self.git_enrichment_policy,
+            TurnContextConstructionPolicy::PublishModel,
+            /*runtime_snapshot*/ None,
         )
         .await
     }
@@ -975,6 +1018,7 @@ impl Session {
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
+        construction_policy: TurnContextConstructionPolicy,
     ) -> Arc<TurnContext> {
         self.new_turn_context_from_configuration(
             sub_id,
@@ -982,6 +1026,26 @@ impl Session {
             NewTurnContextOptions::default(),
             TurnMultiAgentRuntime::Preview,
             GitEnrichmentPolicy::Skip,
+            construction_policy,
+            /*runtime_snapshot*/ None,
+        )
+        .await
+    }
+
+    async fn new_managed_background_turn_from_configuration(
+        &self,
+        sub_id: String,
+        session_configuration: SessionConfiguration,
+        runtime_snapshot: TurnContextRuntimeSnapshot,
+    ) -> Arc<TurnContext> {
+        self.new_turn_context_from_configuration(
+            sub_id,
+            session_configuration,
+            /*final_output_json_schema*/ None,
+            TurnMultiAgentRuntime::Preview,
+            GitEnrichmentPolicy::Skip,
+            TurnContextConstructionPolicy::ManagedBackground,
+            Some(runtime_snapshot),
         )
         .await
     }
@@ -995,8 +1059,37 @@ impl Session {
         options: NewTurnContextOptions,
         multi_agent_runtime: TurnMultiAgentRuntime,
         git_enrichment_policy: GitEnrichmentPolicy,
+        construction_policy: TurnContextConstructionPolicy,
+        runtime_snapshot: Option<TurnContextRuntimeSnapshot>,
     ) -> Arc<TurnContext> {
-        let turn_environments = self.services.turn_environments.snapshot().await;
+        let runtime_snapshot =
+            match runtime_snapshot {
+                Some(runtime_snapshot) => runtime_snapshot,
+                None => {
+                    let environments = self.services.turn_environments.snapshot().await;
+                    let network_permission_profile = environments
+                        .primary()
+                        .map(TurnEnvironment::permission_profile)
+                        .cloned()
+                        .unwrap_or_else(|| session_configuration.permission_profile());
+                    let network = self.services.network_proxy.load_full().as_ref().and_then(
+                        |started_proxy| {
+                            Self::managed_network_proxy_active_for_permission_profile(
+                                &network_permission_profile,
+                            )
+                            .then(|| started_proxy.proxy())
+                        },
+                    );
+                    TurnContextRuntimeSnapshot {
+                        environments,
+                        network,
+                    }
+                }
+            };
+        let TurnContextRuntimeSnapshot {
+            environments: turn_environments,
+            network,
+        } = runtime_snapshot;
         let primary_turn_environment = turn_environments.primary();
         // TODO(anp): Migrate per-turn config and legacy TurnContext cwd consumers to PathUri so
         // a foreign primary environment does not fall back to the session's host cwd.
@@ -1017,9 +1110,11 @@ impl Session {
                 self.features.enabled(Feature::Personality),
             )
             .await;
-        self.services
-            .thread_extension_data
-            .insert(model_info.clone());
+        if construction_policy == TurnContextConstructionPolicy::PublishModel {
+            self.services
+                .thread_extension_data
+                .insert(model_info.clone());
+        }
 
         let multi_agent_version = match multi_agent_runtime {
             TurnMultiAgentRuntime::ResolveAndStore => {
@@ -1083,21 +1178,16 @@ impl Session {
             per_turn_config,
             step_settings,
             &self.services.models_manager,
-            self.services
-                .network_proxy
-                .load_full()
-                .as_ref()
-                .and_then(|started_proxy| {
-                    Self::managed_network_proxy_active_for_permission_profile(
-                        &network_permission_profile,
-                    )
-                    .then(|| started_proxy.proxy())
-                }),
+            network,
             turn_environments,
             cwd,
             sub_id,
             skills_snapshot,
         );
+        if construction_policy == TurnContextConstructionPolicy::ManagedBackground {
+            Arc::make_mut(&mut turn_context.config).service_tier =
+                session_configuration.service_tier.clone();
+        }
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
         turn_context.extension_data.insert(trusted_plugin_roots);
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
@@ -1175,13 +1265,120 @@ impl Session {
             .await
     }
 
+    pub(crate) async fn new_startup_prewarm_turn_contexts_with_sub_id(
+        &self,
+        sub_id: String,
+        lane: Option<crate::config::ModelPolicyLane>,
+    ) -> StartupPrewarmTurnContexts {
+        let mut session_configuration = self.default_turn_configuration().await;
+        let guardian_parent = self
+            .new_startup_prewarm_turn_from_configuration(
+                sub_id.clone(),
+                session_configuration.clone(),
+                TurnContextConstructionPolicy::PreserveInteractiveModel,
+            )
+            .await;
+        self.services
+            .thread_extension_data
+            .insert_if(guardian_parent.model_info.as_ref().clone(), |existing| {
+                existing.is_none()
+            });
+        let Some(lane) = lane else {
+            return StartupPrewarmTurnContexts {
+                request: Arc::clone(&guardian_parent),
+                guardian_parent,
+            };
+        };
+        let resolved_summary = guardian_parent.reasoning_summary;
+        let inference = crate::config::managed_background_inference_for_lane(
+            guardian_parent.model_info.slug.clone(),
+            session_configuration.collaboration_mode.reasoning_effort(),
+            session_configuration.service_tier.clone(),
+            Some(lane),
+        );
+        session_configuration.collaboration_mode =
+            session_configuration.collaboration_mode.with_updates(
+                Some(inference.model),
+                Some(inference.reasoning_effort),
+                /*developer_instructions*/ None,
+            );
+        session_configuration.model_reasoning_summary = Some(resolved_summary);
+        session_configuration.service_tier = inference.service_tier;
+        let request = self
+            .new_startup_prewarm_turn_from_configuration(
+                sub_id,
+                session_configuration,
+                TurnContextConstructionPolicy::ManagedBackground,
+            )
+            .await;
+        StartupPrewarmTurnContexts {
+            guardian_parent,
+            request,
+        }
+    }
+
     pub(crate) async fn new_startup_prewarm_turn_with_sub_id(
         &self,
         sub_id: String,
+        lane: Option<crate::config::ModelPolicyLane>,
     ) -> Arc<TurnContext> {
-        let session_configuration = self.default_turn_configuration().await;
-        self.new_startup_prewarm_turn_from_configuration(sub_id, session_configuration)
+        self.new_startup_prewarm_turn_contexts_with_sub_id(sub_id, lane)
             .await
+            .request
+    }
+
+    pub(crate) async fn new_managed_background_turn_from_turn(
+        &self,
+        source: &TurnContext,
+        lane: crate::config::ModelPolicyLane,
+    ) -> Arc<TurnContext> {
+        let mut session_configuration = self.default_turn_configuration().await;
+        session_configuration.provider = source.provider.clone();
+        session_configuration.collaboration_mode = source.collaboration_mode();
+        session_configuration.model_reasoning_summary = Some(source.reasoning_summary);
+        session_configuration.service_tier = source.config.service_tier.clone();
+        session_configuration.developer_instructions = source.developer_instructions.clone();
+        session_configuration.personality = source.personality;
+        session_configuration.approval_policy = source.config.permissions.approval_policy.clone();
+        session_configuration.approvals_reviewer = source.config.approvals_reviewer;
+        session_configuration.permission_profile_state =
+            source.config.permissions.permission_profile_state().clone();
+        session_configuration.allow_login_shell = source.config.permissions.allow_login_shell;
+        session_configuration.shell_environment_policy =
+            source.config.permissions.shell_environment_policy.clone();
+        session_configuration.windows_sandbox_level = source.windows_sandbox_level;
+        #[allow(deprecated)]
+        {
+            session_configuration.legacy_fallback_cwd = source.cwd.clone();
+        }
+        session_configuration.codex_home = source.config.codex_home.clone();
+        session_configuration.original_config_do_not_use = Arc::clone(&source.config);
+        session_configuration.app_server_client_name = source.app_server_client_name.clone();
+        session_configuration.session_source = source.session_source.clone();
+        session_configuration.history_mode = source.history_mode;
+        session_configuration.parent_thread_id = source.parent_thread_id;
+        session_configuration.originator = source.originator.clone();
+        session_configuration.dynamic_tools = source.dynamic_tools.clone();
+
+        let inference = crate::config::managed_background_inference_for_lane(
+            source.model_info.slug.clone(),
+            source.reasoning_effort.clone(),
+            source.config.service_tier.clone(),
+            Some(lane),
+        );
+        session_configuration.collaboration_mode =
+            session_configuration.collaboration_mode.with_updates(
+                Some(inference.model),
+                Some(inference.reasoning_effort),
+                /*developer_instructions*/ None,
+            );
+        session_configuration.service_tier = inference.service_tier;
+        self.new_managed_background_turn_from_configuration(
+            source.sub_id.clone(),
+            session_configuration,
+            TurnContextRuntimeSnapshot::from_turn(source),
+        )
+        .await
     }
 
     async fn default_turn_configuration(&self) -> SessionConfiguration {

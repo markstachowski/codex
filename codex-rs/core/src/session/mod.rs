@@ -3953,6 +3953,22 @@ impl Session {
         .await
     }
 
+    pub(crate) async fn capture_managed_background_step_context(
+        self: &Arc<Self>,
+        source_turn: Arc<TurnContext>,
+        lane: crate::config::ModelPolicyLane,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Arc<StepContext>> {
+        let managed_turn = self
+            .new_managed_background_turn_from_turn(source_turn.as_ref(), lane)
+            .await;
+        let step = self
+            .capture_step_context(managed_turn, cancellation_token)
+            .await?;
+        step.validate_managed_background(lane)?;
+        Ok(step)
+    }
+
     pub(crate) async fn capture_step_context_with_required_mcp_servers(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
