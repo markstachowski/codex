@@ -8,6 +8,7 @@ use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::config::managed_background_inference_for_lane;
 use codex_core::content_items_to_text;
 use codex_core::detached_memory_responses_metadata;
 use codex_core::resolve_installation_id;
@@ -25,7 +26,6 @@ use codex_otel::TelemetryAuthMode;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InternalSessionSource;
@@ -52,17 +52,6 @@ pub(crate) struct StageOneRequestContext {
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) reasoning_summary: ReasoningSummary,
     pub(crate) service_tier: Option<String>,
-}
-
-pub(crate) fn managed_background_service_tier_for_lane(
-    inherited_service_tier: Option<String>,
-    lane: Option<codex_core::config::ModelPolicyLane>,
-) -> Option<String> {
-    if lane.is_some() {
-        Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
-    } else {
-        inherited_service_tier
-    }
 }
 
 impl StageOneRequestContext {
@@ -226,19 +215,16 @@ impl MemoryStartupContext {
     ) -> anyhow::Result<StageOneRequestContext> {
         let config_snapshot = self.thread.config_snapshot().await;
         let lane = codex_core::config::locked_model_policy_lane()?;
-        let service_tier =
-            managed_background_service_tier_for_lane(config_snapshot.service_tier, lane);
-        let (model_name, reasoning_effort) = match lane {
-            Some(lane) => (
-                lane.required_model().to_string(),
-                lane.required_local_effort(),
-            ),
-            None => (model_name.to_string(), reasoning_effort),
-        };
+        let inference = managed_background_inference_for_lane(
+            model_name.to_string(),
+            Some(reasoning_effort),
+            config_snapshot.service_tier,
+            lane,
+        );
         let model_info = self
             .thread_manager
             .get_models_manager()
-            .get_model_info(&model_name, &config.to_models_manager_config())
+            .get_model_info(&inference.model, &config.to_models_manager_config())
             .await;
         let reasoning_summary = config
             .model_reasoning_summary
@@ -251,12 +237,12 @@ impl MemoryStartupContext {
                 self.thread_id,
                 config,
                 SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
-                &model_name,
+                &inference.model,
                 config_snapshot.originator,
             ),
-            reasoning_effort: Some(reasoning_effort),
+            reasoning_effort: inference.reasoning_effort,
             reasoning_summary,
-            service_tier,
+            service_tier: inference.service_tier,
         })
     }
 
@@ -403,30 +389,37 @@ impl MemoryStartupContext {
 #[cfg(test)]
 mod managed_service_tier_tests {
     use super::*;
+    use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 
     #[test]
-    fn managed_background_work_clears_parent_fast_tier() {
-        assert_eq!(
-            managed_background_service_tier_for_lane(
+    fn locked_model_policy_managed_memory_uses_sol_ultra_standard() {
+        for lane in [
+            codex_core::config::ModelPolicyLane::Subscription,
+            codex_core::config::ModelPolicyLane::Api,
+            codex_core::config::ModelPolicyLane::Spark,
+        ] {
+            let managed = managed_background_inference_for_lane(
+                "root-model".to_string(),
+                Some(ReasoningEffort::High),
                 Some("priority".to_string()),
-                Some(codex_core::config::ModelPolicyLane::Subscription),
-            )
-            .as_deref(),
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+                Some(lane),
+            );
+            assert_eq!(managed.model, codex_core::config::SOL_MODEL);
+            assert_eq!(managed.reasoning_effort, Some(ReasoningEffort::Ultra));
+            assert_eq!(
+                managed.service_tier.as_deref(),
+                Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+            );
+        }
+
+        let unmanaged = managed_background_inference_for_lane(
+            "root-model".to_string(),
+            Some(ReasoningEffort::High),
+            Some("priority".to_string()),
+            None,
         );
-        assert_eq!(
-            managed_background_service_tier_for_lane(Some("priority".to_string()), None).as_deref(),
-            Some("priority")
-        );
-        // A flex parent (API-lane root tier since 2026-08-05) clears the same
-        // way: background work never inherits a non-Standard tier.
-        assert_eq!(
-            managed_background_service_tier_for_lane(
-                Some("flex".to_string()),
-                Some(codex_core::config::ModelPolicyLane::Api),
-            )
-            .as_deref(),
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
-        );
+        assert_eq!(unmanaged.model, "root-model");
+        assert_eq!(unmanaged.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(unmanaged.service_tier.as_deref(), Some("priority"));
     }
 }

@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 use codex_config::config_toml::RealtimeWsVersion;
+use codex_core::config::MODEL_POLICY_LANE_ENV;
 use codex_core::TurnInputRequest;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_history::InitialHistory;
@@ -70,6 +71,79 @@ const MEMORY_PROMPT_PHRASE: &str =
     "You have access to a memory folder with guidance from prior runs.";
 const REALTIME_CONVERSATION_TEST_SUBPROCESS_ENV_VAR: &str =
     "CODEX_REALTIME_CONVERSATION_TEST_SUBPROCESS";
+const MANAGED_REALTIME_POLICY_CASE_ENV_VAR: &str = "CODEX_MANAGED_REALTIME_POLICY_CASE";
+const MANAGED_REALTIME_POLICY_TEST_NAME: &str = "suite::realtime_conversation::managed_model_policy_rejects_realtime_starts_before_any_transport";
+
+#[derive(Clone, Copy)]
+enum ManagedRealtimeTransport {
+    Websocket,
+    Webrtc,
+}
+
+#[derive(Clone, Copy)]
+enum ManagedRealtimeModelSource {
+    Caller,
+    Configured,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedRealtimePolicyCase {
+    name: &'static str,
+    lane: &'static str,
+    transport: ManagedRealtimeTransport,
+    model_source: ManagedRealtimeModelSource,
+}
+
+const MANAGED_REALTIME_POLICY_CASES: [ManagedRealtimePolicyCase; 8] = [
+    ManagedRealtimePolicyCase {
+        name: "websocket_subscription_caller_model",
+        lane: "subscription",
+        transport: ManagedRealtimeTransport::Websocket,
+        model_source: ManagedRealtimeModelSource::Caller,
+    },
+    ManagedRealtimePolicyCase {
+        name: "websocket_subscription_configured_model",
+        lane: "subscription",
+        transport: ManagedRealtimeTransport::Websocket,
+        model_source: ManagedRealtimeModelSource::Configured,
+    },
+    ManagedRealtimePolicyCase {
+        name: "websocket_api_caller_model",
+        lane: "api",
+        transport: ManagedRealtimeTransport::Websocket,
+        model_source: ManagedRealtimeModelSource::Caller,
+    },
+    ManagedRealtimePolicyCase {
+        name: "websocket_api_configured_model",
+        lane: "api",
+        transport: ManagedRealtimeTransport::Websocket,
+        model_source: ManagedRealtimeModelSource::Configured,
+    },
+    ManagedRealtimePolicyCase {
+        name: "websocket_spark_caller_model",
+        lane: "spark",
+        transport: ManagedRealtimeTransport::Websocket,
+        model_source: ManagedRealtimeModelSource::Caller,
+    },
+    ManagedRealtimePolicyCase {
+        name: "websocket_spark_configured_model",
+        lane: "spark",
+        transport: ManagedRealtimeTransport::Websocket,
+        model_source: ManagedRealtimeModelSource::Configured,
+    },
+    ManagedRealtimePolicyCase {
+        name: "webrtc_api_caller_model",
+        lane: "api",
+        transport: ManagedRealtimeTransport::Webrtc,
+        model_source: ManagedRealtimeModelSource::Caller,
+    },
+    ManagedRealtimePolicyCase {
+        name: "webrtc_api_configured_model",
+        lane: "api",
+        transport: ManagedRealtimeTransport::Webrtc,
+        model_source: ManagedRealtimeModelSource::Configured,
+    },
+];
 
 #[derive(Debug, Clone)]
 struct RealtimeCallRequestCapture {
@@ -212,6 +286,39 @@ fn run_realtime_conversation_test_in_subprocess(
     );
     Ok(())
 }
+
+fn run_managed_realtime_policy_test_in_subprocess(case: ManagedRealtimePolicyCase) -> Result<()> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--exact")
+        .arg(MANAGED_REALTIME_POLICY_TEST_NAME)
+        .env(MANAGED_REALTIME_POLICY_CASE_ENV_VAR, case.name)
+        .env_remove(MODEL_POLICY_LANE_ENV)
+        .env_remove("CDX_USER_CONFIG_HOMES");
+    // The child owns its process environment and its loopback fixtures. Keep
+    // inherited proxy settings from redirecting either endpoint away from the
+    // local test servers.
+    for &key in codex_network_proxy::PROXY_ENV_KEYS {
+        command.env_remove(key);
+    }
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "managed realtime policy subprocess case `{}` failed\nstdout:\n{}\nstderr:\n{}",
+        case.name,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+fn managed_realtime_policy_case(name: &str) -> Result<ManagedRealtimePolicyCase> {
+    MANAGED_REALTIME_POLICY_CASES
+        .into_iter()
+        .find(|case| case.name == name)
+        .with_context(|| format!("unknown managed realtime policy case `{name}`"))
+}
+
 async fn seed_recent_thread(
     test: &TestCodex,
     title: &str,
@@ -1627,6 +1734,165 @@ async fn conversation_audio_before_start_emits_error() -> Result<()> {
     assert_eq!(err.message, "conversation is not running");
 
     server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_model_policy_rejects_realtime_starts_before_any_transport() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let Some(case_name) = std::env::var_os(MANAGED_REALTIME_POLICY_CASE_ENV_VAR) else {
+        for case in MANAGED_REALTIME_POLICY_CASES {
+            run_managed_realtime_policy_test_in_subprocess(case)?;
+        }
+        return Ok(());
+    };
+    let case_name = case_name
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("managed realtime policy case must be valid UTF-8"))?;
+    let case = managed_realtime_policy_case(&case_name)?;
+
+    assert!(
+        std::env::var_os(MODEL_POLICY_LANE_ENV).is_none(),
+        "the isolated child must build TestCodex without a managed lane"
+    );
+
+    let http_server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/realtime/calls$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "Location",
+                    "/v1/realtime/calls/calls/rtc_managed_policy_test",
+                )
+                .set_body_string("v=answer\r\n"),
+        )
+        .mount(&http_server)
+        .await;
+    let websocket_server = start_websocket_server(vec![vec![vec![]]]).await;
+
+    let caller_model = matches!(case.model_source, ManagedRealtimeModelSource::Caller)
+        .then(|| "caller-realtime-model".to_string());
+    let configured_model = matches!(case.model_source, ManagedRealtimeModelSource::Configured)
+        .then(|| "configured-realtime-model".to_string());
+    let websocket_base_url = websocket_server.uri().to_string();
+    let webrtc_call_base_url = format!("{}/v1", http_server.uri());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(move |config| {
+            // This is deliberately the managed API lane's valid ordinary
+            // provider. Only the two realtime endpoint overrides target local
+            // fixtures, so a zero-call result cannot be a false green from the
+            // ordinary ModelClient provider guard rejecting a mock base URL.
+            config.model_provider.base_url = Some("https://api.openai.com/v1".to_string());
+            config.experimental_realtime_ws_base_url = Some(websocket_base_url);
+            config.experimental_realtime_webrtc_call_base_url = Some(webrtc_call_base_url);
+            config.experimental_realtime_ws_model = configured_model;
+            config.experimental_realtime_ws_backend_prompt = Some("backend prompt".to_string());
+            config.experimental_realtime_ws_startup_context = Some(String::new());
+            config.realtime.version = RealtimeWsVersion::V1;
+        });
+    let test = builder.build(&http_server).await?;
+
+    // SAFETY: this exact test case runs alone in a dedicated subprocess. The
+    // parent removes the marker, TestCodex is fully built while unmanaged, and
+    // no other test can concurrently observe this child-only mutation.
+    unsafe {
+        std::env::set_var(MODEL_POLICY_LANE_ENV, case.lane);
+    }
+
+    let transport = match case.transport {
+        ManagedRealtimeTransport::Websocket => ConversationStartTransport::Websocket,
+        ManagedRealtimeTransport::Webrtc => ConversationStartTransport::Webrtc {
+            sdp: "v=offer\r\n".to_string(),
+        },
+    };
+    test.codex
+        .submit(Op::RealtimeConversationStart(ConversationStartParams {
+            client_managed_handoffs: false,
+            delegation_ack_filler: None,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode:
+                codex_protocol::protocol::CodexResponseHandoffMode::Thinking,
+            codex_response_handoff_channel_prefixes: None,
+            model: caller_model,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: false,
+            initial_items: Vec::new(),
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: Some(transport),
+            version: Some(RealtimeConversationVersion::V1),
+            voice: None,
+        }))
+        .await?;
+
+    let rejection = timeout(
+        Duration::from_secs(5),
+        wait_for_event_match(&test.codex, |msg| match msg {
+            EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                payload: RealtimeEvent::Error(message),
+            }) => Some(Ok(message.clone())),
+            EventMsg::RealtimeConversationStarted(_) => Some(Err(anyhow::anyhow!(
+                "unexpected RealtimeConversationStarted"
+            ))),
+            EventMsg::RealtimeConversationSdp(_) => {
+                Some(Err(anyhow::anyhow!("unexpected RealtimeConversationSdp")))
+            }
+            EventMsg::RealtimeConversationClosed(_) => Some(Err(anyhow::anyhow!(
+                "unexpected RealtimeConversationClosed"
+            ))),
+            EventMsg::Error(error) => Some(Err(anyhow::anyhow!(
+                "unexpected ordinary error event: {error:?}"
+            ))),
+            _ => None,
+        }),
+    )
+    .await
+    .context("timed out waiting for managed realtime policy rejection")??;
+    assert_eq!(
+        rejection,
+        format!(
+            "{} model policy rejected realtime conversation start; realtime inference is unavailable in managed lanes",
+            case.lane
+        )
+    );
+
+    let unexpected_late_event = timeout(
+        Duration::from_millis(250),
+        wait_for_event_match(&test.codex, |msg| match msg {
+            EventMsg::RealtimeConversationStarted(_) => Some("RealtimeConversationStarted"),
+            EventMsg::RealtimeConversationSdp(_) => Some("RealtimeConversationSdp"),
+            EventMsg::RealtimeConversationClosed(_) => Some("RealtimeConversationClosed"),
+            _ => None,
+        }),
+    )
+    .await;
+    assert!(
+        unexpected_late_event.is_err(),
+        "managed rejection emitted a late {}",
+        unexpected_late_event.expect("late event should be present")
+    );
+    assert!(
+        websocket_server.handshakes().is_empty(),
+        "managed rejection reached the realtime websocket override"
+    );
+    let http_requests = http_server
+        .received_requests()
+        .await
+        .context("mock HTTP request log unavailable")?;
+    assert!(
+        http_requests.is_empty(),
+        "managed rejection reached the realtime WebRTC call override"
+    );
+
+    test.codex.shutdown_and_wait().await?;
+    websocket_server.shutdown().await;
     Ok(())
 }
 
