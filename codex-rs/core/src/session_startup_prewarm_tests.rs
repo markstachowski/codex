@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::Result;
+use codex_api::ResponseCreateWsRequest;
 use codex_config::Constrained;
 use codex_features::Feature;
 use codex_login::CodexAuth;
@@ -12,10 +13,6 @@ use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
-use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_response_created;
-use core_test_support::responses::start_websocket_server;
-use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -34,6 +31,13 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                     config.permissions.approval_policy =
                         Constrained::allow_any(AskForApproval::Never);
                     config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+                    config.agents_enabled = lane.multi_agent_enabled();
+                    if lane.multi_agent_enabled() {
+                        config
+                            .features
+                            .enable(Feature::MultiAgentV2)
+                            .expect("managed API and subscription test lanes allow multi-agent v2");
+                    }
                 },
             )
             .await;
@@ -60,7 +64,7 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                         /*developer_instructions*/ None,
                     )),
                     reasoning_summary: Some(ReasoningSummary::Detailed),
-                    service_tier: root_tier.map(Some),
+                    service_tier: root_tier.clone().map(Some),
                     ..Default::default()
                 },
             )
@@ -81,10 +85,22 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
         let guardian_parent_turn = startup_turns.guardian_parent;
         let managed_turn = startup_turns.request;
         assert_eq!(
+            managed_turn.environments.to_selections(),
+            guardian_parent_turn.environments.to_selections(),
+            "startup Guardian parent and managed request must share one environment snapshot"
+        );
+        assert_eq!(managed_turn.network, guardian_parent_turn.network);
+        assert_eq!(
+            managed_turn.config.workspace_roots,
+            guardian_parent_turn.config.workspace_roots
+        );
+        assert_eq!(
             guardian_parent_turn.model_info().slug.as_str(),
             root_model.as_str(),
             "Guardian must retain the interactive root turn while managed prewarm uses Sol"
         );
+        assert_eq!(guardian_parent_turn.reasoning_effort(), Some(&root_effort));
+        assert_eq!(guardian_parent_turn.config.service_tier, root_tier);
         let managed_step = session
             .capture_step_context(Arc::clone(&managed_turn), &CancellationToken::new())
             .await?;
@@ -152,11 +168,15 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                 managed_step.turn.approval_policy(),
                 managed_step.settings.approvals_reviewer(),
                 managed_step.turn.config.approvals_reviewer,
+                guardian_parent_turn.approval_policy(),
+                guardian_parent_turn.config.approvals_reviewer,
             ),
             (
                 AskForApproval::Never,
                 AskForApproval::Never,
                 ApprovalsReviewer::AutoReview,
+                ApprovalsReviewer::AutoReview,
+                AskForApproval::Never,
                 ApprovalsReviewer::AutoReview,
             )
         );
@@ -228,11 +248,12 @@ async fn managed_startup_prewarm_seeds_missing_root_metadata_and_preserves_resol
     );
 
     let managed_turn = session
-        .new_startup_prewarm_turn_with_sub_id(
+        .new_startup_prewarm_turn_contexts_with_sub_id(
             "managed-prewarm-default-summary".to_string(),
             Some(ModelPolicyLane::Subscription),
         )
-        .await;
+        .await
+        .request;
 
     assert_eq!(managed_turn.model_info().slug, "gpt-5.6-sol");
     assert_eq!(managed_turn.reasoning_summary(), ReasoningSummary::Auto);
@@ -253,10 +274,47 @@ async fn managed_startup_prewarm_seeds_missing_root_metadata_and_preserves_resol
     assert_eq!(root_metadata.slug, "gpt-5.2");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn locked_model_policy_managed_startup_prewarm_does_not_inherit_root() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+#[tokio::test]
+async fn startup_prewarm_rejects_divergent_guardian_parent_authority() -> Result<()> {
+    let (session, _initial_turn_context, _rx) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            |_| {},
+        )
+        .await;
+    let mut prepared = prepare_startup_prewarm(
+        &session,
+        session.get_base_instructions().await,
+        Some(ModelPolicyLane::Subscription),
+    )
+    .await?;
+    let guardian_parent = Arc::get_mut(&mut prepared.guardian_parent_turn)
+        .expect("prepared Guardian parent should be uniquely owned");
+    let guardian_config = Arc::make_mut(&mut guardian_parent.config);
+    guardian_config.approvals_reviewer =
+        if guardian_config.approvals_reviewer == ApprovalsReviewer::User {
+            ApprovalsReviewer::AutoReview
+        } else {
+            ApprovalsReviewer::User
+        };
 
+    let error =
+        validate_guardian_parent_authority(&prepared.step_context, &prepared.guardian_parent_turn)
+            .expect_err("Guardian parent authority drift must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("startup prewarm Guardian authority is incoherent"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_network() -> Result<()>
+{
     let Some(lane) = locked_model_policy_lane()? else {
         return Ok(());
     };
@@ -270,24 +328,19 @@ async fn locked_model_policy_managed_startup_prewarm_does_not_inherit_root() -> 
             )?
         }
     };
-    let response_id = format!("{}-managed-warmup", lane.as_str());
-    let server = start_websocket_server(vec![vec![vec![
-        ev_response_created(&response_id),
-        ev_completed(&response_id),
-    ]]])
-    .await;
-    let base_url = format!("{}/v1", server.uri());
+    let lane_env = crate::session::tests::ModelPolicyLaneEnvGuard::unset();
     let (session, _initial_turn_context, _rx) =
         crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
             auth,
             Vec::new(),
-            move |config| {
-                config.model_provider.base_url = Some(base_url);
-                config.model_provider.supports_websockets = true;
-                config
-                    .features
-                    .enable(Feature::ResponsesWebsocketsV2)
-                    .expect("test config should allow WebSocket v2");
+            |config| {
+                config.agents_enabled = lane.multi_agent_enabled();
+                if lane.multi_agent_enabled() {
+                    config
+                        .features
+                        .enable(Feature::MultiAgentV2)
+                        .expect("managed API and subscription test lanes allow multi-agent v2");
+                }
             },
         )
         .await;
@@ -321,6 +374,8 @@ async fn locked_model_policy_managed_startup_prewarm_does_not_inherit_root() -> 
     assert_eq!(root_turn.model_info().slug, root_model);
     assert_eq!(root_turn.reasoning_effort(), Some(&root_effort));
     assert_eq!(root_turn.config.service_tier, root_tier);
+    lane_env.restore();
+    assert_eq!(locked_model_policy_lane()?, Some(lane));
 
     let sol_model_info = session
         .services
@@ -339,67 +394,110 @@ async fn locked_model_policy_managed_startup_prewarm_does_not_inherit_root() -> 
             model: root_turn.model_info().slug.clone(),
         }),
     };
-    let _managed_client_session =
-        schedule_startup_prewarm_inner(Arc::clone(&session), base_instructions, Some(lane)).await?;
-    let managed = server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
-        .await
-        .body_json();
-    let managed_metadata: serde_json::Value = serde_json::from_str(
-        managed["client_metadata"]["x-codex-turn-metadata"]
-            .as_str()
-            .expect("managed prewarm turn metadata"),
-    )?;
-    let expected_context_window_id = session.current_window().await.1.to_string();
-
-    assert_eq!(managed["generate"].as_bool(), Some(false));
-    assert_eq!(managed["model"].as_str(), Some("gpt-5.6-sol"));
-    assert_eq!(managed["reasoning"]["effort"].as_str(), Some("max"));
-    assert_eq!(managed_metadata["request_kind"].as_str(), Some("prewarm"));
+    let prepared = prepare_startup_prewarm(&session, base_instructions, Some(lane)).await?;
+    prepared.step_context.validate_managed_background(lane)?;
     assert_eq!(
-        managed_metadata["context_window_id"].as_str(),
-        Some(expected_context_window_id.as_str()),
-        "managed prewarm must carry the active context-window identity"
+        prepared.guardian_parent_turn.model_info().slug,
+        root_turn.model_info().slug
     );
     assert_eq!(
-        managed["reasoning"]
-            .get("mode")
-            .and_then(|mode| mode.as_str()),
-        match lane {
-            ModelPolicyLane::Api => Some("pro"),
-            ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
+        prepared.guardian_parent_turn.config.model,
+        root_turn.config.model
+    );
+    assert_eq!(
+        prepared.step_context.settings.approval_policy(),
+        prepared.guardian_parent_turn.approval_policy()
+    );
+    assert_eq!(
+        prepared.step_context.settings.approvals_reviewer(),
+        prepared.guardian_parent_turn.config.approvals_reviewer
+    );
+    assert!(matches!(
+        prepared.responses_metadata.request_kind,
+        Some(CodexResponsesRequestKind::Prewarm)
+    ));
+    assert_eq!(
+        prepared.prompt.base_instructions,
+        BaseInstructions {
+            text: expected_instructions.clone(),
+            provenance: Some(BaseInstructionsProvenance::Model {
+                model: "gpt-5.6-sol".to_string(),
+            }),
         }
     );
     assert_eq!(
-        managed["parallel_tool_calls"].as_bool(),
-        Some(!sol_model_info.use_responses_lite)
+        prepared.responses_metadata.context_window_id,
+        Some(session.current_window().await.2),
+        "managed prewarm must carry the active context-window identity"
     );
-    let serialized_instructions = if sol_model_info.use_responses_lite {
-        managed["input"]
-            .as_array()
-            .and_then(|input| {
-                input
-                    .iter()
-                    .find(|item| item["type"] == "message" && item["role"] == "developer")
-            })
-            .and_then(|item| item["content"][0]["text"].as_str())
-    } else {
-        managed["instructions"].as_str()
-    };
-    assert_eq!(
-        serialized_instructions,
-        Some(expected_instructions.as_str())
-    );
-    assert_eq!(
-        managed.get("service_tier").and_then(|tier| tier.as_str()),
-        match lane {
-            ModelPolicyLane::Api => Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
-            ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
-        },
-        "wire tier policy must come from the actual locked lane"
+    assert!(
+        !prepared.prompt.tools.is_empty(),
+        "managed prewarm must serialize the Sol tool snapshot"
     );
 
-    server.shutdown().await;
+    // This helper materializes only the body. It intentionally does not call current_client_setup,
+    // so the test performs no provider I/O; the live path still performs its official endpoint and
+    // authentication checks before transport. The body itself uses the actual process lane and the
+    // same final fail-closed request validator as production.
+    let request = session
+        .services
+        .model_client
+        .materialize_responses_request_for_test(
+            &prepared.prompt,
+            &prepared.step_context,
+            &prepared.responses_metadata,
+        )?;
+    let http_wire = serde_json::to_value(&request)?;
+    let websocket_wire = serde_json::to_value(ResponseCreateWsRequest {
+        generate: Some(false),
+        ..ResponseCreateWsRequest::from(&request)
+    })?;
+    let expected_mode = match lane {
+        ModelPolicyLane::Api => Some("pro"),
+        ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
+    };
+    let expected_tier = match lane {
+        ModelPolicyLane::Api => Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+        ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
+    };
+    for (transport, wire) in [("HTTP", &http_wire), ("WebSocket", &websocket_wire)] {
+        assert_eq!(
+            (
+                wire["model"].as_str(),
+                wire["reasoning"]["mode"].as_str(),
+                wire["reasoning"]["effort"].as_str(),
+                wire.get("service_tier").and_then(|tier| tier.as_str()),
+                wire["parallel_tool_calls"].as_bool(),
+            ),
+            (
+                Some("gpt-5.6-sol"),
+                expected_mode,
+                Some("max"),
+                expected_tier,
+                Some(!sol_model_info.use_responses_lite),
+            ),
+            "{transport} must carry the actual locked lane's managed prewarm contract"
+        );
+        let serialized_instructions = if sol_model_info.use_responses_lite {
+            wire["input"]
+                .as_array()
+                .and_then(|input| {
+                    input
+                        .iter()
+                        .find(|item| item["type"] == "message" && item["role"] == "developer")
+                })
+                .and_then(|item| item["content"][0]["text"].as_str())
+        } else {
+            wire["instructions"].as_str()
+        };
+        assert_eq!(
+            serialized_instructions,
+            Some(expected_instructions.as_str()),
+            "{transport} must serialize the Sol-derived base instructions"
+        );
+    }
+    assert_eq!(http_wire.get("generate"), None);
+    assert_eq!(websocket_wire["generate"].as_bool(), Some(false));
 
     Ok(())
 }

@@ -12,19 +12,24 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
+use crate::client_common::Prompt;
 use crate::config::ModelPolicyLane;
 use crate::config::locked_model_policy_lane;
 use crate::config::managed_background_base_instructions_for_model;
 use crate::guardian::routes_approval_to_guardian;
+use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::RequestEffortUsage;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn::build_prompt;
+use crate::session::turn_context::TurnContext;
 use codex_features::Feature;
 use codex_otel::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
 use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 
@@ -41,6 +46,13 @@ pub(crate) enum SessionStartupPrewarmResolution {
         status: &'static str,
         prewarm_duration: Option<Duration>,
     },
+}
+
+struct PreparedStartupPrewarm {
+    guardian_parent_turn: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
+    prompt: Prompt,
+    responses_metadata: CodexResponsesMetadata,
 }
 
 impl SessionStartupPrewarmHandle {
@@ -279,6 +291,51 @@ async fn schedule_startup_prewarm_inner(
     base_instructions: BaseInstructions,
     lane: Option<ModelPolicyLane>,
 ) -> CodexResult<ModelClientSession> {
+    let PreparedStartupPrewarm {
+        guardian_parent_turn,
+        step_context,
+        prompt,
+        responses_metadata,
+    } = prepare_startup_prewarm(&session, base_instructions, lane).await?;
+    let startup_turn_context = Arc::clone(&step_context.turn);
+    // Guardian still enforces Turn/config-owned approval policy. Initialize it only
+    // after the managed Step/Turn parity boundary passes, and install it before the regular
+    // websocket warmup so the first review reuses the prewarmed session.
+    if routes_approval_to_guardian(&guardian_parent_turn)
+        && let Err(err) = crate::guardian::prewarm_guardian_review_session(
+            Arc::clone(&session),
+            guardian_parent_turn,
+        )
+        .await
+    {
+        warn!("failed to initialize guardian review session: {err:#}");
+    }
+    let mut client_session = session.services.model_client.new_session();
+    let websocket_warmup_started_at = Instant::now();
+    client_session
+        .prewarm_websocket(
+            &prompt,
+            &step_context.settings.model_info,
+            &step_context.session_telemetry,
+            step_context.settings.reasoning_effort().cloned(),
+            step_context.settings.reasoning_summary,
+            step_context.settings.service_tier.clone(),
+            &responses_metadata,
+        )
+        .await?;
+    startup_turn_context.session_telemetry.record_startup_phase(
+        "startup_prewarm_websocket_warmup",
+        websocket_warmup_started_at.elapsed(),
+        /*status*/ None,
+    );
+    Ok(client_session)
+}
+
+async fn prepare_startup_prewarm(
+    session: &Arc<Session>,
+    base_instructions: BaseInstructions,
+    lane: Option<ModelPolicyLane>,
+) -> CodexResult<PreparedStartupPrewarm> {
     let prewarm_started_at = Instant::now();
     let startup_turn_contexts = session
         .new_startup_prewarm_turn_contexts_with_sub_id(INITIAL_SUBMIT_ID.to_owned(), lane)
@@ -302,26 +359,12 @@ async fn schedule_startup_prewarm_inner(
     if let Some(lane) = lane {
         step_context.validate_managed_background(lane)?;
     }
+    validate_guardian_parent_authority(&step_context, &guardian_parent_turn)?;
     let base_instructions = managed_background_base_instructions_for_model(
         base_instructions,
         &step_context.settings.model_info,
         startup_turn_context.personality(),
     );
-    // Guardian still enforces Turn/config-owned approval policy. Do not start its
-    // background session until the managed Step/Turn parity boundary has passed.
-    if routes_approval_to_guardian(&guardian_parent_turn) {
-        let guardian_session = Arc::clone(&session);
-        drop(tokio::spawn(async move {
-            if let Err(err) = crate::guardian::prewarm_guardian_review_session(
-                guardian_session,
-                guardian_parent_turn,
-            )
-            .await
-            {
-                warn!("failed to initialize guardian review session: {err:#}");
-            }
-        }));
-    }
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_tools",
         built_tools_started_at.elapsed(),
@@ -340,28 +383,31 @@ async fn schedule_startup_prewarm_inner(
             CodexResponsesRequestKind::Prewarm,
         )
         .await;
-    let mut client_session = session.services.model_client.new_session();
-    let websocket_warmup_started_at = Instant::now();
-    // Prewarm establishes the request baseline before the first turn can change effort.
-    client_session
-        .prewarm_websocket(
-            &startup_prompt,
-            &step_context.settings.model_info,
-            &step_context.session_telemetry,
-            session
-                .reasoning_effort_for_request(&step_context.settings, RequestEffortUsage::Sampling)
-                .await,
-            step_context.settings.reasoning_summary,
-            step_context.settings.service_tier.clone(),
-            &responses_metadata,
-        )
-        .await?;
-    startup_turn_context.session_telemetry.record_startup_phase(
-        "startup_prewarm_websocket_warmup",
-        websocket_warmup_started_at.elapsed(),
-        /*status*/ None,
-    );
-    Ok(client_session)
+    Ok(PreparedStartupPrewarm {
+        guardian_parent_turn,
+        step_context,
+        prompt: startup_prompt,
+        responses_metadata,
+    })
+}
+
+fn validate_guardian_parent_authority(
+    step_context: &StepContext,
+    guardian_parent_turn: &TurnContext,
+) -> CodexResult<()> {
+    if step_context.settings.approval_policy() == guardian_parent_turn.approval_policy()
+        && step_context.settings.approvals_reviewer()
+            == guardian_parent_turn.config.approvals_reviewer
+    {
+        return Ok(());
+    }
+    Err(CodexErr::InvalidRequest(format!(
+        "startup prewarm Guardian authority is incoherent: step_approval={:?} guardian_approval={:?} step_reviewer={:?} guardian_reviewer={:?}",
+        step_context.settings.approval_policy(),
+        guardian_parent_turn.approval_policy(),
+        step_context.settings.approvals_reviewer(),
+        guardian_parent_turn.config.approvals_reviewer,
+    )))
 }
 
 #[cfg(test)]

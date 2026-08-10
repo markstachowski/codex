@@ -1305,26 +1305,20 @@ impl Session {
         session_configuration.model_reasoning_summary = Some(resolved_summary);
         session_configuration.service_tier = inference.service_tier;
         let request = self
-            .new_startup_prewarm_turn_from_configuration(
+            .new_turn_context_from_configuration(
                 sub_id,
                 session_configuration,
+                /*final_output_json_schema*/ None,
+                TurnMultiAgentRuntime::Preview,
+                GitEnrichmentPolicy::Skip,
                 TurnContextConstructionPolicy::ManagedBackground,
+                Some(TurnContextRuntimeSnapshot::from_turn(&guardian_parent)),
             )
             .await;
         StartupPrewarmTurnContexts {
             guardian_parent,
             request,
         }
-    }
-
-    pub(crate) async fn new_startup_prewarm_turn_with_sub_id(
-        &self,
-        sub_id: String,
-        lane: Option<crate::config::ModelPolicyLane>,
-    ) -> Arc<TurnContext> {
-        self.new_startup_prewarm_turn_contexts_with_sub_id(sub_id, lane)
-            .await
-            .request
     }
 
     pub(crate) async fn new_managed_background_turn_from_turn(

@@ -133,6 +133,8 @@ use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::subagent_header_value;
+#[cfg(test)]
+use crate::session::step_context::StepContext;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -634,10 +636,11 @@ impl ModelClient {
 
     fn validate_locked_responses_request(
         &self,
+        lane: Option<ModelPolicyLane>,
         request: &ResponsesApiRequest,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        let Some(lane) = self.locked_policy_lane()? else {
+        let Some(lane) = lane else {
             return Ok(());
         };
         Self::validate_locked_responses_request_for_request_kind(
@@ -1049,12 +1052,16 @@ impl ModelClient {
 
     fn build_reasoning(
         &self,
+        lane: Option<ModelPolicyLane>,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-    ) -> Result<Reasoning> {
-        Ok(Reasoning {
-            mode: self.locked_reasoning_mode_for(&model_info.slug)?,
+    ) -> Reasoning {
+        Reasoning {
+            mode: match lane {
+                Some(lane) => lane.required_reasoning_mode_for_model(&model_info.slug),
+                None => self.model_reasoning_mode,
+            },
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
                 .map(|effort| model_info.resolve_reasoning_effort(effort)),
@@ -1066,11 +1073,12 @@ impl ModelClient {
             context: model_info
                 .use_responses_lite
                 .then_some(ReasoningContext::AllTurns),
-        })
+        }
     }
 
     pub(crate) fn build_responses_request(
         &self,
+        lane: Option<ModelPolicyLane>,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -1130,7 +1138,7 @@ impl ModelClient {
                 }
             }
         }
-        let reasoning = self.build_reasoning(model_info, effort, summary)?;
+        let reasoning = self.build_reasoning(lane, model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
@@ -1155,11 +1163,7 @@ impl ModelClient {
             prompt.output_schema_strict,
         );
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
-        let service_tier = Self::service_tier_for_request_for_lane(
-            self.locked_policy_lane()?,
-            model_info,
-            service_tier,
-        );
+        let service_tier = Self::service_tier_for_request_for_lane(lane, model_info, service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
@@ -1178,7 +1182,7 @@ impl ModelClient {
             client_metadata: Some(responses_metadata.client_metadata()),
             access_programs: None,
         };
-        self.validate_locked_responses_request(&request, responses_metadata)?;
+        self.validate_locked_responses_request(lane, &request, responses_metadata)?;
         Ok(request)
     }
 
@@ -1200,6 +1204,30 @@ impl ModelClient {
                 item.clear_tool_result_metadata();
             }
         }
+    }
+
+    /// Materializes the exact request body without resolving auth or opening a transport.
+    ///
+    /// This is deliberately test-only: production callers must still pass through
+    /// `current_client_setup`, including its managed endpoint and authentication checks. The body
+    /// itself goes through the same locked-lane lookup and final fail-closed validator as a live
+    /// HTTP or WebSocket request.
+    #[cfg(test)]
+    pub(crate) fn materialize_responses_request_for_test(
+        &self,
+        prompt: &Prompt,
+        step_context: &StepContext,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<ResponsesApiRequest> {
+        self.build_responses_request(
+            self.locked_policy_lane()?,
+            prompt,
+            &step_context.settings.model_info,
+            step_context.settings.reasoning_effort().cloned(),
+            step_context.settings.reasoning_summary,
+            step_context.settings.service_tier.clone(),
+            responses_metadata,
+        )
     }
 
     fn prepare_response_items_for_request(&self, input: &mut [ResponseItem]) {
@@ -1825,6 +1853,7 @@ impl ModelClientSession {
                 .await;
 
             let mut request = self.client.build_responses_request(
+                self.client.locked_policy_lane()?,
                 prompt,
                 model_info,
                 effort.clone(),
@@ -2001,6 +2030,7 @@ impl ModelClientSession {
                 pending_retry,
             );
             let mut request = self.client.build_responses_request(
+                self.client.locked_policy_lane()?,
                 prompt,
                 model_info,
                 effort.clone(),

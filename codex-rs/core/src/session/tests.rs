@@ -252,6 +252,13 @@ pub(crate) fn update_turn_settings_for_test(
     turn.current_settings.store(settings);
 }
 
+pub(crate) async fn set_base_instructions_provenance_for_test(
+    session: &Session,
+    provenance: Option<codex_protocol::models::BaseInstructionsProvenance>,
+) {
+    session.state.lock().await.base_instructions_provenance = provenance;
+}
+
 #[derive(Clone)]
 struct FixedNetworkProxyReloader {
     state: ConfigState,
@@ -4946,6 +4953,8 @@ async fn turn_context_with_model_updates_model_fields() {
 #[tokio::test]
 async fn server_model_match_uses_request_step_model() {
     let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
     let nested_turn_model = turn_context.model_info().slug.clone();
     let mut step_context = StepContext::for_test(Arc::clone(&turn_context));
     let mut step_model = turn_context.model_info().as_ref().clone();
@@ -4972,6 +4981,8 @@ async fn server_model_match_uses_request_step_model() {
 #[tokio::test]
 async fn managed_background_step_validation_rejects_step_only_approval_drift() {
     let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
     let lane = crate::config::ModelPolicyLane::Subscription;
     let mut step_context = session
         .capture_managed_background_step_context(
@@ -5008,6 +5019,8 @@ async fn managed_background_step_validation_rejects_step_only_approval_drift() {
 #[tokio::test]
 async fn managed_background_step_validation_rejects_step_only_reviewer_drift() {
     let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
     let lane = crate::config::ModelPolicyLane::Subscription;
     let mut step_context = session
         .capture_managed_background_step_context(
@@ -5173,17 +5186,21 @@ impl ModelPolicyLaneEnvGuard {
         unsafe { std::env::remove_var(crate::config::MODEL_POLICY_LANE_ENV) };
         Self { previous }
     }
-}
 
-impl Drop for ModelPolicyLaneEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: this test is serialized and restores the exact prior value.
+    pub(crate) fn restore(&self) {
+        // SAFETY: callers are serialized tests and this restores the exact captured value.
         unsafe {
             match self.previous.as_ref() {
                 Some(value) => std::env::set_var(crate::config::MODEL_POLICY_LANE_ENV, value),
                 None => std::env::remove_var(crate::config::MODEL_POLICY_LANE_ENV),
             }
         }
+    }
+}
+
+impl Drop for ModelPolicyLaneEnvGuard {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -5202,11 +5219,21 @@ async fn session_configuration_apply_runs_environment_validation_before_locked_i
 
     let configuration = session.state.lock().await.session_configuration.clone();
     let current_environments = session.services.turn_environments.selections();
-    let mut pending_environment = current_environments
+    let mut invalid_environment = current_environments
         .first()
         .cloned()
         .expect("test session should have a primary environment");
-    pending_environment.config = EnvironmentConfigState::Pending;
+    let mut invalid_environment_config = configuration.inferred_environment_config();
+    invalid_environment_config.selected_capability_roots.push(
+        codex_protocol::capabilities::SelectedCapabilityRoot {
+            id: "wrong-environment-root".to_string(),
+            location: codex_protocol::capabilities::CapabilityRootLocation::Environment {
+                environment_id: "wrong-environment".to_string(),
+                path: invalid_environment.cwd.clone(),
+            },
+        },
+    );
+    invalid_environment.config = EnvironmentConfigState::Ready(invalid_environment_config);
     let invalid_collaboration_mode = configuration.collaboration_mode.with_updates(
         Some(crate::config::SPARK_MODEL.to_string()),
         Some(Some(ReasoningEffortConfig::High)),
@@ -5215,7 +5242,7 @@ async fn session_configuration_apply_runs_environment_validation_before_locked_i
     let updates = SessionSettingsUpdate {
         environments: Some(TurnEnvironmentSelections::new(
             configuration.legacy_fallback_cwd.clone(),
-            vec![pending_environment],
+            vec![invalid_environment],
         )),
         collaboration_mode: Some(invalid_collaboration_mode),
         ..Default::default()
@@ -5224,7 +5251,7 @@ async fn session_configuration_apply_runs_environment_validation_before_locked_i
     let error = configuration
         .apply(&updates, &current_environments)
         .err()
-        .expect("pending environment configuration must fail before inference validation");
+        .expect("invalid environment configuration must fail before inference validation");
     assert!(matches!(
         error,
         ConstraintError::InvalidValue {
