@@ -14,11 +14,18 @@ use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
 use crate::config::ModelPolicyLane;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
+use crate::responses_metadata::CompactionTurnMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
+use codex_analytics::CompactionImplementation;
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
+use codex_analytics::CompactionTrigger;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::Reasoning;
+use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesApiRequest;
 use codex_api::TransportError;
@@ -40,10 +47,13 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::ReasoningMode;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
@@ -197,7 +207,7 @@ fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
     )
     .expect_err("a subscription child must remain on Standard");
 
-    let mut fast_api = managed.clone();
+    let mut fast_api = managed;
     fast_api.reasoning.as_mut().expect("reasoning payload").mode = Some(ReasoningMode::Pro);
     fast_api.service_tier = Some("priority".to_string());
     ModelClient::validate_locked_responses_request_for_lane(
@@ -222,6 +232,16 @@ fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
         &standard_api,
     )
     .expect("the API root may explicitly toggle back to Standard");
+
+    let mut omitted_api_tier = standard_api;
+    omitted_api_tier.service_tier = None;
+    let error = ModelClient::validate_locked_responses_request_for_lane(
+        ModelPolicyLane::Api,
+        /*is_non_root_agent*/ false,
+        &omitted_api_tier,
+    )
+    .expect_err("a managed API request must make Standard or Priority explicit on the wire");
+    assert!(error.to_string().contains("explicit service tier"));
 
     let mut fast_spark = policy_test_request("gpt-5.3-codex-spark", ReasoningEffort::XHigh);
     fast_spark.service_tier = Some("priority".to_string());
@@ -251,6 +271,258 @@ fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
     )
     .expect_err("the Spark lane is root-only");
     assert!(error.to_string().contains("rejects non-root requests"));
+}
+
+#[test]
+fn locked_model_policy_background_request_kinds_are_fail_closed() {
+    let compaction = CompactionTurnMetadata::new(
+        CompactionTrigger::Manual,
+        CompactionReason::UserRequested,
+        CompactionImplementation::Responses,
+        CompactionPhase::StandaloneTurn,
+    );
+    let background_kinds = [
+        CodexResponsesRequestKind::Prewarm,
+        CodexResponsesRequestKind::Compaction(compaction),
+        CodexResponsesRequestKind::Memory,
+    ];
+
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        for request_kind in background_kinds {
+            let mut inherited = policy_test_request("alternate-root", ReasoningEffort::High);
+            inherited.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            let error = ModelClient::validate_locked_responses_request_for_request_kind(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(request_kind),
+                &inherited,
+            )
+            .expect_err("background work must reject an inherited root model");
+            assert!(error.to_string().contains("required `gpt-5.6-sol`"));
+
+            let mut managed = policy_test_request("gpt-5.6-sol", ReasoningEffort::Max);
+            if matches!(lane, ModelPolicyLane::Api) {
+                managed.reasoning.as_mut().expect("reasoning payload").mode =
+                    Some(ReasoningMode::Pro);
+                managed.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+            }
+            ModelClient::validate_locked_responses_request_for_request_kind(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(request_kind),
+                &managed,
+            )
+            .expect("all managed background request kinds use Sol/Max/Standard");
+
+            let mut premium = managed.clone();
+            premium.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            ModelClient::validate_locked_responses_request_for_request_kind(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(request_kind),
+                &premium,
+            )
+            .expect_err("background work must reject an inherited premium tier");
+
+            let mut wrong_effort = managed.clone();
+            wrong_effort
+                .reasoning
+                .as_mut()
+                .expect("reasoning payload")
+                .effort = Some(ReasoningEffort::XHigh);
+            ModelClient::validate_locked_responses_request_for_request_kind(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(request_kind),
+                &wrong_effort,
+            )
+            .expect_err("background work must reject inherited root effort");
+        }
+    }
+
+    let managed = policy_test_request("gpt-5.6-sol", ReasoningEffort::Max);
+    let error = ModelClient::validate_locked_responses_request_for_request_kind(
+        ModelPolicyLane::Subscription,
+        /*is_non_root_agent*/ false,
+        /*request_kind*/ None,
+        &managed,
+    )
+    .expect_err("managed request bodies must identify their request kind");
+    assert!(error.to_string().contains("request-kind metadata"));
+}
+
+#[test]
+fn locked_model_policy_api_service_tier_wire_contract_is_explicit_and_scoped() {
+    fn assert_serialized_wire_contract(
+        request: &ResponsesApiRequest,
+        expected_mode: Option<&str>,
+        expected_effort: &str,
+        expected_service_tier: Option<&str>,
+    ) {
+        let http_wire = serde_json::to_value(request).expect("serialize Responses HTTP request");
+        let websocket_wire = serde_json::to_value(ResponseCreateWsRequest::from(request))
+            .expect("serialize Responses WebSocket request");
+
+        assert_eq!(
+            http_wire["reasoning"]
+                .get("mode")
+                .and_then(serde_json::Value::as_str),
+            expected_mode
+        );
+        assert_eq!(
+            http_wire["reasoning"]["effort"].as_str(),
+            Some(expected_effort)
+        );
+        assert_eq!(websocket_wire["reasoning"], http_wire["reasoning"]);
+
+        for (transport, wire) in [("HTTP", &http_wire), ("WebSocket", &websocket_wire)] {
+            match expected_service_tier {
+                Some(expected) => assert_eq!(
+                    wire["service_tier"].as_str(),
+                    Some(expected),
+                    "{transport} request must carry the selected service tier"
+                ),
+                None => assert!(
+                    wire.get("service_tier").is_none(),
+                    "{transport} request must omit the stock default service tier"
+                ),
+            }
+        }
+    }
+
+    let mut model = test_model_info();
+    model.service_tiers = [ServiceTier::Fast, ServiceTier::Flex]
+        .into_iter()
+        .map(|tier| ModelServiceTier {
+            id: tier.request_value().to_string(),
+            name: tier.to_string(),
+            description: format!("{} processing", tier.request_value()),
+        })
+        .collect();
+
+    for (lane, effort, configured, expected_mode, expected_effort, expected_tier) in [
+        (
+            ModelPolicyLane::Api,
+            ReasoningEffort::Ultra,
+            None,
+            Some("pro"),
+            "max",
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+        ),
+        (
+            ModelPolicyLane::Api,
+            ReasoningEffort::Ultra,
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+            Some("pro"),
+            "max",
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+        ),
+        (
+            ModelPolicyLane::Api,
+            ReasoningEffort::Ultra,
+            Some(ServiceTier::Fast.request_value().to_string()),
+            Some("pro"),
+            "max",
+            Some(ServiceTier::Fast.request_value()),
+        ),
+        (
+            ModelPolicyLane::Api,
+            ReasoningEffort::Ultra,
+            Some(ServiceTier::Flex.request_value().to_string()),
+            Some("pro"),
+            "max",
+            Some(ServiceTier::Flex.request_value()),
+        ),
+        (
+            ModelPolicyLane::Subscription,
+            ReasoningEffort::Ultra,
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+            None,
+            "max",
+            None,
+        ),
+        (
+            ModelPolicyLane::Spark,
+            ReasoningEffort::XHigh,
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+            None,
+            "xhigh",
+            None,
+        ),
+    ] {
+        model.slug = lane.required_model().to_string();
+        let wire_effort = super::reasoning_effort_for_request(effort);
+        let mut request = policy_test_request(model.slug.as_str(), wire_effort);
+        request.reasoning.as_mut().expect("reasoning payload").mode =
+            lane.required_reasoning_mode_for_model(model.slug.as_str());
+        request.service_tier =
+            ModelClient::service_tier_for_request_for_lane(Some(lane), &model, configured);
+        ModelClient::validate_locked_responses_request_for_request_kind(
+            lane,
+            /*is_non_root_agent*/ false,
+            Some(CodexResponsesRequestKind::Turn),
+            &request,
+        )
+        .expect("validate managed root request before serialization");
+        assert_serialized_wire_contract(&request, expected_mode, expected_effort, expected_tier);
+    }
+
+    model.slug = ModelPolicyLane::Api.required_model().to_string();
+    let mut unsupported = policy_test_request(model.slug.as_str(), ReasoningEffort::Max);
+    unsupported
+        .reasoning
+        .as_mut()
+        .expect("reasoning payload")
+        .mode = Some(ReasoningMode::Pro);
+    unsupported.service_tier = ModelClient::service_tier_for_request_for_lane(
+        Some(ModelPolicyLane::Api),
+        &model,
+        Some("unsupported".to_string()),
+    );
+    let error = ModelClient::validate_locked_responses_request_for_request_kind(
+        ModelPolicyLane::Api,
+        /*is_non_root_agent*/ false,
+        Some(CodexResponsesRequestKind::Turn),
+        &unsupported,
+    )
+    .expect_err("unsupported API tiers must fail closed before the wire");
+    assert!(error.to_string().contains("explicit service tier"));
+
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        let background_reasoning = Reasoning {
+            mode: lane.required_reasoning_mode_for_model("gpt-5.6-sol"),
+            effort: Some(ReasoningEffort::Max),
+            summary: None,
+            context: None,
+        };
+        ModelClient::validate_locked_memory_request_for_lane(
+            lane,
+            "gpt-5.6-sol",
+            Some(&background_reasoning),
+        )
+        .expect("memory summarize boundary must use Sol/Max in every managed lane");
+    }
+
+    let inherited_spark_reasoning = Reasoning {
+        mode: None,
+        effort: Some(ReasoningEffort::XHigh),
+        summary: None,
+        context: None,
+    };
+    ModelClient::validate_locked_memory_request_for_lane(
+        ModelPolicyLane::Spark,
+        "gpt-5.3-codex-spark",
+        Some(&inherited_spark_reasoning),
+    )
+    .expect_err("Spark/XHigh must not reach the dormant background memory endpoint");
 }
 
 #[tokio::test]

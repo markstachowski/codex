@@ -8,7 +8,6 @@ use crate::prune_old_extension_resources;
 use crate::rebuild_raw_memories_file_from_memories;
 use crate::runtime::MemoryStartupContext;
 use crate::runtime::SpawnedConsolidationAgent;
-use crate::runtime::managed_background_service_tier_for_lane;
 use crate::sync_rollout_summaries_from_memories;
 use crate::workspace::memory_workspace_diff;
 use crate::workspace::prepare_memory_workspace;
@@ -17,6 +16,7 @@ use crate::workspace::validate_consolidation_artifacts;
 use crate::workspace::write_workspace_diff;
 use codex_config::Constrained;
 use codex_core::config::Config;
+use codex_core::config::managed_background_inference_for_lane;
 use codex_features::Feature;
 use codex_model_provider::ModelProvider;
 use codex_protocol::ThreadId;
@@ -355,24 +355,26 @@ mod agent {
         }
         .ok()?;
 
-        if let Some(lane) = codex_core::config::locked_model_policy_lane().ok()? {
-            if !lane.allows_non_root_sessions() {
-                return None;
-            }
-            agent_config.model = Some(lane.required_model().to_string());
-            agent_config.model_reasoning_effort = Some(lane.required_local_effort());
-            agent_config.service_tier =
-                managed_background_service_tier_for_lane(agent_config.service_tier, Some(lane));
-        } else {
-            agent_config.model = Some(
-                config
-                    .memories
-                    .consolidation_model
-                    .clone()
-                    .unwrap_or_else(|| provider.memory_consolidation_preferred_model().to_string()),
-            );
-            agent_config.model_reasoning_effort = Some(crate::stage_two::REASONING_EFFORT);
+        let lane = codex_core::config::locked_model_policy_lane().ok()?;
+        if let Some(lane) = lane
+            && !lane.allows_non_root_sessions()
+        {
+            return None;
         }
+        let requested_model = config
+            .memories
+            .consolidation_model
+            .clone()
+            .unwrap_or_else(|| provider.memory_consolidation_preferred_model().to_string());
+        let inference = managed_background_inference_for_lane(
+            requested_model,
+            Some(crate::stage_two::REASONING_EFFORT),
+            agent_config.service_tier,
+            lane,
+        );
+        agent_config.model = Some(inference.model);
+        agent_config.model_reasoning_effort = inference.reasoning_effort;
+        agent_config.service_tier = inference.service_tier;
 
         Some(agent_config)
     }
