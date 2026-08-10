@@ -356,45 +356,40 @@ fn locked_model_policy_background_request_kinds_are_fail_closed() {
 }
 
 #[test]
-fn locked_model_policy_api_service_tier_wire_contract_is_explicit_and_scoped() {
-    fn assert_serialized_wire_contract(
-        request: &ResponsesApiRequest,
-        expected_mode: Option<&str>,
-        expected_effort: &str,
-        expected_service_tier: Option<&str>,
-    ) {
+fn locked_model_policy_request_builder_wiring_is_fail_closed() {
+    fn assert_api_wire_contract(request: &ResponsesApiRequest) {
         let http_wire = serde_json::to_value(request).expect("serialize Responses HTTP request");
         let websocket_wire = serde_json::to_value(ResponseCreateWsRequest::from(request))
             .expect("serialize Responses WebSocket request");
 
-        assert_eq!(
-            http_wire["reasoning"]
-                .get("mode")
-                .and_then(serde_json::Value::as_str),
-            expected_mode
-        );
-        assert_eq!(
-            http_wire["reasoning"]["effort"].as_str(),
-            Some(expected_effort)
-        );
-        assert_eq!(websocket_wire["reasoning"], http_wire["reasoning"]);
-
         for (transport, wire) in [("HTTP", &http_wire), ("WebSocket", &websocket_wire)] {
-            match expected_service_tier {
-                Some(expected) => assert_eq!(
+            assert_eq!(
+                (
+                    wire["model"].as_str(),
+                    wire["reasoning"]["mode"].as_str(),
+                    wire["reasoning"]["effort"].as_str(),
                     wire["service_tier"].as_str(),
-                    Some(expected),
-                    "{transport} request must carry the selected service tier"
                 ),
-                None => assert!(
-                    wire.get("service_tier").is_none(),
-                    "{transport} request must omit the stock default service tier"
+                (
+                    Some("gpt-5.6-sol"),
+                    Some("pro"),
+                    Some("max"),
+                    Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
                 ),
-            }
+                "{transport} must carry the complete managed API contract"
+            );
         }
     }
 
+    let client = test_model_client(SessionSource::Cli);
+    let provider = client
+        .state
+        .provider
+        .info()
+        .to_api_provider(/*auth_mode*/ None)
+        .expect("build API provider");
     let mut model = test_model_info();
+    model.slug = ModelPolicyLane::Api.required_model().to_string();
     model.service_tiers = [ServiceTier::Fast, ServiceTier::Flex]
         .into_iter()
         .map(|tier| ModelServiceTier {
@@ -403,94 +398,81 @@ fn locked_model_policy_api_service_tier_wire_contract_is_explicit_and_scoped() {
             description: format!("{} processing", tier.request_value()),
         })
         .collect();
-
-    for (lane, effort, configured, expected_mode, expected_effort, expected_tier) in [
-        (
-            ModelPolicyLane::Api,
-            ReasoningEffort::Ultra,
-            None,
-            Some("pro"),
-            "max",
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
-        ),
-        (
-            ModelPolicyLane::Api,
-            ReasoningEffort::Ultra,
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
-            Some("pro"),
-            "max",
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
-        ),
-        (
-            ModelPolicyLane::Api,
-            ReasoningEffort::Ultra,
-            Some(ServiceTier::Fast.request_value().to_string()),
-            Some("pro"),
-            "max",
-            Some(ServiceTier::Fast.request_value()),
-        ),
-        (
-            ModelPolicyLane::Api,
-            ReasoningEffort::Ultra,
-            Some(ServiceTier::Flex.request_value().to_string()),
-            Some("pro"),
-            "max",
-            Some(ServiceTier::Flex.request_value()),
-        ),
-        (
-            ModelPolicyLane::Subscription,
-            ReasoningEffort::Ultra,
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
-            None,
-            "max",
-            None,
-        ),
-        (
-            ModelPolicyLane::Spark,
-            ReasoningEffort::XHigh,
-            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
-            None,
-            "xhigh",
-            None,
-        ),
-    ] {
-        model.slug = lane.required_model().to_string();
-        let wire_effort = super::reasoning_effort_for_request(effort);
-        let mut request = policy_test_request(model.slug.as_str(), wire_effort);
-        request.reasoning.as_mut().expect("reasoning payload").mode =
-            lane.required_reasoning_mode_for_model(model.slug.as_str());
-        request.service_tier =
-            ModelClient::service_tier_for_request_for_lane(Some(lane), &model, configured);
-        ModelClient::validate_locked_responses_request_for_request_kind(
+    let prompt = Prompt::default();
+    let build = |lane, request_kind, service_tier| {
+        let responses_metadata = test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            request_kind,
+        );
+        client.build_responses_request(
             lane,
-            /*is_non_root_agent*/ false,
-            Some(CodexResponsesRequestKind::Turn),
-            &request,
+            &provider,
+            &prompt,
+            &model,
+            Some(ReasoningEffort::Ultra),
+            codex_protocol::config_types::ReasoningSummary::None,
+            service_tier,
+            &responses_metadata,
         )
-        .expect("validate managed root request before serialization");
-        assert_serialized_wire_contract(&request, expected_mode, expected_effort, expected_tier);
+    };
+
+    let root = build(
+        Some(ModelPolicyLane::Api),
+        TestCodexResponsesRequestKind::Turn,
+        /*service_tier*/ None,
+    )
+    .expect("ordinary managed API request must build");
+    assert_api_wire_contract(&root);
+
+    let background = build(
+        Some(ModelPolicyLane::Api),
+        TestCodexResponsesRequestKind::Prewarm,
+        /*service_tier*/ None,
+    )
+    .expect("managed API background request must stay on Standard");
+    assert_api_wire_contract(&background);
+
+    for tier in [ServiceTier::Fast, ServiceTier::Flex] {
+        let error = build(
+            Some(ModelPolicyLane::Api),
+            TestCodexResponsesRequestKind::Prewarm,
+            Some(tier.request_value().to_string()),
+        )
+        .expect_err("managed background work must reject premium service tiers");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("rejected service tier `{}`", tier.request_value()))
+        );
     }
 
-    model.slug = ModelPolicyLane::Api.required_model().to_string();
-    let mut unsupported = policy_test_request(model.slug.as_str(), ReasoningEffort::Max);
-    unsupported
-        .reasoning
-        .as_mut()
-        .expect("reasoning payload")
-        .mode = Some(ReasoningMode::Pro);
-    unsupported.service_tier = ModelClient::service_tier_for_request_for_lane(
+    let error = build(
         Some(ModelPolicyLane::Api),
-        &model,
-        Some("unsupported".to_string()),
-    );
-    let error = ModelClient::validate_locked_responses_request_for_request_kind(
-        ModelPolicyLane::Api,
-        /*is_non_root_agent*/ false,
-        Some(CodexResponsesRequestKind::Turn),
-        &unsupported,
+        TestCodexResponsesRequestKind::WebsocketConnection,
+        /*service_tier*/ None,
     )
-    .expect_err("unsupported API tiers must fail closed before the wire");
-    assert!(error.to_string().contains("explicit service tier"));
+    .expect_err("managed request bodies must identify their request kind");
+    assert!(error.to_string().contains("request-kind metadata"));
+
+    let stock = build(
+        /*lane*/ None,
+        TestCodexResponsesRequestKind::Turn,
+        /*service_tier*/ None,
+    )
+    .expect("unmanaged stock request must retain stock behavior");
+    assert_eq!(
+        stock.reasoning,
+        Some(Reasoning {
+            mode: None,
+            effort: Some(ReasoningEffort::Max),
+            summary: None,
+            context: None,
+        })
+    );
+    assert_eq!(stock.service_tier, None);
 
     for lane in [
         ModelPolicyLane::Subscription,
