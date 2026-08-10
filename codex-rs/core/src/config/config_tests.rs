@@ -392,6 +392,83 @@ fn locked_model_policy_bootstrap_service_tiers_are_standard_only() {
 }
 
 #[test]
+fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        for inherited in [
+            None,
+            Some(ServiceTier::Fast.request_value().to_string()),
+            Some(ServiceTier::Flex.request_value().to_string()),
+        ] {
+            let settings = managed_background_inference_for_lane(
+                "alternate-root".to_string(),
+                Some(ReasoningEffort::Low),
+                inherited,
+                Some(lane),
+            );
+            assert_eq!(settings.model, SOL_MODEL, "{} model", lane.as_str());
+            assert_eq!(
+                settings.reasoning_effort,
+                Some(ReasoningEffort::Ultra),
+                "{} local effort",
+                lane.as_str()
+            );
+            assert_eq!(
+                settings.service_tier.as_deref(),
+                Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+                "{} background work must not inherit a root tier",
+                lane.as_str()
+            );
+        }
+    }
+
+    let unmanaged = managed_background_inference_for_lane(
+        "alternate-root".to_string(),
+        Some(ReasoningEffort::Low),
+        Some("priority".to_string()),
+        None,
+    );
+    assert_eq!(unmanaged.model, "alternate-root");
+    assert_eq!(unmanaged.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(unmanaged.service_tier.as_deref(), Some("priority"));
+
+    let model_info = bundled_models_response()
+        .expect("bundled models should parse")
+        .models
+        .into_iter()
+        .find(|model| model.slug == SOL_MODEL)
+        .expect("bundled catalog should contain Sol");
+    let inherited = BaseInstructions {
+        text: "unmanaged model-specific instructions".to_string(),
+        provenance: Some(BaseInstructionsProvenance::Model {
+            model: "different-root-model".to_string(),
+        }),
+    };
+    assert_eq!(
+        managed_background_base_instructions_for_model(inherited.clone(), &model_info, None, None,),
+        inherited,
+        "unmanaged execution must preserve mismatched model provenance byte-for-byte"
+    );
+
+    let managed = managed_background_base_instructions_for_model(
+        inherited,
+        &model_info,
+        None,
+        Some(ModelPolicyLane::Api),
+    );
+    assert_eq!(managed.text, model_info.get_model_instructions(None));
+    assert_eq!(
+        managed.provenance,
+        Some(BaseInstructionsProvenance::Model {
+            model: SOL_MODEL.to_string(),
+        })
+    );
+}
+
+#[test]
 fn locked_model_policy_reasoning_mode_is_derived_from_the_model() {
     // Pro belongs to the model, not the lane: the API rejects the whole
     // request when `reasoning.mode` reaches a model that does not implement
