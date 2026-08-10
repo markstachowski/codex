@@ -304,19 +304,19 @@ impl ModelPolicyLane {
         matches!(self, Self::Subscription | Self::Api)
     }
 
-    /// Service tier applied whenever a new managed root is created. Every lane
-    /// starts on Standard; Fast is an explicit per-root opt-in via `/fast`,
-    /// never a startup default, so no session can silently begin billing at
-    /// the premium tier.
+    /// Internal service-tier selection applied whenever a new managed root is
+    /// created. Fast remains an explicit per-root opt-in via `/fast`. The API
+    /// request boundary serializes this Standard sentinel explicitly; stock
+    /// subscription and Spark request handling continue to omit it.
     pub const fn required_root_service_tier(self) -> &'static str {
         match self {
             Self::Api | Self::Subscription | Self::Spark => SERVICE_TIER_DEFAULT_REQUEST_VALUE,
         }
     }
 
-    /// Persistent startup tier required in each lane's physical config. Every
-    /// lane omits the key, so a root can only reach Fast through an explicit
-    /// in-session selection.
+    /// Persistent startup tier required in each lane's physical config. The
+    /// key stays absent because managed root initialization owns the default
+    /// and an in-session selection must remain conversation-local.
     pub const fn required_config_service_tier(self) -> Option<&'static str> {
         match self {
             Self::Api | Self::Subscription | Self::Spark => None,
@@ -325,7 +325,7 @@ impl ModelPolicyLane {
 
     /// Whether a fully merged config carries an allowed tier while a managed
     /// root is being bootstrapped. Every lane may use either its omitted
-    /// persistent baseline or an explicit Standard root selection; no lane may
+    /// persistent config or the managed Standard selection; no lane may
     /// bootstrap directly onto Fast.
     pub(crate) fn allows_bootstrap_service_tier(self, service_tier: Option<&str>) -> bool {
         service_tier == self.required_config_service_tier()

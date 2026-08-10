@@ -1142,6 +1142,15 @@ async fn prepare_realtime_start(
     sess: &Arc<Session>,
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
+    let lane = crate::config::locked_model_policy_lane()
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+    if let Some(lane) = lane {
+        return Err(CodexErr::InvalidRequest(format!(
+            "{} model policy rejected realtime conversation start; realtime inference is unavailable in managed lanes",
+            lane.as_str()
+        )));
+    }
+
     let provider = sess.provider().await;
     let auth_manager = sess
         .services
