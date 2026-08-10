@@ -595,10 +595,11 @@ impl ModelClient {
 
     fn validate_locked_responses_request(
         &self,
+        lane: Option<ModelPolicyLane>,
         request: &ResponsesApiRequest,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        let Some(lane) = self.locked_policy_lane()? else {
+        let Some(lane) = lane else {
             return Ok(());
         };
         Self::validate_locked_responses_request_for_request_kind(
@@ -861,6 +862,7 @@ impl ModelClient {
             self.state.auth_env_telemetry.clone(),
         );
         let request = self.build_responses_request(
+            self.locked_policy_lane()?,
             prompt,
             model_info,
             settings.effort,
@@ -1110,12 +1112,16 @@ impl ModelClient {
 
     fn build_reasoning(
         &self,
+        lane: Option<ModelPolicyLane>,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-    ) -> Result<Reasoning> {
-        Ok(Reasoning {
-            mode: self.locked_reasoning_mode_for(&model_info.slug)?,
+    ) -> Reasoning {
+        Reasoning {
+            mode: match lane {
+                Some(lane) => lane.required_reasoning_mode_for_model(&model_info.slug),
+                None => self.model_reasoning_mode,
+            },
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
                 .map(reasoning_effort_for_request),
@@ -1127,11 +1133,12 @@ impl ModelClient {
             context: model_info
                 .use_responses_lite
                 .then_some(ReasoningContext::AllTurns),
-        })
+        }
     }
 
     fn build_responses_request(
         &self,
+        lane: Option<ModelPolicyLane>,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -1183,7 +1190,7 @@ impl ModelClient {
                 Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
             )
         };
-        let reasoning = self.build_reasoning(model_info, effort, summary)?;
+        let reasoning = self.build_reasoning(lane, model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
@@ -1208,11 +1215,7 @@ impl ModelClient {
             prompt.output_schema_strict,
         );
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
-        let service_tier = Self::service_tier_for_request_for_lane(
-            self.locked_policy_lane()?,
-            model_info,
-            service_tier,
-        );
+        let service_tier = Self::service_tier_for_request_for_lane(lane, model_info, service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
@@ -1230,7 +1233,7 @@ impl ModelClient {
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
         };
-        self.validate_locked_responses_request(&request, responses_metadata)?;
+        self.validate_locked_responses_request(lane, &request, responses_metadata)?;
         Ok(request)
     }
 
@@ -1782,6 +1785,7 @@ impl ModelClientSession {
                 .await;
 
             let mut request = self.client.build_responses_request(
+                self.client.locked_policy_lane()?,
                 prompt,
                 model_info,
                 effort.clone(),
@@ -1922,6 +1926,7 @@ impl ModelClientSession {
                 pending_retry,
             );
             let mut request = self.client.build_responses_request(
+                self.client.locked_policy_lane()?,
                 prompt,
                 model_info,
                 effort.clone(),
