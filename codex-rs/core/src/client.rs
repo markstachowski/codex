@@ -78,6 +78,7 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningMode as ReasoningModeConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
@@ -122,6 +123,7 @@ use crate::config::ModelPolicyLane;
 use crate::config::locked_model_policy_lane;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
@@ -534,6 +536,31 @@ impl ModelClient {
         }
     }
 
+    /// Resolve the service tier that reaches a Responses request body.
+    ///
+    /// `default` remains an internal sentinel for stock, subscription, and
+    /// Spark traffic, where the upstream client intentionally omits it. The
+    /// managed API lane is different: omission delegates billing to the
+    /// mutable project setting, so cdxpro must make Standard explicit. A
+    /// missing managed API value is normalized to the same explicit Standard
+    /// value so no resumed or background request can silently become premium.
+    fn service_tier_for_request_for_lane(
+        lane: Option<ModelPolicyLane>,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+    ) -> Option<String> {
+        if matches!(lane, Some(ModelPolicyLane::Api))
+            && matches!(
+                service_tier.as_deref(),
+                None | Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+            )
+        {
+            return Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+        }
+
+        model_info.service_tier_for_request(service_tier)
+    }
+
     fn validate_locked_client_setup(&self, setup: &CurrentClientSetup) -> Result<()> {
         let Some(lane) = self.locked_policy_lane()? else {
             return Ok(());
@@ -566,40 +593,79 @@ impl ModelClient {
         Ok(())
     }
 
-    fn validate_locked_responses_request(&self, request: &ResponsesApiRequest) -> Result<()> {
+    fn validate_locked_responses_request(
+        &self,
+        request: &ResponsesApiRequest,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<()> {
         let Some(lane) = self.locked_policy_lane()? else {
             return Ok(());
         };
-        Self::validate_locked_responses_request_for_lane(
+        Self::validate_locked_responses_request_for_request_kind(
             lane,
             self.state.session_source.is_non_root_agent(),
+            responses_metadata.request_kind,
             request,
         )
     }
 
+    #[cfg(test)]
     fn validate_locked_responses_request_for_lane(
         lane: ModelPolicyLane,
         is_non_root_agent: bool,
         request: &ResponsesApiRequest,
     ) -> Result<()> {
+        Self::validate_locked_responses_request_for_request_kind(
+            lane,
+            is_non_root_agent,
+            Some(CodexResponsesRequestKind::Turn),
+            request,
+        )
+    }
+
+    fn validate_locked_responses_request_for_request_kind(
+        lane: ModelPolicyLane,
+        is_non_root_agent: bool,
+        request_kind: Option<CodexResponsesRequestKind>,
+        request: &ResponsesApiRequest,
+    ) -> Result<()> {
+        let Some(request_kind) = request_kind else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires explicit request-kind metadata",
+                lane.as_str()
+            )));
+        };
+        let managed_background = match request_kind {
+            CodexResponsesRequestKind::Turn => false,
+            CodexResponsesRequestKind::Prewarm => true,
+            CodexResponsesRequestKind::Compaction(_) => true,
+            CodexResponsesRequestKind::Memory => true,
+        };
         if is_non_root_agent && !lane.allows_non_root_sessions() {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejects non-root requests",
                 lane.as_str()
             )));
         }
-        // An explicit root may select its own model; everything else -- child
-        // agents, background work, review, memory -- stays on the managed model.
-        let user_selecting = lane.allows_user_model_selection() && !is_non_root_agent;
+        // Only an ordinary root turn may select its own model. Root-owned
+        // background work is Sol/Ultra even when the interactive root is
+        // Spark; children and other non-root work retain their existing pin.
+        let root_turn = !is_non_root_agent && !managed_background;
+        let user_selecting = lane.allows_user_model_selection() && root_turn;
+        let required_model = if managed_background {
+            lane.required_background_model()
+        } else {
+            lane.required_model()
+        };
         if user_selecting {
             lane.validate_user_selected_model(request.model.as_str())
                 .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-        } else if request.model != lane.required_model() {
+        } else if request.model != required_model {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejected request model `{}`; required `{}`",
                 lane.as_str(),
                 request.model,
-                lane.required_model()
+                required_model
             )));
         }
 
@@ -647,7 +713,11 @@ impl ModelClient {
                 Some(_) => {}
             }
         } else {
-            let required_effort = lane.required_wire_effort();
+            let required_effort = if managed_background {
+                lane.required_background_wire_effort()
+            } else {
+                lane.required_wire_effort()
+            };
             if reasoning.effort.as_ref() != Some(&required_effort) {
                 return Err(CodexErr::InvalidRequest(format!(
                     "{} model policy rejected wire reasoning effort {:?}; required {}",
@@ -658,9 +728,16 @@ impl ModelClient {
             }
         }
 
+        if matches!(lane, ModelPolicyLane::Api) && request.service_tier.is_none() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires an explicit service tier on every Responses request",
+                lane.as_str()
+            )));
+        }
+
         lane.validate_service_tier(
             request.service_tier.as_deref(),
-            /*allow_user_service_tier_selection*/ !is_non_root_agent,
+            /*allow_user_service_tier_selection*/ root_turn,
         )
         .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         Ok(())
@@ -674,11 +751,19 @@ impl ModelClient {
         let Some(lane) = self.locked_policy_lane()? else {
             return Ok(());
         };
-        if model != lane.required_model() {
+        Self::validate_locked_memory_request_for_lane(lane, model, reasoning)
+    }
+
+    fn validate_locked_memory_request_for_lane(
+        lane: ModelPolicyLane,
+        model: &str,
+        reasoning: Option<&Reasoning>,
+    ) -> Result<()> {
+        if model != lane.required_background_model() {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejected memory model `{model}`; required `{}`",
                 lane.as_str(),
-                lane.required_model()
+                lane.required_background_model()
             )));
         }
         let Some(reasoning) = reasoning else {
@@ -687,16 +772,15 @@ impl ModelClient {
                 lane.as_str()
             )));
         };
-        let required_effort = lane.required_wire_effort();
-        if reasoning.effort.as_ref() != Some(&required_effort)
-            || reasoning.mode != lane.required_reasoning_mode()
-        {
+        let required_effort = lane.required_background_wire_effort();
+        let required_mode = lane.required_reasoning_mode_for_model(model);
+        if reasoning.effort.as_ref() != Some(&required_effort) || reasoning.mode != required_mode {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejected memory reasoning mode={:?} effort={:?}; required mode={:?} effort={}",
                 lane.as_str(),
                 reasoning.mode,
                 reasoning.effort,
-                lane.required_reasoning_mode(),
+                required_mode,
                 required_effort
             )));
         }
@@ -1124,7 +1208,11 @@ impl ModelClient {
             prompt.output_schema_strict,
         );
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
-        let service_tier = model_info.service_tier_for_request(service_tier);
+        let service_tier = Self::service_tier_for_request_for_lane(
+            self.locked_policy_lane()?,
+            model_info,
+            service_tier,
+        );
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
@@ -1142,7 +1230,7 @@ impl ModelClient {
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
         };
-        self.validate_locked_responses_request(&request)?;
+        self.validate_locked_responses_request(&request, responses_metadata)?;
         Ok(request)
     }
 
