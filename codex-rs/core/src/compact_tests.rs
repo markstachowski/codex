@@ -1,9 +1,155 @@
 use super::*;
+use codex_login::CodexAuth;
 use codex_protocol::ResponseItemId;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::openai_models::ReasoningEffort;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locked_model_policy_managed_manual_and_auto_local_compaction_do_not_inherit_root() {
+    skip_if_no_network!();
+
+    for lane in [ModelPolicyLane::Api, ModelPolicyLane::Spark] {
+        for (name, trigger, reason, phase) in [
+            (
+                "manual",
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionPhase::StandaloneTurn,
+            ),
+            (
+                "auto",
+                CompactionTrigger::Auto,
+                CompactionReason::ContextLimit,
+                CompactionPhase::PreTurn,
+            ),
+        ] {
+            let server = start_mock_server().await;
+            let summary_id = format!("{}-{name}-summary", lane.as_str());
+            let response_id = format!("{}-{name}-response", lane.as_str());
+            let response_mock = mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_assistant_message(&summary_id, "summary"),
+                    ev_completed(&response_id),
+                ]),
+            )
+            .await;
+            let base_url = format!("{}/v1", server.uri());
+            let (session, _initial_turn_context, _rx) =
+                crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+                    CodexAuth::from_api_key("Test API Key"),
+                    Vec::new(),
+                    move |config| {
+                        config.model_provider.base_url = Some(base_url);
+                        config.model_provider.supports_websockets = false;
+                    },
+                )
+                .await;
+            let original = session.collaboration_mode().await;
+            let (root_model, root_effort, root_tier) = match lane {
+                ModelPolicyLane::Api => (
+                    original.model().to_string(),
+                    ReasoningEffort::High,
+                    Some(ServiceTier::Fast.request_value().to_string()),
+                ),
+                ModelPolicyLane::Spark => (
+                    "gpt-5.3-codex-spark".to_string(),
+                    ReasoningEffort::XHigh,
+                    None,
+                ),
+                ModelPolicyLane::Subscription => unreachable!("test lane matrix is explicit"),
+            };
+            let alternate_root = original.with_updates(
+                Some(root_model.clone()),
+                Some(Some(root_effort.clone())),
+                /*developer_instructions*/ None,
+            );
+            let turn_context = session
+                .new_turn_with_sub_id(
+                    format!("{}-{name}-compact", lane.as_str()),
+                    crate::session::SessionSettingsUpdate {
+                        collaboration_mode: Some(alternate_root),
+                        service_tier: root_tier.clone().map(Some),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("apply alternate premium root inference");
+
+            assert_eq!(turn_context.model_info.slug, root_model);
+            assert_eq!(turn_context.reasoning_effort, Some(root_effort));
+            assert_eq!(
+                turn_context.config.service_tier, root_tier,
+                "API must start premium; Spark starts on its supported Standard tier"
+            );
+            let sol_model_info = session
+                .services
+                .models_manager
+                .get_model_info(
+                    lane.required_background_model(),
+                    &turn_context.config.to_models_manager_config(),
+                )
+                .await;
+            // The lightweight session fixture deliberately leaves instruction
+            // provenance unknown, so managed compaction must preserve it.
+            // The startup-prewarm wire test covers explicit mismatched Model
+            // provenance being rebound to Sol.
+            let expected_instructions = session.get_base_instructions().await.text;
+
+            run_compact_task_inner(
+                Arc::clone(&session),
+                turn_context,
+                vec![UserInput::Text {
+                    text: format!("{name} compact"),
+                    text_elements: Vec::new(),
+                }],
+                InitialContextInjection::DoNotInject,
+                Some(lane),
+                trigger,
+                reason,
+                phase,
+            )
+            .await
+            .expect("managed local compaction should complete");
+
+            let request = response_mock.single_request().body_json();
+            assert_eq!(request["model"].as_str(), Some("gpt-5.6-sol"));
+            assert_eq!(request["reasoning"]["effort"].as_str(), Some("max"));
+            let serialized_instructions = if sol_model_info.use_responses_lite {
+                request["input"]
+                    .as_array()
+                    .and_then(|input| {
+                        input
+                            .iter()
+                            .find(|item| item["type"] == "message" && item["role"] == "developer")
+                    })
+                    .and_then(|item| item["content"][0]["text"].as_str())
+            } else {
+                request["instructions"].as_str()
+            };
+            assert_eq!(
+                serialized_instructions,
+                Some(expected_instructions.as_str())
+            );
+            assert_eq!(
+                request.get("service_tier"),
+                None,
+                "{} {name} local compaction must replace root Priority with the Standard sentinel; the unmanaged test serializer omits that sentinel",
+                lane.as_str()
+            );
+        }
+    }
+}
 
 async fn process_compacted_history_with_test_session(
     compacted_history: Vec<ResponseItem>,

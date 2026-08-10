@@ -5,6 +5,9 @@ use super::trim_function_call_history_to_fit_context_window;
 use crate::Prompt;
 use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_base_instructions_for_model;
+use crate::config::managed_background_inference_for_lane;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
@@ -58,12 +61,43 @@ pub(super) async fn run_remote_compact_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().to_vec());
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let inherited_service_tier = if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey)
+    {
+        None
+    } else {
+        turn_context.config.service_tier.clone()
+    };
+    let lane = locked_model_policy_lane()?;
+    let inference = managed_background_inference_for_lane(
+        turn_context.model_info.slug.clone(),
+        turn_context.reasoning_effort.clone(),
+        inherited_service_tier,
+        lane,
+    );
+    let model_info = match lane {
+        Some(_) => {
+            sess.services
+                .models_manager
+                .get_model_info(
+                    inference.model.as_str(),
+                    &turn_context.config.to_models_manager_config(),
+                )
+                .await
+        }
+        None => turn_context.model_info.clone(),
+    };
+    let base_instructions = managed_background_base_instructions_for_model(
+        base_instructions,
+        &model_info,
+        turn_context.personality,
+        lane,
+    );
+    let prompt_input = history.for_prompt(&model_info.input_modalities);
     let tool_router = &step_context.tool_router;
     let prompt = Prompt {
         input: prompt_input,
         tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        parallel_tool_calls: model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: None,
         output_schema_strict: true,
@@ -74,23 +108,26 @@ pub(super) async fn run_remote_compact_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
+    let session_telemetry = match lane {
+        Some(_) => turn_context
+            .session_telemetry
+            .clone()
+            .with_model(model_info.slug.as_str(), model_info.slug.as_str()),
+        None => turn_context.session_telemetry.clone(),
+    };
     let new_history = sess
         .services
         .model_client
         .compact_conversation_history(
             &prompt,
-            &turn_context.model_info,
+            &model_info,
             turn_state,
             CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
+                effort: inference.reasoning_effort,
                 summary: turn_context.reasoning_summary,
-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
-                    None
-                } else {
-                    turn_context.config.service_tier.clone()
-                },
+                service_tier: inference.service_tier,
             },
-            &turn_context.session_telemetry,
+            &session_telemetry,
             compaction_trace,
             &responses_metadata,
         )
