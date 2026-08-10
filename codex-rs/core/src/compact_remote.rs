@@ -12,6 +12,8 @@ use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_inference_for_lane;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_item_token_count;
@@ -199,6 +201,13 @@ async fn run_remote_compact_task_inner_impl(
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
+    let lane = locked_model_policy_lane()?;
+    let inference = managed_background_inference_for_lane(
+        turn_context.model_info.slug.clone(),
+        turn_context.reasoning_effort.clone(),
+        turn_context.config.service_tier.clone(),
+        lane,
+    );
     let context_compaction_item = ContextCompactionItem::new();
     let compaction_id = context_compaction_item.id.clone();
     // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
@@ -206,7 +215,7 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),
         compaction_id.as_str(),
-        turn_context.model_info.slug.as_str(),
+        inference.model.as_str(),
         turn_context.provider.info().name.as_str(),
     );
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
@@ -231,11 +240,17 @@ async fn run_remote_compact_task_inner_impl(
                 return Err(error);
             }
             let fallback_turn_context = &fallback_step_context.turn;
+            let fallback_inference = managed_background_inference_for_lane(
+                fallback_turn_context.model_info.slug.clone(),
+                fallback_turn_context.reasoning_effort.clone(),
+                fallback_turn_context.config.service_tier.clone(),
+                lane,
+            );
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
                     compaction_id.as_str(),
-                    fallback_turn_context.model_info.slug.as_str(),
+                    fallback_inference.model.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
                 );
             let fallback_result = run_remote_compact_attempt(
@@ -249,8 +264,8 @@ async fn run_remote_compact_task_inner_impl(
             .await;
             record_model_fallback(
                 &sess.services.session_telemetry,
-                turn_context.model_info.slug.as_str(),
-                fallback_turn_context.model_info.slug.as_str(),
+                inference.model.as_str(),
+                fallback_inference.model.as_str(),
                 compaction_metadata.reason(),
                 compaction_metadata.implementation(),
                 fallback_result.as_ref().err(),

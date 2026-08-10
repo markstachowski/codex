@@ -105,10 +105,12 @@ use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelMessages;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::is_auto_routing_model_family;
@@ -253,6 +255,29 @@ impl ModelPolicyLane {
     /// Review work always uses Sol/Ultra. Spark is a root-only interactive lane.
     pub const fn required_review_model(self) -> &'static str {
         SOL_MODEL
+    }
+
+    /// Model used by root-owned background inference. Spark is an interactive
+    /// root-only lane, so its background work returns to Sol with every other
+    /// managed lane.
+    pub(crate) const fn required_background_model(self) -> &'static str {
+        match self {
+            Self::Subscription | Self::Api | Self::Spark => SOL_MODEL,
+        }
+    }
+
+    /// Local reasoning effort used by root-owned background inference.
+    pub(crate) fn required_background_local_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Subscription | Self::Api | Self::Spark => ReasoningEffort::Ultra,
+        }
+    }
+
+    /// Wire reasoning effort used by root-owned background inference.
+    pub(crate) fn required_background_wire_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Subscription | Self::Api | Self::Spark => ReasoningEffort::Max,
+        }
     }
 
     /// Whether an explicit root-session model selection may differ from the
@@ -452,6 +477,62 @@ impl ModelPolicyLane {
             Self::Subscription | Self::Api => MultiAgentVersion::V2,
             Self::Spark => MultiAgentVersion::Disabled,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedBackgroundInferenceSettings {
+    pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<String>,
+}
+
+/// Resolve inference settings for root-owned background work. Managed
+/// prewarm, compaction, and memory requests always use Sol, Ultra, and
+/// Standard, including when the interactive root is Spark. Unmanaged
+/// execution preserves the caller's existing behavior.
+pub fn managed_background_inference_for_lane(
+    inherited_model: String,
+    inherited_reasoning_effort: Option<ReasoningEffort>,
+    inherited_service_tier: Option<String>,
+    lane: Option<ModelPolicyLane>,
+) -> ManagedBackgroundInferenceSettings {
+    match lane {
+        Some(lane) => ManagedBackgroundInferenceSettings {
+            model: lane.required_background_model().to_string(),
+            reasoning_effort: Some(lane.required_background_local_effort()),
+            service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+        },
+        None => ManagedBackgroundInferenceSettings {
+            model: inherited_model,
+            reasoning_effort: inherited_reasoning_effort,
+            service_tier: inherited_service_tier,
+        },
+    }
+}
+
+/// Keep explicit or inherited instructions intact, but do not send catalog
+/// instructions for an interactive root model with a different background
+/// model.
+pub(crate) fn managed_background_base_instructions_for_model(
+    inherited: BaseInstructions,
+    model_info: &ModelInfo,
+    personality: Option<Personality>,
+    lane: Option<ModelPolicyLane>,
+) -> BaseInstructions {
+    if lane.is_none() {
+        return inherited;
+    }
+    match inherited.provenance.as_ref() {
+        Some(BaseInstructionsProvenance::Model { model }) if model != &model_info.slug => {
+            BaseInstructions {
+                text: model_info.get_model_instructions(personality),
+                provenance: Some(BaseInstructionsProvenance::Model {
+                    model: model_info.slug.clone(),
+                }),
+            }
+        }
+        _ => inherited,
     }
 }
 
