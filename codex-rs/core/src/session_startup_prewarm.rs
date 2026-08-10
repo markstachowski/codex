@@ -12,6 +12,10 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_base_instructions_for_model;
+use crate::config::managed_background_inference_for_lane;
 use crate::guardian::routes_approval_to_guardian;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
@@ -182,7 +186,10 @@ impl SessionStartupPrewarmHandle {
 }
 
 impl Session {
-    pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
+    pub(crate) async fn schedule_startup_prewarm(
+        self: &Arc<Self>,
+        base_instructions: BaseInstructions,
+    ) {
         if !self.services.model_client.responses_websocket_enabled() {
             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
             // register or engage this session's bearer fallback before the first user request.
@@ -201,9 +208,17 @@ impl Session {
         let startup_prewarm_session = Arc::clone(self);
         let startup_prewarm = tokio::spawn(
             async move {
-                let result =
-                    schedule_startup_prewarm_inner(startup_prewarm_session, base_instructions)
-                        .await;
+                let result = match locked_model_policy_lane() {
+                    Ok(lane) => {
+                        schedule_startup_prewarm_inner(
+                            startup_prewarm_session,
+                            base_instructions,
+                            lane,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err.into()),
+                };
                 let status = if result.is_ok() { "ready" } else { "failed" };
                 session_telemetry.record_startup_phase(
                     "startup_prewarm_total",
@@ -249,7 +264,8 @@ impl Session {
 
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
-    base_instructions: String,
+    base_instructions: BaseInstructions,
+    lane: Option<ModelPolicyLane>,
 ) -> CodexResult<ModelClientSession> {
     let prewarm_started_at = Instant::now();
     let startup_turn_context = session
@@ -259,6 +275,31 @@ async fn schedule_startup_prewarm_inner(
         "startup_prewarm_create_turn_context",
         prewarm_started_at.elapsed(),
         /*status*/ None,
+    );
+    let inference = managed_background_inference_for_lane(
+        startup_turn_context.model_info.slug.clone(),
+        startup_turn_context.reasoning_effort.clone(),
+        startup_turn_context.config.service_tier.clone(),
+        lane,
+    );
+    let model_info = match lane {
+        Some(_) => {
+            session
+                .services
+                .models_manager
+                .get_model_info(
+                    inference.model.as_str(),
+                    &startup_turn_context.config.to_models_manager_config(),
+                )
+                .await
+        }
+        None => startup_turn_context.model_info.clone(),
+    };
+    let base_instructions = managed_background_base_instructions_for_model(
+        base_instructions,
+        &model_info,
+        startup_turn_context.personality,
+        lane,
     );
     if routes_approval_to_guardian(&startup_turn_context) {
         let guardian_session = Arc::clone(&session);
@@ -293,10 +334,7 @@ async fn schedule_startup_prewarm_inner(
         Vec::new(),
         startup_router.as_ref(),
         startup_turn_context.as_ref(),
-        BaseInstructions {
-            text: base_instructions,
-            provenance: None,
-        },
+        base_instructions,
     );
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_prompt",
@@ -312,15 +350,22 @@ async fn schedule_startup_prewarm_inner(
             CodexResponsesRequestKind::Prewarm,
         );
     let mut client_session = session.services.model_client.new_session();
+    let session_telemetry = match lane {
+        Some(_) => startup_turn_context
+            .session_telemetry
+            .clone()
+            .with_model(model_info.slug.as_str(), model_info.slug.as_str()),
+        None => startup_turn_context.session_telemetry.clone(),
+    };
     let websocket_warmup_started_at = Instant::now();
     client_session
         .prewarm_websocket(
             &startup_prompt,
-            &startup_turn_context.model_info,
-            &startup_turn_context.session_telemetry,
-            startup_turn_context.reasoning_effort.clone(),
+            &model_info,
+            &session_telemetry,
+            inference.reasoning_effort,
             startup_turn_context.reasoning_summary,
-            startup_turn_context.config.service_tier.clone(),
+            inference.service_tier,
             &responses_metadata,
         )
         .await?;
@@ -331,3 +376,7 @@ async fn schedule_startup_prewarm_inner(
     );
     Ok(client_session)
 }
+
+#[cfg(test)]
+#[path = "session_startup_prewarm_tests.rs"]
+mod tests;
