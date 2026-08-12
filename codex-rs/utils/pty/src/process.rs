@@ -6,6 +6,8 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use anyhow::anyhow;
 use portable_pty::MasterPty;
@@ -21,6 +23,16 @@ use tokio::task::JoinHandle;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessSignal {
     Interrupt,
+}
+
+/// Selects how terminating a spawned process stops its process group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessTerminationStrategy {
+    /// Stop the process immediately using the platform's historical behavior.
+    KillImmediately,
+    /// On Linux, allow the process group a fixed interval after SIGTERM before SIGKILL.
+    #[cfg(target_os = "linux")]
+    GracefulThenKill { grace_period: Duration },
 }
 
 pub(crate) fn unsupported_signal(signal: ProcessSignal) -> io::Error {
