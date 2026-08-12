@@ -54,7 +54,6 @@ use codex_protocol::auth::AuthMode as DomainAuthMode;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use serial_test::serial;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -2083,8 +2082,6 @@ async fn login_account_chatgpt_device_code_can_be_cancelled() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
@@ -2143,8 +2140,6 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
@@ -2186,8 +2181,6 @@ async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
@@ -2241,6 +2234,13 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
 
     let token_redirect_uri = callback_url.clone();
     let mut callback_url = Url::parse(&callback_url)?;
+    let callback_port = callback_url
+        .port()
+        .ok_or_else(|| anyhow::anyhow!("missing callback port"))?;
+    assert!(
+        !matches!(callback_port, 1455 | 1457),
+        "app-server integration tests must use an ephemeral login callback port, got {callback_port}"
+    );
     let callback_state = format!("{state}.onboarding_entrypoint=life_sciences");
     callback_url
         .query_pairs_mut()
@@ -2287,8 +2287,6 @@ async fn login_account_chatgpt_redirects_to_hosted_success_page() -> Result<()> 
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
@@ -2346,8 +2344,6 @@ async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(
@@ -2378,8 +2374,6 @@ async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result
 }
 
 #[tokio::test]
-// Serialize tests that launch the login server since it binds to a fixed port.
-#[serial(login_port)]
 async fn login_account_chatgpt_includes_forced_workspace_allowlist_query_param() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(
