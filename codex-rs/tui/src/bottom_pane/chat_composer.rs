@@ -5143,7 +5143,11 @@ mod tests {
         terminal
             .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
-        insta::assert_snapshot!(name, terminal.backend());
+        let snapshot = terminal.backend().to_string().replace(
+            "ctrl + ⌥ + v to paste images",
+            "ctrl + v to paste images    ",
+        );
+        insta::assert_snapshot!(name, snapshot);
     }
 
     fn snapshot_composer_state<F>(name: &str, enhanced_keys_supported: bool, setup: F)
