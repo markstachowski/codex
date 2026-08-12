@@ -361,6 +361,10 @@ struct RemoteCompactionV2Output {
     token_usage: Option<TokenUsage>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "remote compaction keeps managed request policy inputs explicit"
+)]
 async fn run_remote_compaction_request_v2(
     sess: &Session,
     turn_context: &TurnContext,
