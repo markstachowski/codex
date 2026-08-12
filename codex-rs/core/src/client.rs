@@ -1076,6 +1076,10 @@ impl ModelClient {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "request construction keeps policy and telemetry inputs explicit"
+    )]
     pub(crate) fn build_responses_request(
         &self,
         lane: Option<ModelPolicyLane>,

@@ -211,6 +211,10 @@ pub(crate) async fn run_compact_task(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "compaction lifecycle inputs remain explicit at the task boundary"
+)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
