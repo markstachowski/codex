@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -12,6 +14,9 @@ use codex_utils_pty::TerminalSize;
 use crate::SandboxType;
 use crate::WindowsSandboxFilesystemOverrides;
 use crate::WindowsSandboxProxySettingsMode;
+
+#[cfg(target_os = "linux")]
+const LINUX_SANDBOX_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Windows-specific inputs for an executor-native process spawn.
 pub struct WindowsSandboxSpawnRequest<'a> {
@@ -94,8 +99,18 @@ pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> 
         .command
         .split_first()
         .context("missing program for process spawn")?;
+    #[cfg(target_os = "linux")]
+    let process_termination_strategy = if request.sandbox == SandboxType::LinuxSeccomp {
+        codex_utils_pty::ProcessTerminationStrategy::GracefulThenKill {
+            grace_period: LINUX_SANDBOX_TERMINATION_GRACE_PERIOD,
+        }
+    } else {
+        codex_utils_pty::ProcessTerminationStrategy::KillImmediately
+    };
+    #[cfg(not(target_os = "linux"))]
+    let process_termination_strategy = codex_utils_pty::ProcessTerminationStrategy::KillImmediately;
     if request.tty {
-        codex_utils_pty::pty::spawn_process(
+        codex_utils_pty::pty::spawn_process_with_termination_strategy(
             program,
             args,
             request.cwd,
@@ -103,26 +118,29 @@ pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> 
             request.arg0,
             TerminalSize::default(),
             request.inherited_fds,
+            process_termination_strategy,
         )
         .await
     } else if request.stdin_open {
-        codex_utils_pty::pipe::spawn_process(
+        codex_utils_pty::pipe::spawn_process_with_termination_strategy(
             program,
             args,
             request.cwd,
             request.env,
             request.arg0,
             request.inherited_fds,
+            process_termination_strategy,
         )
         .await
     } else {
-        codex_utils_pty::pipe::spawn_process_no_stdin(
+        codex_utils_pty::pipe::spawn_process_no_stdin_with_termination_strategy(
             program,
             args,
             request.cwd,
             request.env,
             request.arg0,
             request.inherited_fds,
+            process_termination_strategy,
         )
         .await
     }

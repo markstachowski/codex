@@ -445,6 +445,23 @@ fn bwrap_signal_forwarder_terminates_child_and_keeps_parent_alive() {
     assert_eq!(libc::WEXITSTATUS(status), 0);
 }
 
+#[test]
+fn bwrap_child_parent_death_recheck_uses_sigkill() {
+    let child_pid = unsafe { libc::fork() };
+    assert!(child_pid >= 0, "failed to fork parent-death test child");
+
+    if child_pid == 0 {
+        kill_with_parent(libc::pid_t::MAX);
+        unsafe {
+            libc::_exit(1);
+        }
+    }
+
+    let status = wait_for_bwrap_child(child_pid);
+    assert!(libc::WIFSIGNALED(status), "child status: {status}");
+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+}
+
 #[cfg(test)]
 fn run_bwrap_signal_forwarder_test_supervisor() -> ! {
     let child_pid = unsafe { libc::fork() };
