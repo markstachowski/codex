@@ -243,6 +243,7 @@ async fn watchable_skill_root_paths_exclude_plugin_and_system_roots() {
 #[tokio::test]
 async fn snapshot_for_config_merges_extension_host_and_legacy_plugin_roots() {
     let codex_home = tempfile::tempdir().expect("tempdir");
+    let home_dir = tempfile::tempdir().expect("home tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
     write_user_skill(&codex_home, "user", "user-skill", "from the host loader");
     let plugin_skill_path = write_plugin_skill(
@@ -261,9 +262,11 @@ async fn snapshot_for_config_merges_extension_host_and_legacy_plugin_roots() {
         vec![plugin_skill_root],
         config_layer_stack,
     );
-    let skills_service = HostSkillsService::new(
+    let skills_service = HostSkillsService::new_with_restriction_product_and_home_dir(
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ false,
+        Some(Product::Codex),
+        Some(home_dir.path().abs()),
     );
 
     let snapshot = skills_service
@@ -288,6 +291,7 @@ async fn snapshot_for_config_preserves_host_precedence_for_symlinked_plugin_root
     use std::os::unix::fs::symlink;
 
     let codex_home = tempfile::tempdir().expect("tempdir");
+    let home_dir = tempfile::tempdir().expect("home tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
     let plugin_skill_path = write_plugin_skill(
         &codex_home,
@@ -305,9 +309,11 @@ async fn snapshot_for_config_preserves_host_precedence_for_symlinked_plugin_root
     )
     .expect("symlink user skills root to plugin skills root");
     let config_layer_stack = config_stack(&codex_home, "[skills.bundled]\nenabled = false\n");
-    let skills_service = HostSkillsService::new(
+    let skills_service = HostSkillsService::new_with_restriction_product_and_home_dir(
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ false,
+        Some(Product::Codex),
+        Some(home_dir.path().abs()),
     );
 
     let outcome = skills_for_config_with_stack(
