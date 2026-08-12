@@ -28,6 +28,8 @@ const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 // The development success-page redirect remains debug-only.
 #[cfg(debug_assertions)]
 const LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
+#[cfg(debug_assertions)]
+const LOGIN_PORT_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_PORT";
 
 enum ActiveLogin {
     Browser {
@@ -624,14 +626,25 @@ impl AccountRequestProcessor {
             opts.issuer = issuer;
         }
         #[cfg(debug_assertions)]
-        if let LoginSuccessPage::Hosted { url, .. } = &mut opts.login_success_page
-            && let Ok(open_app_url) = std::env::var(LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR)
-            && !open_app_url.trim().is_empty()
-        {
-            *url = open_app_url
-                .parse()
-                .map_err(|err| internal_error(format!("invalid Codex open app URL: {err}")))?;
-        }
+        let opts = {
+            let mut opts = opts;
+            if let Ok(port) = std::env::var(LOGIN_PORT_OVERRIDE_ENV_VAR)
+                && !port.trim().is_empty()
+            {
+                opts.port = port.trim().parse::<u16>().map_err(|err| {
+                    internal_error(format!("invalid login callback port override: {err}"))
+                })?;
+            }
+            if let LoginSuccessPage::Hosted { url, .. } = &mut opts.login_success_page
+                && let Ok(open_app_url) = std::env::var(LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR)
+                && !open_app_url.trim().is_empty()
+            {
+                *url = open_app_url
+                    .parse()
+                    .map_err(|err| internal_error(format!("invalid Codex open app URL: {err}")))?;
+            }
+            opts
+        };
 
         Ok(opts)
     }
