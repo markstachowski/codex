@@ -1958,7 +1958,9 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     .expect("auth with account id should save");
     auth_manager.reload().await;
 
-    let enroll_request = timeout(Duration::from_millis(100), accept_http_request(&listener))
+    // Leave scheduler headroom under full-workspace fanout while still proving
+    // that the auth notification beats the one-second account-id retry.
+    let enroll_request = timeout(Duration::from_millis(500), accept_http_request(&listener))
         .await
         .expect("auth change should wake remote control before the retry delay");
     assert_eq!(
