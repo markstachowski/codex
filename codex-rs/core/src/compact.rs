@@ -175,6 +175,10 @@ pub(crate) async fn run_compact_task(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "compaction lifecycle inputs remain explicit at the task boundary"
+)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -761,6 +765,10 @@ fn build_compacted_history_with_limit(
     history
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream construction keeps managed request policy inputs explicit"
+)]
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
