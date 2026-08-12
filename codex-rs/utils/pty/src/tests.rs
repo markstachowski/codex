@@ -5,6 +5,8 @@ use pretty_assertions::assert_eq;
 
 use crate::ProcessDriver;
 use crate::ProcessSignal;
+#[cfg(target_os = "linux")]
+use crate::ProcessTerminationStrategy;
 use crate::SpawnedProcess;
 use crate::TerminalSize;
 use crate::combine_output_receivers;
@@ -16,6 +18,48 @@ use crate::spawn_pty_process;
 #[cfg(windows)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
+
+#[cfg(target_os = "linux")]
+struct LinuxPtyTerminationTestDir {
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPtyTerminationTestDir {
+    fn new() -> anyhow::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "codex-pty-termination-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxPtyTerminationTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_test_path(path: &Path) -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for {}", path.display()))
+}
 
 fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
@@ -873,9 +917,57 @@ async fn pipe_drop_reaps_child() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linux_raw_pty_graceful_termination_runs_term_cleanup_for_full_grace() -> anyhow::Result<()>
+{
+    let test_dir = LinuxPtyTerminationTestDir::new()?;
+    let ready_path = test_dir.path().join("ready");
+    let cleanup_path = test_dir.path().join("cleaned");
+    let mut env_map: HashMap<String, String> = std::env::vars().collect();
+    env_map.insert("READY_PATH".to_string(), ready_path.display().to_string());
+    env_map.insert(
+        "CLEANUP_PATH".to_string(),
+        cleanup_path.display().to_string(),
+    );
+    let (program, args) = shell_command(concat!(
+        "trap 'printf cleaned >\"$CLEANUP_PATH\"; exit 0' TERM; ",
+        "printf ready >\"$READY_PATH\"; ",
+        "while :; do sleep 1; done"
+    ));
+    let grace_period = std::time::Duration::from_millis(150);
+    let spawned = crate::pty::spawn_process_with_termination_strategy(
+        &program,
+        &args,
+        test_dir.path(),
+        &env_map,
+        &None,
+        TerminalSize::default(),
+        &[],
+        ProcessTerminationStrategy::GracefulThenKill { grace_period },
+    )
+    .await?;
+    let (session, _output_rx, exit_rx) = combine_spawned_output(spawned);
+
+    wait_for_test_path(&ready_path).await?;
+    let started_at = tokio::time::Instant::now();
+    session.terminate();
+    let exit_code = tokio::time::timeout(std::time::Duration::from_secs(2), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for raw PTY termination"))??;
+
+    assert_eq!(exit_code, 0);
+    assert!(
+        started_at.elapsed() >= grace_period,
+        "raw PTY root was reaped before the complete grace period"
+    );
+    assert_eq!(std::fs::read_to_string(cleanup_path)?, "cleaned");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
-fn pty_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
+fn pty_immediate_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -936,6 +1028,106 @@ fn pty_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), exit_rx)
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child waiter"))?;
+
+        // A returned PID proves an exited child was still an unreaped zombie.
+        let wait_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let result =
+                    unsafe { libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if result != 0 {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child to exit"))?;
+        let wait_error = std::io::Error::last_os_error();
+        assert_eq!(
+            wait_result, -1,
+            "PTY child {child_pid} remained an unreaped zombie"
+        );
+        assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_raw_pty_graceful_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::channel();
+    let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+    // Keep the PTY's blocking child waiter queued until after termination.
+    runtime.spawn_blocking(move || {
+        let _ = blocker_started_tx.send(());
+        let _ = release_blocker_rx.recv_timeout(std::time::Duration::from_secs(5));
+    });
+    blocker_started_rx.recv_timeout(std::time::Duration::from_secs(2))?;
+
+    let test_dir = LinuxPtyTerminationTestDir::new()?;
+    let pid_file = test_dir.path().join("pid");
+    let cleanup_file = test_dir.path().join("cleaned");
+    runtime.block_on(async {
+        let mut env_map: HashMap<String, String> = std::env::vars().collect();
+        env_map.insert(
+            "CODEX_PTY_TEST_PID_FILE".to_string(),
+            pid_file.display().to_string(),
+        );
+        env_map.insert(
+            "CODEX_PTY_TEST_CLEANUP_FILE".to_string(),
+            cleanup_file.display().to_string(),
+        );
+        let (program, args) = shell_command(concat!(
+            "trap 'printf cleaned >\"$CODEX_PTY_TEST_CLEANUP_FILE\"; exit 0' TERM; ",
+            "printf '%s' \"$$\" >\"$CODEX_PTY_TEST_PID_FILE\"; ",
+            "while :; do sleep 1; done"
+        ));
+        let grace_period = std::time::Duration::from_millis(150);
+        let spawned = crate::pty::spawn_process_with_termination_strategy(
+            &program,
+            &args,
+            Path::new("."),
+            &env_map,
+            &None,
+            TerminalSize::default(),
+            &[],
+            ProcessTerminationStrategy::GracefulThenKill { grace_period },
+        )
+        .await?;
+        let (session, _output_rx, exit_rx) = combine_spawned_output(spawned);
+
+        let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid.parse::<libc::pid_t>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child PID"))?;
+        std::fs::remove_file(&pid_file)?;
+
+        let started_at = std::time::Instant::now();
+        session.terminate();
+        drop(session);
+        release_blocker_tx.send(())?;
+        let exit_code = tokio::time::timeout(std::time::Duration::from_secs(2), exit_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child waiter"))??;
+        assert_eq!(exit_code, 0);
+        assert!(
+            started_at.elapsed() >= grace_period,
+            "queued PTY waiter skipped the complete grace period"
+        );
+        assert_eq!(std::fs::read_to_string(&cleanup_file)?, "cleaned");
 
         // A returned PID proves an exited child was still an unreaped zombie.
         let wait_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
