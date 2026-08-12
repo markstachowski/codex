@@ -9,9 +9,9 @@
 //! - `kill_process_group_by_pid` targets the whole group (children/grandchildren)
 //! - `kill_process_group` targets a known process group ID directly
 //!   instead of a single PID.
-//! - `set_parent_death_signal` (Linux only) arranges for the child to receive a
-//!   `SIGTERM` when the parent exits, and re-checks the parent PID to avoid
-//!   races during fork/exec.
+//! - Linux parent-death helpers arrange for the child to receive a configured
+//!   terminal signal when the parent exits, and re-check the parent PID to
+//!   avoid races during fork/exec.
 //!
 //! On non-Unix platforms these helpers are no-ops.
 
@@ -32,6 +32,25 @@ pub fn set_parent_death_signal(parent_pid: libc::pid_t) -> io::Result<()> {
     if unsafe { libc::getppid() } != parent_pid {
         unsafe {
             libc::raise(libc::SIGTERM);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Ensure the child receives SIGKILL when the original parent dies.
+///
+/// This should run in `pre_exec` and re-checks the parent PID after `prctl`
+/// so a parent that died during setup cannot leave the child running.
+pub fn set_parent_death_signal_to_kill(parent_pid: libc::pid_t) -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if unsafe { libc::getppid() } != parent_pid {
+        unsafe {
+            libc::raise(libc::SIGKILL);
         }
     }
 
