@@ -48,6 +48,7 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::async_watcher::TRAILING_OUTPUT_GRACE;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
@@ -459,7 +460,7 @@ impl UnifiedExecProcessManager {
             )
         });
 
-        let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        let transcript = process.lifecycle_transcript();
         let event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
             context.step_context.turn.as_ref(),
@@ -494,11 +495,16 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        start_streaming_output(&process, context, Arc::clone(&transcript));
+        let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+        let mut output_drained = (!process_started_alive)
+            .then(|| Box::pin(process.output_drained_notify().notified_owned()));
+        if let Some(output_drained) = output_drained.as_mut() {
+            output_drained.as_mut().enable();
+        }
+        start_streaming_output(&process, context);
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
-        let process_started_alive = !process.has_exited() && process.exit_code().is_none();
         let _initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
             self.store_process(
@@ -529,12 +535,27 @@ impl UnifiedExecProcessManager {
         // (via start_streaming_output above) and collect a snapshot here for
         // the tool response body.
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected_output = Self::collect_output_until_deadline(
+        let mut collected_output = Self::collect_output_until_deadline(
             process.output_handles(),
             Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
         )
         .await;
+        if let Some(output_drained) = output_drained {
+            // The initial collector intentionally gives a closing output stream
+            // only a short grace period. Before publishing a short-lived
+            // process's terminal event, wait for the separately bounded
+            // streaming watcher and merge any poll-buffer tail it observed.
+            // The lifecycle transcript is producer-owned and already contains
+            // these bytes, so it must not be extended here.
+            let _ = tokio::time::timeout(
+                TRAILING_OUTPUT_GRACE + Duration::from_millis(25),
+                output_drained,
+            )
+            .await;
+            let trailing_output = process.output_handles().output_buffer.lock().await.drain();
+            collected_output.push_buffer(trailing_output);
+        }
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let original_token_count = usize::try_from(approx_tokens_from_byte_count(
@@ -650,6 +671,30 @@ impl UnifiedExecProcessManager {
                 self.release_process_id(request.process_id).await;
                 return Err(fail_process_with_message(process.as_ref(), message));
             }
+            if let Err(err) = process.check_for_sandbox_denial_with_text(&text).await {
+                let err =
+                    err.with_output_collection_metadata(original_token_count, output_omitted_bytes);
+                let message = match &err {
+                    UnifiedExecError::SandboxDenied { message, .. } => {
+                        format!("Command denied by sandbox: {message}")
+                    }
+                    _ => unreachable!("sandbox classification returned a non-sandbox error"),
+                };
+                emit_failed_initial_exec_end_if_unstored(
+                    process_started_alive,
+                    context,
+                    &request,
+                    cwd.clone(),
+                    plugin_attribution.clone(),
+                    Arc::clone(&transcript),
+                    text.clone(),
+                    message,
+                    wall_time,
+                )
+                .await;
+                self.release_process_id(request.process_id).await;
+                return Err(err);
+            }
             let exit_code = process.exit_code();
             let exit = exit_code.unwrap_or(-1);
             emit_exec_end_for_unified_exec(
@@ -668,12 +713,6 @@ impl UnifiedExecProcessManager {
             .await;
 
             self.release_process_id(request.process_id).await;
-            process
-                .check_for_sandbox_denial_with_text(&text)
-                .await
-                .map_err(|err| {
-                    err.with_output_collection_metadata(original_token_count, output_omitted_bytes)
-                })?;
             (None, exit_code)
         };
 

@@ -392,7 +392,7 @@ async fn late_network_denial_grace_observes_cancellation_after_exit() {
 }
 
 #[tokio::test]
-async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
+async fn failed_initial_end_for_unstored_process_uses_authoritative_transcript() {
     let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
@@ -468,7 +468,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     assert_eq!(item.process_id.as_deref(), Some("123"));
     assert_eq!(
         item.aggregated_output.as_deref(),
-        Some("PRE_DENIAL_MARKER\nNetwork access denied")
+        Some("PARTIAL_TRANSCRIPT\nNetwork access denied")
     );
 }
 

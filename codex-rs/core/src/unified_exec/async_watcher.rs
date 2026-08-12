@@ -38,14 +38,9 @@ pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
 /// process arbitrarily large delta payloads.
 const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
 
-/// Spawn a background task that continuously reads from the PTY, appends to the
-/// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
-/// boundaries.
-pub(crate) fn start_streaming_output(
-    process: &UnifiedExecProcess,
-    context: &UnifiedExecContext,
-    transcript: Arc<Mutex<HeadTailBuffer>>,
-) {
+/// Spawn a background task that emits best-effort ExecCommandOutputDelta events
+/// from the process output broadcast on UTF-8 boundaries.
+pub(crate) fn start_streaming_output(process: &UnifiedExecProcess, context: &UnifiedExecContext) {
     let mut receiver = process.output_receiver();
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
@@ -111,7 +106,6 @@ pub(crate) fn start_streaming_output(
 
                     process_chunk(
                         &mut pending,
-                        &transcript,
                         &call_id,
                         &session_ref,
                         &turn_ref,
@@ -139,7 +133,6 @@ pub(crate) fn start_streaming_output(
 
                 process_chunk(
                     &mut pending,
-                    &transcript,
                     &call_id,
                     &session_ref,
                     &turn_ref,
@@ -222,7 +215,6 @@ pub(crate) fn spawn_exit_watcher(
 
 async fn process_chunk(
     pending: &mut VecDeque<u8>,
-    transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
@@ -231,11 +223,6 @@ async fn process_chunk(
 ) {
     pending.extend(chunk);
     while let Some(prefix) = split_valid_utf8_prefix(pending) {
-        {
-            let mut guard = transcript.lock().await;
-            guard.push_chunk(prefix.to_vec());
-        }
-
         if *emitted_deltas >= MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
             continue;
         }
@@ -316,11 +303,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     message: String,
     duration: Duration,
 ) {
-    let stdout = if fallback_output.is_empty() {
-        resolve_aggregated_output(&transcript, fallback_output).await
-    } else {
-        fallback_output
-    };
+    let stdout = resolve_aggregated_output(&transcript, fallback_output).await;
     let aggregated_output = if stdout.is_empty() {
         message.clone()
     } else {
