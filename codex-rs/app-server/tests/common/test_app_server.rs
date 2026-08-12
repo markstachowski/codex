@@ -165,6 +165,7 @@ pub struct TestAppServer {
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
 pub const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
+const LOGIN_PORT_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_PORT";
 #[cfg(windows)]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(not(windows))]
@@ -178,7 +179,12 @@ impl TestAppServer {
             codex_home: None,
             environment: TestAppServerEnvironment::Auto,
             program: None,
-            env_overrides: Vec::new(),
+            // Browser-login integration tests must not reserve the operator's
+            // registered callback ports.
+            env_overrides: vec![(
+                LOGIN_PORT_OVERRIDE_ENV_VAR.to_string(),
+                Some("0".to_string()),
+            )],
             args: vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG.to_string()],
             exec_server_delay: None,
         }
