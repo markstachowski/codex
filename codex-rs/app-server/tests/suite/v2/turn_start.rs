@@ -2819,6 +2819,7 @@ async fn turn_start_resolves_sticky_thread_local_environment_and_turn_overrides(
 [[environments]]
 id = "remote"
 url = "ws://127.0.0.1:1"
+connect_timeout_sec = 0.05
 "#,
     )?;
 
