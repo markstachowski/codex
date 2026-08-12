@@ -18,6 +18,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::permissions::PROTECTED_METADATA_PATH_NAMES;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -1328,6 +1329,15 @@ async fn ambiguous_unattributed_network_request_is_not_assigned_to_active_calls(
     )
     .await?;
     wait_for_paths(&[&first_marker, &second_marker]).await?;
+    let protected_metadata_paths: Vec<_> = PROTECTED_METADATA_PATH_NAMES
+        .iter()
+        .map(|name| test.cwd.path().join(name))
+        .collect();
+    let protected_metadata_path_refs: Vec<_> = protected_metadata_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect();
+    wait_for_paths(&protected_metadata_path_refs).await?;
 
     let proxy_addr = test
         .session_configured
@@ -1372,6 +1382,17 @@ async fn ambiguous_unattributed_network_request_is_not_assigned_to_active_calls(
     })
     .await
     .context("timed out waiting for background terminal cleanup")?;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if protected_metadata_paths.iter().all(|path| !path.exists()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for sandbox metadata cleanup")?;
 
     Ok(())
 }
@@ -1932,12 +1953,7 @@ allow_local_binding = true
 "#,
     )?;
     let approval_policy = AskForApproval::OnRequest;
-    let permission_profile = PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Enabled,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
-    );
+    let permission_profile = managed_network_permission_profile();
     let permission_profile_for_config = permission_profile.clone();
     let features = features.to_vec();
     let mut builder = test_codex()
@@ -1976,6 +1992,15 @@ allow_local_binding = true
         .expect("expected runtime managed network proxy addresses");
 
     Ok(test)
+}
+
+fn managed_network_permission_profile() -> PermissionProfile {
+    PermissionProfile::workspace_write_with(
+        &[],
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    )
 }
 
 async fn mount_exec_network_turn(
@@ -2031,12 +2056,7 @@ async fn submit_managed_network_turn(
     approvals_reviewer: ApprovalsReviewer,
     approval_policy: AskForApproval,
 ) -> Result<()> {
-    let permission_profile = PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Enabled,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
-    );
+    let permission_profile = managed_network_permission_profile();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.config.cwd.as_path());
     let turn_environment_selections =
