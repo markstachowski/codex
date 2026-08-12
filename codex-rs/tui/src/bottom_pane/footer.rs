@@ -2034,42 +2034,30 @@ mod tests {
     }
 
     #[test]
-    fn paste_image_shortcut_prefers_ctrl_alt_v_under_wsl() {
+    fn paste_image_shortcut_uses_ctrl_alt_v_only_under_wsl() {
         let descriptor = SHORTCUTS
             .iter()
             .find(|descriptor| descriptor.id == ShortcutId::PasteImage)
             .expect("paste image shortcut");
 
-        let is_wsl = {
-            #[cfg(target_os = "linux")]
-            {
-                crate::clipboard_paste::is_probably_wsl()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
+        for (is_wsl, expected_key) in [
+            (false, key_hint::ctrl(KeyCode::Char('v'))),
+            (true, key_hint::ctrl_alt(KeyCode::Char('v'))),
+        ] {
+            let actual_key = descriptor
+                .binding_for(ShortcutsState {
+                    use_shift_enter_hint: false,
+                    esc_backtrack_hint: false,
+                    is_task_running: false,
+                    queue_submissions: false,
+                    is_wsl,
+                    collaboration_modes_enabled: false,
+                    key_hints: FooterKeyHints::default_bindings(),
+                })
+                .expect("shortcut binding")
+                .key;
 
-        let expected_key = if is_wsl {
-            key_hint::ctrl_alt(KeyCode::Char('v'))
-        } else {
-            key_hint::ctrl(KeyCode::Char('v'))
-        };
-
-        let actual_key = descriptor
-            .binding_for(ShortcutsState {
-                use_shift_enter_hint: false,
-                esc_backtrack_hint: false,
-                is_task_running: false,
-                queue_submissions: false,
-                is_wsl,
-                collaboration_modes_enabled: false,
-                key_hints: FooterKeyHints::default_bindings(),
-            })
-            .expect("shortcut binding")
-            .key;
-
-        assert_eq!(actual_key, expected_key);
+            assert_eq!(actual_key, expected_key);
+        }
     }
 }
