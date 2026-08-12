@@ -23,6 +23,8 @@ const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
 const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 #[cfg(debug_assertions)]
 const LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
+#[cfg(debug_assertions)]
+const LOGIN_PORT_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_PORT";
 
 enum ActiveLogin {
     Browser {
@@ -536,6 +538,13 @@ impl AccountRequestProcessor {
         #[cfg(debug_assertions)]
         let opts = {
             let mut opts = opts;
+            if let Ok(port) = std::env::var(LOGIN_PORT_OVERRIDE_ENV_VAR)
+                && !port.trim().is_empty()
+            {
+                opts.port = port.trim().parse::<u16>().map_err(|err| {
+                    internal_error(format!("invalid login callback port override: {err}"))
+                })?;
+            }
             if let Ok(issuer) = std::env::var(LOGIN_ISSUER_OVERRIDE_ENV_VAR)
                 && !issuer.trim().is_empty()
             {
