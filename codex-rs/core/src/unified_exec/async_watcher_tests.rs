@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::Buffer;
 use super::Emitter;
 use super::TRAILING_OUTPUT_GRACE;
+use super::resolve_aggregated_output;
 use super::spawn_exit_watcher;
 use super::start_streaming_output;
 use super::utf8_boundary;
@@ -58,8 +59,8 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         tokio_util::sync::CancellationToken::new(),
         "streaming-output-test".to_string(),
     );
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    start_streaming_output(&process, &context, Arc::clone(&transcript));
+    let transcript = process.lifecycle_transcript();
+    start_streaming_output(&process, &context);
 
     Ok(StreamingOutputHarness {
         process,
@@ -112,6 +113,21 @@ async fn streaming_output_preserves_multibyte_characters_across_chunks() -> anyh
     assert!(rx_event.try_recv().is_err());
 
     Ok(())
+}
+
+#[tokio::test]
+async fn aggregated_output_prefers_transcript_and_falls_back_when_empty() {
+    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    assert_eq!(
+        resolve_aggregated_output(&transcript, "FALLBACK".to_string()).await,
+        "FALLBACK"
+    );
+
+    transcript.lock().await.push_chunk(b"AUTHORITATIVE");
+    assert_eq!(
+        resolve_aggregated_output(&transcript, "FALLBACK".to_string()).await,
+        "AUTHORITATIVE"
+    );
 }
 
 #[tokio::test]
@@ -197,6 +213,71 @@ async fn streaming_output_keeps_grace_as_fallback_without_close() -> anyhow::Res
         }
     );
     assert!(rx_event.try_recv().is_err());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_transcript_survives_output_broadcast_lag() -> anyhow::Result<()> {
+    let StreamingOutputHarness {
+        process,
+        stdout_tx,
+        exit_tx,
+        transcript,
+        ..
+    } = streaming_output_harness().await?;
+    let output_drained = process.output_drained_notify();
+    let drained = output_drained.notified();
+    tokio::pin!(drained);
+
+    // Keep one live-output consumer behind while the process-side collector
+    // receives every chunk. The broadcast retains only 64 chunks, so this
+    // deterministically proves that lag cannot affect the lifecycle transcript.
+    let mut lagged_output = process.output_receiver();
+    let output_line_batch = b"token token \n".repeat(1_000);
+    let mut expected_total = 0;
+    for chunk in std::iter::once(b"HEAD\n".to_vec())
+        .chain(std::iter::repeat_n(output_line_batch, 100))
+        .chain(std::iter::once(b"TAIL\n".to_vec()))
+    {
+        expected_total += chunk.len();
+        stdout_tx.send(chunk).expect("send output chunk");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if process
+                    .output_handles()
+                    .output_buffer
+                    .lock()
+                    .await
+                    .total_bytes()
+                    == expected_total
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process-side collector should receive each chunk");
+    }
+    assert_eq!(expected_total, 1_300_010);
+    assert!(matches!(
+        lagged_output.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) if skipped > 0
+    ));
+
+    exit_tx.send(0).expect("send exit");
+    drop(stdout_tx);
+    tokio::time::timeout(Duration::from_secs(2), &mut drained)
+        .await
+        .expect("streaming watcher should drain after output closes");
+
+    let transcript = transcript.lock().await;
+    assert_eq!(transcript.total_bytes(), 1_300_010);
+    assert_eq!(transcript.omitted_bytes(), 251_434);
+    let rendered = transcript.to_bytes_with_omission_marker();
+    assert!(rendered.starts_with(b"HEAD\n"));
+    assert!(rendered.ends_with(b"TAIL\n"));
 
     Ok(())
 }
@@ -311,12 +392,10 @@ fn utf8_boundary_batches_malformed_output() {
 }
 
 #[tokio::test]
-async fn streaming_output_bounds_invalid_bytes_and_keeps_the_full_transcript() {
+async fn streaming_output_bounds_invalid_bytes() {
     let (session, turn, rx_event) = make_session_and_context_with_rx().await;
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
     let mut output = Buffer::<8> {
         pending: Vec::new(),
-        transcript: Arc::clone(&transcript),
         emitter: Emitter {
             remaining_deltas: 2,
             session,
@@ -344,12 +423,5 @@ async fn streaming_output_bounds_invalid_bytes_and_keeps_the_full_transcript() {
             b"\xff\xff\xff\xff\xff\xff".to_vec(),
             b"\xf0\x9f\x98\x80\xff\xff\xff".to_vec(),
         ]
-    );
-
-    let mut expected_transcript = bytes.to_vec();
-    expected_transcript.extend([0xfe, 0xfe]);
-    assert_eq!(
-        transcript.lock().await.to_bytes_with_omission_marker(),
-        expected_transcript
     );
 }

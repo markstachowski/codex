@@ -788,6 +788,7 @@ timeout = 900
         .await?;
     let mut saw_exec_command_begin = false;
     let mut saw_patch_denial_approval = false;
+    let mut exec_command_end = None;
     if !managed_network_enabled {
         loop {
             let event = timeout(Duration::from_secs(5), test.codex.next_event())
@@ -821,6 +822,9 @@ timeout = 900
                             },
                         })
                         .await?;
+                }
+                EventMsg::ExecCommandEnd(event) if event.call_id == CALL_ID => {
+                    exec_command_end = Some(event);
                 }
                 EventMsg::TurnComplete(_) => break,
                 _ => {}
@@ -1069,6 +1073,11 @@ timeout = 900
             assert!(saw_exec_command_begin);
             assert_eq!(output.matches(RECOVERED_OUTPUT).count(), 1);
             assert_eq!(output.matches(RETAINED_OUTPUT).count(), 1);
+            let aggregated_output = &exec_command_end
+                .expect("replay recovery should emit a terminal command event")
+                .aggregated_output;
+            assert_eq!(aggregated_output.matches(RECOVERED_OUTPUT).count(), 1);
+            assert_eq!(aggregated_output.matches(RETAINED_OUTPUT).count(), 1);
             assert_eq!(process_read_requests, 1, "expected replay recovery read");
         }
     }
