@@ -3108,6 +3108,7 @@ fn should_enable_color(
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufRead;
     use std::io::Read;
     use std::io::Write;
     use std::net::TcpListener;
@@ -3881,31 +3882,61 @@ mod tests {
     #[tokio::test]
     async fn mcp_http_probe_falls_back_to_get_when_head_times_out() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set test listener nonblocking");
         let addr = listener.local_addr().expect("listener address");
         let server = std::thread::spawn(move || {
-            let (mut head_stream, _) = listener.accept().expect("accept HEAD probe request");
-            let head = std::thread::spawn(move || {
-                let mut request = [0; 1024];
-                let _ = head_stream.read(&mut request);
-                std::thread::sleep(Duration::from_millis(50));
-            });
+            let mut held_head_streams = Vec::new();
+            let server_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < server_deadline,
+                                "timed out waiting for MCP probe request"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(err) => panic!("accept MCP probe request: {err}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("set probe stream blocking");
+                stream
+                    .set_read_timeout(/*dur*/ Some(Duration::from_secs(5)))
+                    .expect("set probe request read timeout");
+                let mut request_line = String::new();
+                let bytes_read = std::io::BufReader::new(&mut stream)
+                    .read_line(&mut request_line)
+                    .expect("read MCP probe request line");
+                if bytes_read == 0 {
+                    continue;
+                }
+                if request_line.starts_with("HEAD ") {
+                    held_head_streams.push(stream);
+                    continue;
+                }
 
-            let (mut get_stream, _) = listener.accept().expect("accept GET probe request");
-            let mut request = [0; 1024];
-            let _ = get_stream.read(&mut request);
-            get_stream
-                .write_all(
+                assert!(
+                    request_line.starts_with("GET "),
+                    "expected HEAD or GET MCP probe request"
+                );
+                stream
+                    .write_all(
                     b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .expect("write response");
-            head.join().expect("HEAD holder should finish");
+                break;
+            }
         });
 
-        let status = mcp_http_probe_url_with_timeout(
-            &format!("http://{addr}/mcp"),
-            Duration::from_millis(10),
-        )
-        .await;
+        let status =
+            mcp_http_probe_url_with_timeout(&format!("http://{addr}/mcp"), Duration::from_secs(1))
+                .await;
         server.join().expect("probe server thread should finish");
 
         assert_eq!(status, Ok("HTTP 405".to_string()));
