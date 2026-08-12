@@ -21,6 +21,8 @@ pub use process::ProcessDriver;
 pub use process::ProcessHandle;
 /// Process signal supported by spawned-process handles.
 pub use process::ProcessSignal;
+/// Strategy used when terminating a spawned process.
+pub use process::ProcessTerminationStrategy;
 /// Bundle of process handles plus split output and exit receivers returned by spawn helpers.
 pub use process::SpawnedProcess;
 /// Terminal size in character cells used for PTY spawn and resize operations.
