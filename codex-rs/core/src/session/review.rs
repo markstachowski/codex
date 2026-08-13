@@ -1,6 +1,7 @@
 use super::step_settings::ResolvedStepSettings;
 use super::*;
 use arc_swap::ArcSwap;
+use codex_protocol::protocol::ErrorEvent;
 use std::sync::atomic::AtomicBool;
 
 /// Spawn a review thread using the given prompt.
@@ -46,7 +47,7 @@ pub(super) async fn spawn_review_thread(
             return;
         }
     };
-    let review_model_info = sess
+    let mut review_model_info = sess
         .services
         .models_manager
         .get_model_info(&model, &config.to_models_manager_config())
@@ -67,7 +68,6 @@ pub(super) async fn spawn_review_thread(
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
-    let model_info = review_model_info.clone();
     let mut selected = parent_turn_context.initial_settings.selected().clone();
     let mut reasoning_effort = selected.collaboration_mode.reasoning_effort();
 
@@ -97,8 +97,6 @@ pub(super) async fn spawn_review_thread(
         );
     }
 
-    let auth_manager_for_context = auth_manager.clone();
-    let provider_for_context = provider.clone();
     let session_source = parent_turn_context.session_source.clone();
     let (forked_from_thread_id, thread_source, service_tier) = {
         let state = sess.state.lock().await;
@@ -113,6 +111,53 @@ pub(super) async fn spawn_review_thread(
                 .or_else(|| config.service_tier.clone()),
         )
     };
+    per_turn_config.model_reasoning_effort = reasoning_effort.clone();
+    per_turn_config.service_tier = service_tier;
+
+    // Apply the locked review contract after every upstream compatibility and
+    // parent-inheritance transform. The early resolution selects authoritative
+    // model metadata; this final resolution prevents later transforms from
+    // weakening managed review context.
+    let final_model = match crate::tasks::apply_locked_review_inference_settings(
+        &mut per_turn_config,
+        model.clone(),
+    ) {
+        Ok(model) => model,
+        Err(error) => {
+            sess.send_event(
+                parent_turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    misalignment: None,
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+    if final_model != model {
+        review_model_info = sess
+            .services
+            .models_manager
+            .get_model_info(&final_model, &config.to_models_manager_config())
+            .await;
+    }
+    let model = final_model;
+
+    let model_info = review_model_info.clone();
+    let session_telemetry = parent_turn_context
+        .session_telemetry
+        .clone()
+        .with_model(model.as_str(), review_model_info.slug.as_str());
+    let auth_manager_for_context = auth_manager.clone();
+    let provider_for_context = provider.clone();
+    let session_telemetry_for_context = session_telemetry.clone();
+    let reasoning_effort = per_turn_config.model_reasoning_effort.clone();
+    let reasoning_summary = per_turn_config
+        .model_reasoning_summary
+        .unwrap_or(model_info.default_reasoning_summary);
+
     let auto_review_enabled = crate::guardian::routes_approval_policy_to_guardian(
         per_turn_config.permissions.approval_policy.value(),
         per_turn_config.approvals_reviewer,
@@ -121,12 +166,28 @@ pub(super) async fn spawn_review_thread(
     // model. Resolve it against the review model and the shared feature gate.
     selected.collaboration_mode.settings.model = model.clone();
     selected.collaboration_mode.settings.reasoning_effort = reasoning_effort.clone();
-    selected.service_tier = service_tier;
+    selected.service_tier = per_turn_config.service_tier.clone();
     let step_settings = Arc::new(ResolvedStepSettings::new(
         Arc::new(selected),
         Arc::new(model_info.clone()),
         review_features.enabled(Feature::FastMode),
     ));
+    if let Err(error) = per_turn_config.validate_locked_subagent_inference_settings(
+        model.as_str(),
+        reasoning_effort.as_ref(),
+        step_settings.service_tier.as_deref(),
+    ) {
+        sess.send_event(
+            parent_turn_context.as_ref(),
+            EventMsg::Error(ErrorEvent {
+                message: error.to_string(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+                misalignment: None,
+            }),
+        )
+        .await;
+        return;
+    }
     per_turn_config.model = Some(model);
     per_turn_config.model_reasoning_effort = reasoning_effort;
     per_turn_config.service_tier = step_settings.service_tier.clone();

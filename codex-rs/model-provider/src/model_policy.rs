@@ -126,16 +126,29 @@ impl ManagedProviderPolicy {
             )));
         }
         let expected = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-        let mut http_fallback = expected.clone();
-        http_fallback.supports_websockets = false;
-        let http_fallback_profile_allowed = matches!(
+        let derived_profiles_allowed = matches!(
             lane,
             ManagedProviderLane::Subscription | ManagedProviderLane::Api
-        ) && provider_info == &http_fallback;
-        if provider_info != &expected && !http_fallback_profile_allowed {
+        );
+        let mut http_fallback = expected.clone();
+        http_fallback.supports_websockets = false;
+        let http_fallback_profile_allowed =
+            derived_profiles_allowed && provider_info == &http_fallback;
+        let mut guardian_retry_limited = expected.clone();
+        guardian_retry_limited.request_max_retries = Some(1);
+        guardian_retry_limited.stream_max_retries = Some(1);
+        let mut guardian_http_fallback = guardian_retry_limited.clone();
+        guardian_http_fallback.supports_websockets = false;
+        let guardian_retry_profile_allowed = derived_profiles_allowed
+            && (provider_info == &guardian_retry_limited
+                || provider_info == &guardian_http_fallback);
+        if provider_info != &expected
+            && !http_fallback_profile_allowed
+            && !guardian_retry_profile_allowed
+        {
             let required_profile = match lane {
                 ManagedProviderLane::Subscription | ManagedProviderLane::Api => {
-                    "the unmodified built-in OpenAI provider or its exact HTTP-fallback profile"
+                    "the unmodified built-in OpenAI provider or an exact HTTP-fallback, Guardian retry-limited, or combined Guardian HTTP-fallback profile"
                 }
                 ManagedProviderLane::Spark => "the unmodified built-in OpenAI provider",
             };
