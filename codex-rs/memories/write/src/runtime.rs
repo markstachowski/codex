@@ -416,7 +416,7 @@ mod managed_service_tier_tests {
             "root-model".to_string(),
             Some(ReasoningEffort::High),
             Some("priority".to_string()),
-            None,
+            /*lane*/ None,
         );
         assert_eq!(unmanaged.model, "root-model");
         assert_eq!(unmanaged.reasoning_effort, Some(ReasoningEffort::High));

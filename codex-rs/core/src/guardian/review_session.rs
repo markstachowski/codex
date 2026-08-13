@@ -1831,7 +1831,7 @@ mod tests {
             Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
         );
         assert_eq!(
-            guardian_service_tier_for_lane(Some("priority".to_string()), None).as_deref(),
+            guardian_service_tier_for_lane(Some("priority".to_string()), /*lane*/ None,).as_deref(),
             Some("priority")
         );
     }

@@ -1430,7 +1430,7 @@ mod tests {
         assert_eq!(
             app.compatible_plan_reasoning_effort_for_model(
                 "unlisted-model",
-                None,
+                /*conversation_effort*/ None,
                 /*preserve_current_override*/ false,
             ),
             Some(ReasoningEffortConfig::None),

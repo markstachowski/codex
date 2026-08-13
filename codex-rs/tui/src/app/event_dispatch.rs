@@ -35,7 +35,7 @@ fn should_persist_model_selection() -> std::result::Result<bool, String> {
             /*release_default_is_managed*/ !cfg!(debug_assertions),
         ),
         Err(std::env::VarError::NotPresent) => should_persist_model_selection_for_lane(
-            None,
+            /*lane*/ None,
             /*release_default_is_managed*/ !cfg!(debug_assertions),
         ),
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -3018,26 +3018,42 @@ mod model_policy_tests {
     fn managed_model_selection_does_not_persist_as_default() {
         for lane in ["subscription", "api", "spark"] {
             assert_eq!(
-                should_persist_model_selection_for_lane(Some(lane), false),
+                should_persist_model_selection_for_lane(
+                    Some(lane),
+                    /*release_default_is_managed*/ false,
+                ),
                 Ok(false)
             );
         }
         assert_eq!(
-            should_persist_model_selection_for_lane(None, false),
+            should_persist_model_selection_for_lane(
+                /*lane*/ None, /*release_default_is_managed*/ false,
+            ),
             Ok(true)
         );
         assert_eq!(
-            should_persist_model_selection_for_lane(None, true),
+            should_persist_model_selection_for_lane(
+                /*lane*/ None, /*release_default_is_managed*/ true,
+            ),
             Ok(false)
         );
-        assert!(should_persist_model_selection_for_lane(Some("invalid"), false).is_err());
+        assert!(
+            should_persist_model_selection_for_lane(
+                Some("invalid"),
+                /*release_default_is_managed*/ false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn managed_service_tier_selection_does_not_persist_as_default() {
         for lane in ["subscription", "api", "spark"] {
             assert_eq!(
-                should_persist_model_selection_for_lane(Some(lane), false),
+                should_persist_model_selection_for_lane(
+                    Some(lane),
+                    /*release_default_is_managed*/ false,
+                ),
                 Ok(false)
             );
         }

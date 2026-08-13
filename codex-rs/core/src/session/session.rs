@@ -1608,10 +1608,10 @@ mod model_selection_update_tests {
     #[test]
     fn subscription_root_model_update_catalog_contract_is_exact() {
         let catalog = vec![
-            preset("gpt-5.5", true),
-            preset("hidden-model", false),
-            preset(crate::config::SPARK_MODEL, true),
-            preset("codex-auto-balanced", true),
+            preset("gpt-5.5", /*show_in_picker*/ true),
+            preset("hidden-model", /*show_in_picker*/ false),
+            preset(crate::config::SPARK_MODEL, /*show_in_picker*/ true),
+            preset("codex-auto-balanced", /*show_in_picker*/ true),
         ];
         validate_model_selection_update_for_lane(
             crate::config::ModelPolicyLane::Subscription,

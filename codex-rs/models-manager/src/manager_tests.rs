@@ -36,7 +36,10 @@ const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
 
 #[test]
 fn model_policy_picker_contract_keeps_subscription_catalog() {
-    assert_eq!(picker_contract_for_lane(None), PickerContract::Upstream);
+    assert_eq!(
+        picker_contract_for_lane(/*lane*/ None),
+        PickerContract::Upstream
+    );
     assert_eq!(
         picker_contract_for_lane(Some("subscription")),
         PickerContract::Subscription
@@ -63,23 +66,30 @@ fn model_policy_picker_contract_keeps_subscription_catalog() {
 
 #[test]
 fn model_policy_picker_contract_filters_the_actual_catalog_path() {
-    let mut sol = remote_model(SOL_MODEL, "Sol", 0);
+    let mut sol = remote_model(SOL_MODEL, "Sol", /*priority*/ 0);
     sol.default_reasoning_level = Some(ReasoningEffort::Ultra);
     sol.supported_reasoning_levels = vec![ReasoningEffortPreset {
         effort: ReasoningEffort::Ultra,
         description: "ultra".to_string(),
     }];
-    let terra = remote_model("gpt-5.6-terra", "Terra", 1);
-    let mut spark = remote_model(SPARK_MODEL, "Spark", 2);
+    let terra = remote_model("gpt-5.6-terra", "Terra", /*priority*/ 1);
+    let mut spark = remote_model(SPARK_MODEL, "Spark", /*priority*/ 2);
     spark.default_reasoning_level = Some(ReasoningEffort::XHigh);
     spark.supported_reasoning_levels = vec![ReasoningEffortPreset {
         effort: ReasoningEffort::XHigh,
         description: "xhigh".to_string(),
     }];
-    let automatic = remote_model("codex-auto-balanced", "Automatic", 3);
-    let namespaced_automatic =
-        remote_model("openai/codex-auto-balanced", "Namespaced automatic", 4);
-    let uppercase_automatic = remote_model("CODEX-AUTO-BALANCED", "Uppercase automatic", 5);
+    let automatic = remote_model("codex-auto-balanced", "Automatic", /*priority*/ 3);
+    let namespaced_automatic = remote_model(
+        "openai/codex-auto-balanced",
+        "Namespaced automatic",
+        /*priority*/ 4,
+    );
+    let uppercase_automatic = remote_model(
+        "CODEX-AUTO-BALANCED",
+        "Uppercase automatic",
+        /*priority*/ 5,
+    );
     let catalog = vec![
         sol,
         terra,
