@@ -591,9 +591,14 @@ fn resolve_locked_model_policy_lane(
 /// inventing a subscription lane.
 pub fn locked_model_policy_lane() -> std::io::Result<Option<ModelPolicyLane>> {
     match std::env::var(MODEL_POLICY_LANE_ENV) {
-        Ok(value) => resolve_locked_model_policy_lane(Some(value.as_str()), true),
+        Ok(value) => {
+            resolve_locked_model_policy_lane(Some(value.as_str()), /*require_marker*/ true)
+        }
         Err(std::env::VarError::NotPresent) => {
-            resolve_locked_model_policy_lane(None, !cfg!(debug_assertions))
+            resolve_locked_model_policy_lane(
+                /*value*/ None,
+                /*require_marker*/ !cfg!(debug_assertions),
+            )
         }
         Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

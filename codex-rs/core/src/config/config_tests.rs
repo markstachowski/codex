@@ -541,11 +541,11 @@ async fn locked_model_policy_rejects_endpoint_overrides_before_authenticated_egr
 #[test]
 fn locked_model_policy_lane_resolution_requires_managed_marker() {
     assert_eq!(
-        resolve_locked_model_policy_lane(None, /*require_marker*/ false)
+        resolve_locked_model_policy_lane(/*value*/ None, /*require_marker*/ false)
             .expect("unmanaged debug/test execution may omit the lane marker"),
         None
     );
-    let error = resolve_locked_model_policy_lane(None, /*require_marker*/ true)
+    let error = resolve_locked_model_policy_lane(/*value*/ None, /*require_marker*/ true)
         .expect_err("managed release execution must not invent a subscription lane");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains(MODEL_POLICY_LANE_ENV));
@@ -631,7 +631,7 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
         "alternate-root".to_string(),
         Some(ReasoningEffort::Low),
         Some("priority".to_string()),
-        None,
+        /*lane*/ None,
     );
     assert_eq!(unmanaged.model, "alternate-root");
     assert_eq!(unmanaged.reasoning_effort, Some(ReasoningEffort::Low));
@@ -649,8 +649,15 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
             model: "different-root-model".to_string(),
         }),
     };
-    let managed = managed_background_base_instructions_for_model(inherited, &model_info, None);
-    assert_eq!(managed.text, model_info.get_model_instructions(None));
+    let managed = managed_background_base_instructions_for_model(
+        inherited,
+        &model_info,
+        /*personality*/ None,
+    );
+    assert_eq!(
+        managed.text,
+        model_info.get_model_instructions(/*personality*/ None)
+    );
     assert_eq!(
         managed.provenance,
         Some(BaseInstructionsProvenance::Model {
@@ -762,8 +769,10 @@ fn locked_model_policy_scopes_fast_to_explicit_subscription_and_api_roots() {
             /*allow_user_service_tier_selection*/ false,
         )
         .expect("all managed sessions may explicitly select Standard");
-        lane.validate_service_tier(None, /*allow_user_service_tier_selection*/ false)
-            .expect("an absent tier remains Standard at the request boundary");
+        lane.validate_service_tier(
+            /*service_tier*/ None, /*allow_user_service_tier_selection*/ false,
+        )
+        .expect("an absent tier remains Standard at the request boundary");
     }
 
     // Flex (cheaper best-effort capacity, probed live 2026-08-05) is scoped

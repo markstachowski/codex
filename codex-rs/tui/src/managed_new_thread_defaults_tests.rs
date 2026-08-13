@@ -85,7 +85,7 @@ async fn applies_managed_defaults_to_a_new_thread_config() {
         Some(&defaults()),
         &[],
         &ConfigOverrides::default(),
-        None,
+        /*lane*/ None,
     );
 
     assert_eq!(actual, expected);
@@ -109,7 +109,7 @@ async fn explicit_model_skips_managed_model_and_reasoning_effort() {
         Some(&defaults()),
         &[],
         &harness_overrides,
-        None,
+        /*lane*/ None,
     );
 
     assert_eq!(actual, expected);
@@ -133,7 +133,7 @@ async fn explicit_reasoning_effort_skips_managed_model_and_reasoning_effort() {
         Some(&defaults()),
         &cli_kv_overrides,
         &ConfigOverrides::default(),
-        None,
+        /*lane*/ None,
     );
 
     assert_eq!(actual, expected);
@@ -161,7 +161,7 @@ async fn explicit_launch_overrides_take_precedence() {
         Some(&defaults()),
         &cli_kv_overrides,
         &harness_overrides,
-        None,
+        /*lane*/ None,
     );
 
     assert_eq!(actual, expected);
