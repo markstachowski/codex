@@ -191,6 +191,22 @@ async fn login_and_logout_persist_only_cloud_managed_mcp_oauth_credentials() -> 
         return Ok(());
     };
 
+    #[cfg(target_os = "linux")]
+    let browser_launch_marker = {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The browser crate treats `curl` as a foreground text browser, so a
+        // launch marker is guaranteed to exist before the subprocess exits.
+        let launcher = fixture.codex_home.path().join("curl");
+        let marker = fixture.codex_home.path().join("browser-was-launched");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\n: > \"$CODEX_TEST_BROWSER_LAUNCH_MARKER\"\n",
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        (launcher, marker)
+    };
+
     let challenge = format!(
         "Bearer resource_metadata=\"{}/oauth-resource\"",
         fixture.server.uri()
@@ -243,7 +259,11 @@ async fn login_and_logout_persist_only_cloud_managed_mcp_oauth_credentials() -> 
         .mount(&fixture.server)
         .await;
 
-    let mut command = fixture.command(&["mcp", "login", MANAGED_SERVER_NAME])?;
+    let mut command = fixture.command(&["mcp", "login", "--no-browser", MANAGED_SERVER_NAME])?;
+    #[cfg(target_os = "linux")]
+    command
+        .env("BROWSER", &browser_launch_marker.0)
+        .env("CODEX_TEST_BROWSER_LAUNCH_MARKER", &browser_launch_marker.1);
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
     let mut child = command.spawn()?;
     let stdout = child
@@ -332,6 +352,11 @@ async fn login_and_logout_persist_only_cloud_managed_mcp_oauth_credentials() -> 
     ensure!(
         login_status.success(),
         "managed MCP login failed: status={login_status}"
+    );
+    #[cfg(target_os = "linux")]
+    ensure!(
+        !browser_launch_marker.1.exists(),
+        "managed MCP login unexpectedly launched an external browser"
     );
     timeout(Duration::from_secs(30), async {
         while let Some(line) = lines.next_line().await? {
