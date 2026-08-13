@@ -3599,6 +3599,29 @@ async fn guardian_review_session_config_uses_parent_active_model_instead_of_hard
 }
 
 #[tokio::test]
+async fn guardian_review_session_config_only_limits_openai_provider_retries() {
+    let parent_config = test_config().await;
+    assert_eq!(
+        parent_config.model_provider,
+        ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+    );
+    let mut expected_model_provider = parent_config.model_provider.clone();
+    expected_model_provider.request_max_retries = Some(1);
+    expected_model_provider.stream_max_retries = Some(1);
+
+    let guardian_config = build_guardian_review_session_config_for_test(
+        &parent_config,
+        /*live_network_config*/ None,
+        "active-model",
+        /*reasoning_effort*/ None,
+        /*model_messages*/ None,
+    )
+    .expect("guardian config");
+
+    assert_eq!(guardian_config.model_provider, expected_model_provider);
+}
+
+#[tokio::test]
 async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5_4() {
     let mut parent_config = test_config().await;
     parent_config.model_provider_id = AMAZON_BEDROCK_PROVIDER_ID.to_string();

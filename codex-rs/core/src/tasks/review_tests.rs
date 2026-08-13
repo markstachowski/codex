@@ -6,7 +6,7 @@ fn subscription_review_replaces_alternate_root_model_and_effort() {
     let settings = resolve_review_inference_settings(
         "gpt-5.5".to_string(),
         Some(ReasoningEffort::High),
-        None,
+        /*inherited_reasoning_mode*/ None,
         Some("priority".to_string()),
         Some(ModelPolicyLane::Subscription),
     )
@@ -30,7 +30,7 @@ fn unmanaged_review_preserves_requested_inference_settings() {
         Some(ReasoningEffort::High),
         Some(ReasoningMode::Pro),
         Some("priority".to_string()),
-        None,
+        /*lane*/ None,
     )
     .expect("unmanaged reviews should preserve upstream settings");
 
@@ -50,7 +50,7 @@ fn spark_review_is_rejected_before_spawning_a_delegate() {
     let error = resolve_review_inference_settings(
         "gpt-5.3-codex-spark".to_string(),
         Some(ReasoningEffort::XHigh),
-        None,
+        /*inherited_reasoning_mode*/ None,
         Some("priority".to_string()),
         Some(ModelPolicyLane::Spark),
     )

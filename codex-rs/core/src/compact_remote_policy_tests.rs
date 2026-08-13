@@ -33,7 +33,7 @@ fn unmanaged_remote_compaction_preserves_inference_and_enables_parallel_tools() 
         "unmanaged-model".to_string(),
         Some(ReasoningEffort::Custom("unmanaged-effort".to_string())),
         Some("unmanaged-tier".to_string()),
-        None,
+        /*lane*/ None,
     );
 
     assert_eq!(

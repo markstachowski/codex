@@ -126,10 +126,23 @@ impl ManagedProviderPolicy {
             )));
         }
         let expected = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-        if provider_info != &expected {
-            return Err(lane.invalid(
-                "modified model provider; required the unmodified built-in OpenAI provider",
-            ));
+        let mut guardian_retry_limited = expected.clone();
+        guardian_retry_limited.request_max_retries = Some(1);
+        guardian_retry_limited.stream_max_retries = Some(1);
+        let guardian_retry_profile_allowed = matches!(
+            lane,
+            ManagedProviderLane::Subscription | ManagedProviderLane::Api
+        ) && provider_info == &guardian_retry_limited;
+        if provider_info != &expected && !guardian_retry_profile_allowed {
+            let required_profile = match lane {
+                ManagedProviderLane::Subscription | ManagedProviderLane::Api => {
+                    "the unmodified built-in OpenAI provider or its exact Guardian retry-limited profile"
+                }
+                ManagedProviderLane::Spark => "the unmodified built-in OpenAI provider",
+            };
+            return Err(lane.invalid(format!(
+                "modified model provider; required {required_profile}"
+            )));
         }
         Ok(())
     }

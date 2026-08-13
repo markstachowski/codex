@@ -671,14 +671,107 @@ mod tests {
 
     #[tokio::test]
     async fn managed_custom_provider_is_rejected_before_auth_is_polled() {
-        let provider = ConfiguredModelProvider::new(
-            ModelProviderInfo::create_openai_provider(Some(
-                "https://example.invalid/v1".to_string(),
-            )),
-            /*auth_manager*/ None,
-        );
+        let mut guardian_retry_limited =
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        guardian_retry_limited.request_max_retries = Some(1);
+        guardian_retry_limited.stream_max_retries = Some(1);
+        let mut guardian_with_base_url = guardian_retry_limited.clone();
+        guardian_with_base_url.base_url = Some("https://example.invalid/v1".to_string());
+        let mut guardian_with_header = guardian_retry_limited.clone();
+        guardian_with_header
+            .http_headers
+            .as_mut()
+            .expect("built-in version header")
+            .insert("x-managed-override".to_string(), "rejected".to_string());
+        let mut guardian_with_env_header = guardian_retry_limited.clone();
+        guardian_with_env_header
+            .env_http_headers
+            .as_mut()
+            .expect("built-in OpenAI environment headers")
+            .insert(
+                "x-managed-env-override".to_string(),
+                "MANAGED_SECRET".to_string(),
+            );
+        let mut guardian_with_query = guardian_retry_limited.clone();
+        guardian_with_query.query_params = Some(std::collections::HashMap::from([(
+            "managed-override".to_string(),
+            "rejected".to_string(),
+        )]));
+        let mut guardian_with_auth_change = guardian_retry_limited.clone();
+        guardian_with_auth_change.requires_openai_auth = false;
+        let mut guardian_with_bearer = guardian_retry_limited.clone();
+        guardian_with_bearer.experimental_bearer_token = Some("rejected".to_string());
+        let mut guardian_with_name_change = guardian_retry_limited;
+        guardian_with_name_change.name = "OpenAI override".to_string();
         let policy = ManagedProviderPolicy::from_marker(
             Some(std::ffi::OsStr::new("subscription")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+
+        for (label, expected_error, provider_info) in [
+            (
+                "base URL override",
+                "base URL override",
+                guardian_with_base_url,
+            ),
+            (
+                "header override",
+                "modified model provider",
+                guardian_with_header,
+            ),
+            (
+                "environment header override",
+                "modified model provider",
+                guardian_with_env_header,
+            ),
+            (
+                "query override",
+                "modified model provider",
+                guardian_with_query,
+            ),
+            (
+                "auth override",
+                "modified model provider",
+                guardian_with_auth_change,
+            ),
+            (
+                "bearer override",
+                "modified model provider",
+                guardian_with_bearer,
+            ),
+            (
+                "provider name override",
+                "modified model provider",
+                guardian_with_name_change,
+            ),
+        ] {
+            let provider = ConfiguredModelProvider::new(provider_info, /*auth_manager*/ None);
+            let auth_polled = Arc::new(AtomicBool::new(false));
+            let auth_polled_for_future = Arc::clone(&auth_polled);
+            let auth: ModelProviderFuture<'_, Option<CodexAuth>> = Box::pin(async move {
+                auth_polled_for_future.store(true, Ordering::SeqCst);
+                None
+            });
+
+            let error = provider
+                .validated_api_setup(policy, auth)
+                .await
+                .expect_err(label);
+
+            assert!(error.to_string().contains(expected_error));
+            assert_eq!(auth_polled.load(Ordering::SeqCst), false);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_guardian_retry_limited_provider_reaches_auth_resolution() {
+        let mut provider_info = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        provider_info.request_max_retries = Some(1);
+        provider_info.stream_max_retries = Some(1);
+        let provider = ConfiguredModelProvider::new(provider_info, /*auth_manager*/ None);
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(std::ffi::OsStr::new("api")),
             ManagedProviderBuildMode::Release,
         )
         .expect("known managed lane");
@@ -686,16 +779,17 @@ mod tests {
         let auth_polled_for_future = Arc::clone(&auth_polled);
         let auth: ModelProviderFuture<'_, Option<CodexAuth>> = Box::pin(async move {
             auth_polled_for_future.store(true, Ordering::SeqCst);
-            None
+            Some(CodexAuth::from_api_key("managed-api-key"))
         });
 
-        let error = provider
+        let (auth, api_provider) = provider
             .validated_api_setup(policy, auth)
             .await
-            .expect_err("managed provider override must fail before auth is polled");
+            .expect("Guardian's exact retry-limited provider should reach auth resolution");
 
-        assert!(error.to_string().contains("base URL override"));
-        assert_eq!(auth_polled.load(Ordering::SeqCst), false);
+        assert!(auth.expect("resolved auth").is_api_key_auth());
+        assert_eq!(api_provider.base_url, "https://api.openai.com/v1");
+        assert_eq!(auth_polled.load(Ordering::SeqCst), true);
     }
 
     #[test]

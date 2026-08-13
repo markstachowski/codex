@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 
 use codex_model_provider_info::ModelProviderInfo;
@@ -40,6 +41,124 @@ fn exact_managed_provider_setups_are_accepted() {
             .validate_resolved_setup(&provider_info, Some(auth_mode), &api_provider)
             .expect("exact managed provider setup should pass");
         assert_eq!(api_provider.base_url, expected_base_url);
+    }
+}
+
+#[test]
+fn exact_guardian_retry_limited_provider_setups_are_accepted() {
+    let cases = [
+        ("subscription", AuthMode::Chatgpt),
+        ("api", AuthMode::ApiKey),
+    ];
+
+    for (marker, auth_mode) in cases {
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(OsStr::new(marker)),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+        let mut provider_info = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        provider_info.request_max_retries = Some(1);
+        provider_info.stream_max_retries = Some(1);
+
+        policy
+            .validate_before_auth(&provider_info)
+            .expect("Guardian's exact retry-limited provider should pass before auth");
+        let api_provider = provider_info
+            .to_api_provider(Some(auth_mode))
+            .expect("built-in provider should resolve");
+        policy
+            .validate_resolved_setup(&provider_info, Some(auth_mode), &api_provider)
+            .expect("Guardian's exact managed provider setup should pass");
+        assert_eq!(api_provider.retry.max_attempts, 1);
+    }
+
+    let spark_policy = ManagedProviderPolicy::from_marker(
+        Some(OsStr::new("spark")),
+        ManagedProviderBuildMode::Release,
+    )
+    .expect("known managed lane");
+    let mut provider_info = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    provider_info.request_max_retries = Some(1);
+    provider_info.stream_max_retries = Some(1);
+    spark_policy
+        .validate_before_auth(&provider_info)
+        .expect_err("root-only Spark must reject the Guardian provider profile");
+}
+
+#[test]
+fn managed_provider_policy_rejects_other_retry_and_transport_overrides() {
+    let policy = ManagedProviderPolicy::from_marker(
+        Some(OsStr::new("subscription")),
+        ManagedProviderBuildMode::Release,
+    )
+    .expect("known managed lane");
+    let mut guardian_retry_limited =
+        ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    guardian_retry_limited.request_max_retries = Some(1);
+    guardian_retry_limited.stream_max_retries = Some(1);
+
+    let mut request_only_retry = guardian_retry_limited.clone();
+    request_only_retry.stream_max_retries = None;
+    let mut stream_only_retry = guardian_retry_limited.clone();
+    stream_only_retry.request_max_retries = None;
+    let mut higher_request_retry = guardian_retry_limited.clone();
+    higher_request_retry.request_max_retries = Some(2);
+    let mut higher_stream_retry = guardian_retry_limited.clone();
+    higher_stream_retry.stream_max_retries = Some(2);
+    let mut zero_retries = guardian_retry_limited.clone();
+    zero_retries.request_max_retries = Some(0);
+    zero_retries.stream_max_retries = Some(0);
+    let mut stream_timeout_override = guardian_retry_limited.clone();
+    stream_timeout_override.stream_idle_timeout_ms = Some(1);
+    let mut websocket_timeout_override = guardian_retry_limited.clone();
+    websocket_timeout_override.websocket_connect_timeout_ms = Some(1);
+    let mut header_override = guardian_retry_limited.clone();
+    header_override
+        .http_headers
+        .as_mut()
+        .expect("built-in version header")
+        .insert("x-managed-override".to_string(), "rejected".to_string());
+    let mut env_header_override = guardian_retry_limited.clone();
+    env_header_override
+        .env_http_headers
+        .as_mut()
+        .expect("built-in OpenAI environment headers")
+        .insert(
+            "x-managed-env-override".to_string(),
+            "MANAGED_SECRET".to_string(),
+        );
+    let mut query_override = guardian_retry_limited.clone();
+    query_override.query_params = Some(HashMap::from([(
+        "managed-override".to_string(),
+        "rejected".to_string(),
+    )]));
+    let mut auth_override = guardian_retry_limited.clone();
+    auth_override.requires_openai_auth = !auth_override.requires_openai_auth;
+    let mut bearer_override = guardian_retry_limited.clone();
+    bearer_override.experimental_bearer_token = Some("rejected".to_string());
+    let mut capability_override = guardian_retry_limited;
+    capability_override.supports_websockets = !capability_override.supports_websockets;
+
+    for (label, provider_info) in [
+        ("request-only retry limit", request_only_retry),
+        ("stream-only retry limit", stream_only_retry),
+        ("higher request retry limit", higher_request_retry),
+        ("higher stream retry limit", higher_stream_retry),
+        ("zero retry limits", zero_retries),
+        ("stream timeout override", stream_timeout_override),
+        ("websocket timeout override", websocket_timeout_override),
+        ("header override", header_override),
+        ("environment header override", env_header_override),
+        ("query override", query_override),
+        ("authentication override", auth_override),
+        ("bearer override", bearer_override),
+        ("capability override", capability_override),
+    ] {
+        let error = policy
+            .validate_before_auth(&provider_info)
+            .expect_err(label);
+        assert!(error.to_string().contains("modified model provider"));
     }
 }
 
