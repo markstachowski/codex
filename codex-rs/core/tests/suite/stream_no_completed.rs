@@ -14,7 +14,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
-use std::net::TcpListener;
+use tokio::net::TcpSocket;
 use wiremock::MockServer;
 
 fn sse_incomplete() -> String {
@@ -111,9 +111,9 @@ async fn connection_failure_pauses_retry_budget_until_provider_is_reachable() ->
     skip_if_no_network!(Ok(()));
 
     let bootstrap_server = responses::start_mock_server().await;
-    let unavailable_listener = TcpListener::bind("127.0.0.1:0")?;
-    let unavailable_address = unavailable_listener.local_addr()?;
-    drop(unavailable_listener);
+    let unavailable_socket = TcpSocket::new_v4()?;
+    unavailable_socket.bind("127.0.0.1:0".parse()?)?;
+    let unavailable_address = unavailable_socket.local_addr()?;
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
@@ -148,8 +148,9 @@ async fn connection_failure_pauses_retry_budget_until_provider_is_reachable() ->
         "Reconnecting... waiting for network"
     );
 
+    let recovered_listener = unavailable_socket.listen(1024)?;
     let recovered_server = MockServer::builder()
-        .listener(TcpListener::bind(unavailable_address)?)
+        .listener(recovered_listener.into_std()?)
         .start()
         .await;
     let response_mock = responses::mount_sse_sequence(
