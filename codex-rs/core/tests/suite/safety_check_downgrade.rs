@@ -12,6 +12,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ModelVerification;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
@@ -245,6 +246,123 @@ async fn openai_model_header_mismatch_blocks_tool_execution() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follow_up_model_header_mismatch_stops_before_second_tool_execution() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const ALLOWED_CALL_ID: &str = "call-allowed";
+    const BLOCKED_CALL_ID: &str = "call-blocked";
+
+    let allowed_sentinel = "allowed-tool-sentinel";
+    let blocked_sentinel = "blocked-tool-sentinel";
+    let server = start_mock_server().await;
+    let allowed_tool_args = serde_json::json!({
+        "command": format!("echo allowed > {allowed_sentinel}"),
+        "timeout_ms": 1_000
+    });
+    let blocked_tool_args = serde_json::json!({
+        "command": format!("echo blocked > {blocked_sentinel}"),
+        "timeout_ms": 1_000
+    });
+    let first_response = sse_response(sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(
+            ALLOWED_CALL_ID,
+            "shell_command",
+            &serde_json::to_string(&allowed_tool_args)?,
+        ),
+        core_test_support::responses::ev_completed("resp-1"),
+    ]))
+    .insert_header("OpenAI-Model", REQUESTED_MODEL);
+    let second_response = sse_response(sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-blocked", "must not be accepted"),
+        ev_function_call(
+            BLOCKED_CALL_ID,
+            "shell_command",
+            &serde_json::to_string(&blocked_tool_args)?,
+        ),
+        core_test_support::responses::ev_completed("resp-2"),
+    ]))
+    .insert_header("OpenAI-Model", SERVER_MODEL);
+    let request_log = mount_response_sequence(&server, vec![first_response, second_response]).await;
+
+    let mut builder = test_codex().with_model(REQUESTED_MODEL);
+    let test = builder.build(&server).await?;
+    let allowed_path = test.cwd.path().join(allowed_sentinel);
+    let blocked_path = test.cwd.path().join(blocked_sentinel);
+    assert!(!allowed_path.exists());
+    assert!(!blocked_path.exists());
+
+    test.codex
+        .start_or_steer_turn(disabled_text_turn(&test, "trigger follow-up model check"))
+        .await?;
+
+    let mut allowed_exec_begin_count = 0;
+    let allowed_exec_end = loop {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        match event {
+            EventMsg::ExecCommandBegin(event) => {
+                assert_eq!(event.call_id, ALLOWED_CALL_ID);
+                allowed_exec_begin_count += 1;
+            }
+            EventMsg::ExecCommandEnd(event) if event.call_id == ALLOWED_CALL_ID => {
+                assert_eq!(event.call_id, ALLOWED_CALL_ID);
+                assert_eq!(event.exit_code, 0);
+                break event;
+            }
+            EventMsg::ExecCommandEnd(event) => {
+                panic!("unexpected tool execution completed: {}", event.call_id);
+            }
+            _ => {}
+        }
+    };
+
+    assert_eq!(allowed_exec_begin_count, 1);
+    assert_eq!(allowed_exec_end.call_id, ALLOWED_CALL_ID);
+    assert!(
+        allowed_path.exists(),
+        "the matching response tool must execute"
+    );
+
+    assert_server_model_mismatch_is_terminal(&test.codex).await;
+    assert!(
+        request_log
+            .function_call_output_text(ALLOWED_CALL_ID)
+            .is_some(),
+        "the matching response tool output must reach exactly one follow-up request"
+    );
+    assert_eq!(request_log.requests().len(), 2);
+
+    test.codex.submit(Op::Shutdown).await?;
+    loop {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        match event {
+            EventMsg::ExecCommandBegin(_)
+            | EventMsg::ExecCommandOutputDelta(_)
+            | EventMsg::TerminalInteraction(_)
+            | EventMsg::ExecCommandEnd(_) => {
+                panic!("mismatched tool execution arrived after turn completion");
+            }
+            EventMsg::ShutdownComplete => break,
+            _ => {}
+        }
+    }
+    test.codex.wait_until_terminated().await;
+
+    assert!(
+        !blocked_path.exists(),
+        "the mismatched response tool must remain unexecuted after shutdown"
+    );
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "the terminal mismatch must not issue another model request"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_model_header_casing_only_difference_is_accepted() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -252,7 +370,7 @@ async fn openai_model_header_casing_only_difference_is_accepted() -> Result<()> 
     let requested_header = REQUESTED_MODEL.to_ascii_uppercase();
     let response = sse_response(sse_completed("resp-1"))
         .insert_header("OpenAI-Model", requested_header.as_str());
-    let _mock = mount_response_once(&server, response).await;
+    let mock = mount_response_once(&server, response).await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);
     let test = builder.build(&server).await?;
@@ -262,16 +380,45 @@ async fn openai_model_header_casing_only_difference_is_accepted() -> Result<()> 
         .await?;
 
     let mut error_count = 0;
-    loop {
+    let mut reroute_count = 0;
+    let mut model_warning_messages = Vec::new();
+    let mut warning_item_count = 0;
+    let turn_complete = loop {
         let event = wait_for_event(&test.codex, |_| true).await;
         match event {
             EventMsg::Error(_) => error_count += 1,
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::ModelReroute(_) => reroute_count += 1,
+            EventMsg::Warning(warning)
+                if warning.message.contains("server-reported model")
+                    || warning.message.contains("silently rerouted model") =>
+            {
+                model_warning_messages.push(warning.message);
+            }
+            EventMsg::RawResponseItem(raw)
+                if matches!(
+                    &raw.item,
+                    ResponseItem::Message { content, .. }
+                        if content.iter().any(|item| matches!(
+                            item,
+                            ContentItem::InputText { text } | ContentItem::OutputText { text }
+                                if text.starts_with("Warning: ")
+                        ))
+                ) =>
+            {
+                warning_item_count += 1;
+            }
+            EventMsg::TurnComplete(event) => break event,
             _ => {}
         }
-    }
+    };
 
     assert_eq!(error_count, 0);
+    assert_eq!(reroute_count, 0);
+    assert_eq!(model_warning_messages, Vec::<String>::new());
+    assert_eq!(warning_item_count, 0);
+    assert!(turn_complete.error.is_none());
+    assert_eq!(turn_complete.last_agent_message, None);
+    mock.single_request();
 
     Ok(())
 }
