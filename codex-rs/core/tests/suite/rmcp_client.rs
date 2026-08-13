@@ -7,7 +7,6 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::net::SocketAddr;
-use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
@@ -3572,16 +3571,14 @@ async fn start_streamable_http_test_server(
         ));
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    let bind_addr = format!("127.0.0.1:{port}");
-    let server_url = format!("http://{bind_addr}/mcp");
+    let bound_addr_dir = tempdir()?;
+    let bound_addr_file = bound_addr_dir.path().join("bound-addr");
 
     let mut command = Command::new(&rmcp_http_server_bin);
     command
         .kill_on_drop(true)
-        .env("MCP_STREAMABLE_HTTP_BIND_ADDR", &bind_addr)
+        .env("MCP_STREAMABLE_HTTP_BIND_ADDR", "127.0.0.1:0")
+        .env("MCP_STREAMABLE_HTTP_BOUND_ADDR_FILE", &bound_addr_file)
         .env("MCP_TEST_VALUE", expected_env_value);
     if let Some(expected_token) = expected_token {
         command.env("MCP_EXPECT_BEARER", expected_token);
@@ -3591,11 +3588,51 @@ async fn start_streamable_http_test_server(
     }
     let mut child = command.spawn()?;
 
+    let bound_addr =
+        wait_for_local_bound_addr(&mut child, &bound_addr_file, Duration::from_secs(5)).await?;
+    let server_url = format!("http://{bound_addr}/mcp");
     wait_for_local_streamable_http_server(&mut child, &server_url, Duration::from_secs(5)).await?;
     Ok(Some(StreamableHttpTestServer {
         server_url,
         process: StreamableHttpTestServerProcess::Local(child),
     }))
+}
+
+/// Waits until the local test server publishes the address it selected.
+async fn wait_for_local_bound_addr(
+    server_child: &mut Child,
+    bound_addr_file: &Path,
+    timeout: Duration,
+) -> anyhow::Result<SocketAddr> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = server_child.try_wait()? {
+            return Err(anyhow::anyhow!(
+                "streamable HTTP server exited before publishing its bound address with status {status}"
+            ));
+        }
+
+        match fs::read_to_string(bound_addr_file) {
+            Ok(bound_addr) if !bound_addr.trim().is_empty() => {
+                return bound_addr
+                    .trim()
+                    .parse()
+                    .context("parse local streamable HTTP bound address");
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).context("read local streamable HTTP bound address");
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "timed out waiting for local streamable HTTP bound address"
+            ));
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Starts the Streamable HTTP MCP test server inside the remote test container.
