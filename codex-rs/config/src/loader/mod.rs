@@ -46,9 +46,9 @@ use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
-#[cfg(windows)]
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
@@ -62,6 +62,65 @@ const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
 
 #[cfg(windows)]
 const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
+
+const CDX_USER_CONFIG_HOMES_ENV: &str = "CDX_USER_CONFIG_HOMES";
+
+fn platform_default_codex_home() -> io::Result<AbsolutePathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    let home = home.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not resolve the platform user home for the default .codex directory",
+        )
+    })?;
+    AbsolutePathBuf::from_absolute_path_checked(PathBuf::from(home).join(".codex"))
+}
+
+fn parse_user_config_homes(raw: &OsStr) -> io::Result<Vec<AbsolutePathBuf>> {
+    let mut homes = Vec::new();
+    for (index, path) in std::env::split_paths(raw).enumerate() {
+        let absolute = AbsolutePathBuf::from_absolute_path_checked(&path).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{CDX_USER_CONFIG_HOMES_ENV} entry {index} must be an absolute path ({}): {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        homes.push(absolute);
+    }
+    if homes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{CDX_USER_CONFIG_HOMES_ENV} must contain at least one absolute path"),
+        ));
+    }
+    Ok(homes)
+}
+
+fn resolve_project_layer_excluded_user_config_homes(
+    overrides: &LoaderOverrides,
+) -> io::Result<Vec<AbsolutePathBuf>> {
+    let platform_default_codex_home = match overrides.platform_default_codex_home.clone() {
+        Some(path) => path,
+        None => platform_default_codex_home()?,
+    };
+    let mut excluded_homes = match overrides.project_layer_excluded_user_config_homes.clone() {
+        Some(paths) => paths,
+        None => match std::env::var_os(CDX_USER_CONFIG_HOMES_ENV) {
+            Some(raw) => parse_user_config_homes(&raw)?,
+            None => Vec::new(),
+        },
+    };
+    if !excluded_homes.contains(&platform_default_codex_home) {
+        excluded_homes.push(platform_default_codex_home);
+    }
+    Ok(excluded_homes)
+}
 
 // Project-local config comes from repository contents, so it should not get to
 // choose where a user's credentials are sent or which local commands are run.
@@ -180,6 +239,8 @@ pub async fn load_config_layers_state(
         )
     };
     let active_user_profile = overrides.user_config_profile.clone();
+    let project_layer_excluded_user_config_homes =
+        resolve_project_layer_excluded_user_config_homes(&overrides)?;
     let ignore_managed_requirements = overrides.ignore_managed_requirements;
     let ignore_user_config = overrides.ignore_user_config;
     let ignore_user_and_project_exec_policy_rules =
@@ -407,6 +468,7 @@ pub async fn load_config_layers_state(
             &project_trust_context.project_root,
             &project_trust_context,
             codex_home,
+            &project_layer_excluded_user_config_homes,
             strict_config,
         )
         .await?;
@@ -1329,6 +1391,7 @@ async fn load_project_layers(
     project_root: &AbsolutePathBuf,
     trust_context: &ProjectTrustContext,
     codex_home: &Path,
+    project_layer_excluded_user_config_homes: &[AbsolutePathBuf],
     strict_config: bool,
 ) -> io::Result<LoadedProjectLayers> {
     let discovered = discover_project_layers(
@@ -1337,6 +1400,7 @@ async fn load_project_layers(
         project_root,
         trust_context,
         codex_home,
+        project_layer_excluded_user_config_homes,
         strict_config,
     )
     .await?;
@@ -1375,11 +1439,19 @@ async fn discover_project_layers(
     project_root: &AbsolutePathBuf,
     trust_context: &ProjectTrustContext,
     codex_home: &Path,
+    project_layer_excluded_user_config_homes: &[AbsolutePathBuf],
     strict_config: bool,
 ) -> io::Result<DiscoveredProjectLayers> {
     let codex_home_abs = AbsolutePathBuf::from_absolute_path(codex_home)?;
     let codex_home_normalized =
         normalize_path(codex_home_abs.as_path()).unwrap_or_else(|_| codex_home_abs.to_path_buf());
+    let project_layer_excluded_user_config_homes_normalized =
+        project_layer_excluded_user_config_homes
+            .iter()
+            .map(|path| {
+                normalize_path(path.as_path()).unwrap_or_else(|_| path.as_path().to_path_buf())
+            })
+            .collect::<Vec<_>>();
     let mut dirs = cwd
         .ancestors()
         .scan(false, |done, a| {
@@ -1414,7 +1486,15 @@ async fn discover_project_layers(
         let hooks_config_folder_override = trust_context.root_checkout_hooks_folder_for_dir(&dir);
         let dot_codex_normalized =
             normalize_path(dot_codex_abs.as_path()).unwrap_or_else(|_| dot_codex_abs.to_path_buf());
-        if dot_codex_abs == codex_home_abs || dot_codex_normalized == codex_home_normalized {
+        let is_active_codex_home =
+            dot_codex_abs == codex_home_abs || dot_codex_normalized == codex_home_normalized;
+        let is_excluded_user_config_home = project_layer_excluded_user_config_homes
+            .iter()
+            .zip(&project_layer_excluded_user_config_homes_normalized)
+            .any(|(path, normalized)| {
+                dot_codex_abs == *path || dot_codex_normalized == *normalized
+            });
+        if is_active_codex_home || is_excluded_user_config_home {
             continue;
         }
         let config_file = dot_codex_abs.join(CONFIG_TOML_FILE);

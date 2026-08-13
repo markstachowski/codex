@@ -26,6 +26,30 @@ impl App {
         app_server: &mut AppServerSession,
         retry: SafetyBufferedRetry,
     ) {
+        let locked_lane = match std::env::var("CDX_MODEL_POLICY_LANE") {
+            Ok(value) => match value.trim() {
+                "subscription" | "api" | "spark" => Ok(Some(value)),
+                unknown => Err(format!("unsupported lane `{unknown}`")),
+            },
+            Err(std::env::VarError::NotPresent) if cfg!(debug_assertions) => Ok(None),
+            Err(std::env::VarError::NotPresent) => Ok(Some("subscription".to_string())),
+            Err(std::env::VarError::NotUnicode(_)) => Err("lane is not UTF-8".to_string()),
+        };
+        match locked_lane {
+            Ok(Some(lane)) => {
+                self.chat_widget.add_error_message(format!(
+                    "Faster-model retry is disabled by the locked {} lane; retry with the current model instead.",
+                    lane.trim()
+                ));
+                return;
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Invalid Codex model policy: {err}"));
+                return;
+            }
+            Ok(None) => {}
+        }
         let SafetyBufferedRetry {
             thread_id,
             turn_id,

@@ -1,4 +1,12 @@
 use anyhow::Result;
+use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -502,6 +510,70 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
         ThreadHistoryMode::Paginated
     );
     Ok(())
+}
+
+fn model_settings_item(model: &str, effort: ReasoningEffortConfig) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        ThreadSettingsAppliedEvent {
+            thread_settings: ThreadSettingsSnapshot {
+                model: model.to_string(),
+                model_provider_id: "openai".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: PermissionProfile::read_only(),
+                active_permission_profile: None,
+                cwd: "/tmp".try_into().expect("absolute test path"),
+                reasoning_effort: Some(effort.clone()),
+                reasoning_summary: None,
+                personality: None,
+                collaboration_mode: CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: model.to_string(),
+                        reasoning_effort: Some(effort),
+                        developer_instructions: None,
+                    },
+                },
+            },
+        },
+    ))
+}
+
+#[test]
+fn resumed_model_selection_uses_latest_pair_without_fork_inheritance() {
+    let thread_id = ThreadId::new();
+    let selected = model_settings_item("gpt-5.5", ReasoningEffortConfig::High);
+    let resumed = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![selected.clone()]),
+        rollout_path: None,
+    });
+    assert_eq!(
+        resumed.get_resumed_model_selection(),
+        Some(("gpt-5.5".to_string(), Some(ReasoningEffortConfig::High)))
+    );
+
+    assert!(
+        InitialHistory::Forked(vec![selected])
+            .get_resumed_model_selection()
+            .is_none(),
+        "forks must not inherit the root selection"
+    );
+
+    let latest = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![
+            model_settings_item("gpt-5.5", ReasoningEffortConfig::High),
+            model_settings_item("gpt-5.4", ReasoningEffortConfig::Medium),
+        ]),
+        rollout_path: None,
+    });
+    assert_eq!(
+        latest.get_resumed_model_selection(),
+        Some(("gpt-5.4".to_string(), Some(ReasoningEffortConfig::Medium))),
+        "resume must use the latest effective pair"
+    );
 }
 
 #[test]

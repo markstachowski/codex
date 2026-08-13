@@ -14,6 +14,9 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::is_auto_routing_model_family;
+use codex_protocol::openai_models::is_spark_model_family;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -28,6 +31,90 @@ use tracing::info;
 
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+const MODEL_POLICY_LANE_ENV: &str = "CDX_MODEL_POLICY_LANE";
+// Test-only since the API lane moved to the filtered-catalog contract; the
+// Exact contract machinery it exercises remains live for Spark.
+#[cfg(test)]
+const SOL_MODEL: &str = "gpt-5.6-sol";
+const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerContract {
+    Upstream,
+    Subscription,
+    Exact {
+        model: &'static str,
+        effort: ReasoningEffort,
+    },
+    Invalid,
+}
+
+fn picker_contract_for_lane(lane: Option<&str>) -> PickerContract {
+    match lane {
+        None => PickerContract::Upstream,
+        Some("subscription") => PickerContract::Subscription,
+        // The API lane's catalog file IS the locked model list (gpt-5.6
+        // sol/terra/luna), so the filtered-catalog contract offers exactly the
+        // reviewed set while still excluding reserved families.
+        Some("api") => PickerContract::Subscription,
+        Some("spark") => PickerContract::Exact {
+            model: SPARK_MODEL,
+            effort: ReasoningEffort::XHigh,
+        },
+        Some(_) => PickerContract::Invalid,
+    }
+}
+
+fn locked_picker_contract() -> PickerContract {
+    match std::env::var(MODEL_POLICY_LANE_ENV) {
+        Ok(value) => picker_contract_for_lane(Some(value.trim())),
+        Err(std::env::VarError::NotPresent) if cfg!(debug_assertions) => PickerContract::Upstream,
+        Err(std::env::VarError::NotPresent) => PickerContract::Subscription,
+        Err(std::env::VarError::NotUnicode(_)) => PickerContract::Invalid,
+    }
+}
+
+fn apply_picker_contract(presets: &mut Vec<ModelPreset>, contract: PickerContract) {
+    match contract {
+        PickerContract::Upstream => {}
+        PickerContract::Subscription => {
+            presets.retain(|preset| {
+                !is_spark_model_family(&preset.model)
+                    && !is_auto_routing_model_family(&preset.model)
+            });
+        }
+        PickerContract::Exact { model, effort } => {
+            presets.retain(|preset| preset.model == model);
+            for preset in presets {
+                preset.default_reasoning_effort = effort.clone();
+                preset
+                    .supported_reasoning_efforts
+                    .retain(|option| option.effort == effort);
+            }
+        }
+        PickerContract::Invalid => presets.clear(),
+    }
+}
+
+fn build_available_models_with_contract<M: ModelsManager + ?Sized>(
+    manager: &M,
+    mut remote_models: Vec<ModelInfo>,
+    contract: PickerContract,
+) -> Vec<ModelPreset> {
+    remote_models.sort_by_key(|model| model.priority);
+
+    let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
+    let uses_codex_backend = manager
+        .auth_manager()
+        .is_some_and(AuthManager::current_auth_uses_codex_backend);
+    presets = ModelPreset::filter_by_auth(presets, uses_codex_backend);
+
+    apply_picker_contract(&mut presets, contract);
+
+    ModelPreset::mark_default_by_picker_visibility(&mut presets);
+
+    presets
+}
 
 /// Remote endpoint used by the OpenAI-compatible model manager.
 ///
@@ -123,18 +210,8 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     fn auth_manager(&self) -> Option<&AuthManager>;
 
     /// Build picker-ready presets from the active catalog snapshot.
-    fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
-        remote_models.sort_by_key(|model| model.priority);
-
-        let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
-        let uses_codex_backend = self
-            .auth_manager()
-            .is_some_and(AuthManager::current_auth_uses_codex_backend);
-        presets = ModelPreset::filter_by_auth(presets, uses_codex_backend);
-
-        ModelPreset::mark_default_by_picker_visibility(&mut presets);
-
-        presets
+    fn build_available_models(&self, remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
+        build_available_models_with_contract(self, remote_models, locked_picker_contract())
     }
 
     /// List collaboration mode presets.

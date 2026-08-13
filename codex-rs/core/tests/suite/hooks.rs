@@ -1752,6 +1752,12 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn() -> Result<()>
         "an async hook result from the previous turn must not start a model turn"
     );
 
+    fs::remove_file(
+        test.codex_home_path()
+            .join("async_user_prompt_submit_release"),
+    )
+    .context("re-arm gated async hook before the next turn")?;
+
     let next_prompt = "observe the buffered async context";
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {

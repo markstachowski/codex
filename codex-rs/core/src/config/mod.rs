@@ -92,6 +92,7 @@ use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningMode;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::SandboxMode;
@@ -103,11 +104,16 @@ use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::is_auto_routing_model_family;
+pub use codex_protocol::openai_models::is_pro_capable_model;
+pub use codex_protocol::openai_models::is_spark_model_family;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
@@ -254,6 +260,363 @@ const DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT: &str = "Full-histor
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
 const DEFAULT_MULTI_AGENT_V2_WAIT_AGENT_USAGE_HINT_TEXT: &str =
     "When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.";
+pub const MODEL_POLICY_LANE_ENV: &str = "CDX_MODEL_POLICY_LANE";
+pub const SOL_MODEL: &str = "gpt-5.6-sol";
+pub const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
+
+/// Runtime-only model and billing lane selected by the public launchers.
+///
+/// This is intentionally not a config.toml setting: project config, profiles,
+/// resume metadata, and app-server updates must not be able to change lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPolicyLane {
+    Subscription,
+    Api,
+    Spark,
+}
+
+impl ModelPolicyLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Api => "api",
+            Self::Spark => "spark",
+        }
+    }
+
+    pub const fn required_model(self) -> &'static str {
+        match self {
+            Self::Subscription | Self::Api => SOL_MODEL,
+            Self::Spark => SPARK_MODEL,
+        }
+    }
+
+    /// Review work always uses Sol/Ultra. Spark is a root-only interactive lane.
+    pub const fn required_review_model(self) -> &'static str {
+        SOL_MODEL
+    }
+
+    /// Model used by root-owned background inference. Spark is an interactive
+    /// root-only lane, so its background work returns to Sol with every other
+    /// managed lane.
+    pub(crate) const fn required_background_model(self) -> &'static str {
+        match self {
+            Self::Subscription | Self::Api | Self::Spark => SOL_MODEL,
+        }
+    }
+
+    /// Local reasoning effort used by root-owned background inference.
+    pub(crate) fn required_background_local_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Subscription | Self::Api | Self::Spark => ReasoningEffort::Ultra,
+        }
+    }
+
+    /// Wire reasoning effort used by root-owned background inference.
+    pub(crate) fn required_background_wire_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Subscription | Self::Api | Self::Spark => ReasoningEffort::Max,
+        }
+    }
+
+    /// Whether an explicit root-session model selection may differ from the
+    /// managed default. Background work and child agents remain pinned.
+    ///
+    /// The API lane joined 2026-08-05: its catalog file is the locked model
+    /// list (gpt-5.6 sol/terra/luna), so root selection is still bounded by a
+    /// reviewed artifact rather than by whatever the account can reach.
+    pub const fn allows_user_model_selection(self) -> bool {
+        matches!(self, Self::Subscription | Self::Api)
+    }
+
+    /// Whether an explicit root may select the flex service tier. Metered
+    /// API-key billing is the lane where a cheaper best-effort tier makes
+    /// sense; subscription and Spark stay on their existing tier set so this
+    /// change cannot alter their behavior.
+    pub const fn allows_flex_selection(self) -> bool {
+        matches!(self, Self::Api)
+    }
+
+    /// Whether an explicit root-session `/fast` selection may opt into the
+    /// priority service tier. Child and background sessions remain Standard.
+    pub const fn allows_user_service_tier_selection(self) -> bool {
+        matches!(self, Self::Subscription | Self::Api)
+    }
+
+    /// Internal service-tier selection applied whenever a new managed root is
+    /// created. Fast remains an explicit per-root opt-in via `/fast`. The API
+    /// request boundary serializes this Standard sentinel explicitly; stock
+    /// subscription and Spark request handling continue to omit it.
+    pub const fn required_root_service_tier(self) -> &'static str {
+        match self {
+            Self::Api | Self::Subscription | Self::Spark => SERVICE_TIER_DEFAULT_REQUEST_VALUE,
+        }
+    }
+
+    /// Persistent startup tier required in each lane's physical config. The
+    /// key stays absent because managed root initialization owns the default
+    /// and an in-session selection must remain conversation-local.
+    pub const fn required_config_service_tier(self) -> Option<&'static str> {
+        match self {
+            Self::Api | Self::Subscription | Self::Spark => None,
+        }
+    }
+
+    /// Whether a fully merged config carries an allowed tier while a managed
+    /// root is being bootstrapped. Every lane may use either its omitted
+    /// persistent config or the managed Standard selection; no lane may
+    /// bootstrap directly onto Fast.
+    pub(crate) fn allows_bootstrap_service_tier(self, service_tier: Option<&str>) -> bool {
+        service_tier == self.required_config_service_tier()
+            || service_tier == Some(self.required_root_service_tier())
+    }
+
+    pub const fn allows_non_root_sessions(self) -> bool {
+        !matches!(self, Self::Spark)
+    }
+
+    pub(crate) fn validate_user_selected_model(self, model: &str) -> std::io::Result<()> {
+        // Reserved families stay rejected on every lane that permits
+        // selection: Spark has a dedicated lane and usage limit, and automatic
+        // routing would make the running model unprovable.
+        if is_spark_model_family(model) || is_auto_routing_model_family(model) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy rejected reserved model `{model}`; use the dedicated Spark lane for Spark and select an explicit model instead of automatic routing",
+                    self.as_str()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_model_and_effort(
+        self,
+        model: &str,
+        reasoning_effort: Option<&ReasoningEffort>,
+        allow_user_model_selection: bool,
+    ) -> std::io::Result<()> {
+        let require_managed_model =
+            !allow_user_model_selection || !self.allows_user_model_selection();
+        if allow_user_model_selection {
+            self.validate_user_selected_model(model)?;
+        }
+        if require_managed_model && model != self.required_model() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy rejected model `{model}`; required `{}`",
+                    self.as_str(),
+                    self.required_model()
+                ),
+            ));
+        }
+        let required_effort = self.required_local_effort();
+        if require_managed_model && reasoning_effort != Some(&required_effort) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy rejected local reasoning effort {reasoning_effort:?}; required {required_effort}",
+                    self.as_str()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_service_tier(
+        self,
+        service_tier: Option<&str>,
+        allow_user_service_tier_selection: bool,
+    ) -> std::io::Result<()> {
+        let Some(service_tier) = service_tier else {
+            return Ok(());
+        };
+        if service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
+            return Ok(());
+        }
+        if allow_user_service_tier_selection
+            && self.allows_user_service_tier_selection()
+            && service_tier == ServiceTier::Fast.request_value()
+        {
+            return Ok(());
+        }
+        // Flex is API-lane only and root only: cheaper best-effort capacity is
+        // a metered-billing concept, and children/background stay on Standard
+        // exactly as they do for Fast.
+        if allow_user_service_tier_selection
+            && self.allows_flex_selection()
+            && service_tier == ServiceTier::Flex.request_value()
+        {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} model policy rejected service tier `{service_tier}`; explicit subscription or API roots may select `{}`, explicit API roots may select `{}`, and all other managed sessions require `{SERVICE_TIER_DEFAULT_REQUEST_VALUE}`",
+                self.as_str(),
+                ServiceTier::Fast.request_value(),
+                ServiceTier::Flex.request_value()
+            ),
+        ))
+    }
+
+    pub fn required_local_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Subscription | Self::Api => ReasoningEffort::Ultra,
+            Self::Spark => ReasoningEffort::XHigh,
+        }
+    }
+
+    pub fn required_wire_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Subscription | Self::Api => ReasoningEffort::Max,
+            Self::Spark => ReasoningEffort::XHigh,
+        }
+    }
+
+    pub const fn required_reasoning_mode(self) -> Option<ReasoningMode> {
+        match self {
+            Self::Api => Some(ReasoningMode::Pro),
+            Self::Subscription | Self::Spark => None,
+        }
+    }
+
+    /// Reasoning mode required for one specific model on this lane.
+    ///
+    /// Pro is a property of the MODEL, not of the lane: the API rejects the
+    /// whole request when `reasoning.mode` reaches a model that does not
+    /// implement it. Deriving the mode from the resolved model — rather than
+    /// carrying it in config — is what keeps Pro structurally guaranteed on the
+    /// models that support it while still letting the lane offer models that do
+    /// not. It also keeps `/review` correct: review always resolves to Sol, so
+    /// a review request derives Pro even when the root selected another model.
+    pub fn required_reasoning_mode_for_model(self, model: &str) -> Option<ReasoningMode> {
+        match self {
+            Self::Api if is_pro_capable_model(model) => Some(ReasoningMode::Pro),
+            Self::Api => None,
+            Self::Subscription | Self::Spark => self.required_reasoning_mode(),
+        }
+    }
+
+    pub const fn required_login_method(self) -> ForcedLoginMethod {
+        match self {
+            Self::Api => ForcedLoginMethod::Api,
+            Self::Subscription | Self::Spark => ForcedLoginMethod::Chatgpt,
+        }
+    }
+
+    pub const fn multi_agent_enabled(self) -> bool {
+        !matches!(self, Self::Spark)
+    }
+
+    pub const fn required_multi_agent_version(self) -> MultiAgentVersion {
+        match self {
+            Self::Subscription | Self::Api => MultiAgentVersion::V2,
+            Self::Spark => MultiAgentVersion::Disabled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedBackgroundInferenceSettings {
+    pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<String>,
+}
+
+/// Resolve inference settings for root-owned background work. Managed
+/// prewarm, compaction, and memory requests always use Sol, Ultra, and
+/// Standard, including when the interactive root is Spark. Unmanaged
+/// execution preserves the caller's existing behavior.
+pub fn managed_background_inference_for_lane(
+    inherited_model: String,
+    inherited_reasoning_effort: Option<ReasoningEffort>,
+    inherited_service_tier: Option<String>,
+    lane: Option<ModelPolicyLane>,
+) -> ManagedBackgroundInferenceSettings {
+    match lane {
+        Some(lane) => ManagedBackgroundInferenceSettings {
+            model: lane.required_background_model().to_string(),
+            reasoning_effort: Some(lane.required_background_local_effort()),
+            service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+        },
+        None => ManagedBackgroundInferenceSettings {
+            model: inherited_model,
+            reasoning_effort: inherited_reasoning_effort,
+            service_tier: inherited_service_tier,
+        },
+    }
+}
+
+/// Keep explicit or inherited instructions intact, but do not send catalog
+/// instructions for an interactive root model with a different background
+/// model.
+pub(crate) fn managed_background_base_instructions_for_model(
+    inherited: BaseInstructions,
+    model_info: &ModelInfo,
+    personality: Option<Personality>,
+    lane: Option<ModelPolicyLane>,
+) -> BaseInstructions {
+    if lane.is_none() {
+        return inherited;
+    }
+    match inherited.provenance.as_ref() {
+        Some(BaseInstructionsProvenance::Model { model }) if model != &model_info.slug => {
+            BaseInstructions {
+                text: model_info.get_model_instructions(personality),
+                provenance: Some(BaseInstructionsProvenance::Model {
+                    model: model_info.slug.clone(),
+                }),
+            }
+        }
+        _ => inherited,
+    }
+}
+
+fn resolve_locked_model_policy_lane(
+    value: Option<&str>,
+    require_marker: bool,
+) -> std::io::Result<Option<ModelPolicyLane>> {
+    match value.map(str::trim) {
+        Some("subscription") => Ok(Some(ModelPolicyLane::Subscription)),
+        Some("api") => Ok(Some(ModelPolicyLane::Api)),
+        Some("spark") => Ok(Some(ModelPolicyLane::Spark)),
+        Some(unknown) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported {MODEL_POLICY_LANE_ENV} value `{unknown}`; expected subscription, api, or spark"
+            ),
+        )),
+        None if require_marker => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{MODEL_POLICY_LANE_ENV} is required for managed release execution; use the codex, cdxpro, or cdxspark launcher"
+            ),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Resolve the process-local policy lane.
+///
+/// Debug/test builds remain upstream-compatible when the marker is absent.
+/// Installed managed releases reject an absent marker instead of silently
+/// inventing a subscription lane.
+pub fn locked_model_policy_lane() -> std::io::Result<Option<ModelPolicyLane>> {
+    match std::env::var(MODEL_POLICY_LANE_ENV) {
+        Ok(value) => resolve_locked_model_policy_lane(Some(value.as_str()), true),
+        Err(std::env::VarError::NotPresent) => {
+            resolve_locked_model_policy_lane(None, !cfg!(debug_assertions))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{MODEL_POLICY_LANE_ENV} must be valid UTF-8"),
+        )),
+    }
+}
+
 const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Note that collaboration tools cannot be called from inside `functions.exec`. Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` only as direct tool calls using the recipient shown in their tool definitions, such as `to=functions.collaboration.spawn_agent`, since they are intentionally absent from the `functions.exec` `tools.*` namespace. Available tools in `functions.exec` are explicitly described with a `tools` namespace in the developer message.
 
 All agents share the same directory. In detail:
@@ -952,6 +1315,11 @@ pub struct Config {
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
     pub model_reasoning_effort: Option<ReasoningEffort>,
+
+    /// Value to use for `reasoning.mode` when making a request using the
+    /// Responses API.
+    pub model_reasoning_mode: Option<ReasoningMode>,
+
     /// Optional Plan-mode-specific reasoning effort override used by the TUI.
     ///
     /// When unset, Plan mode uses the built-in Plan preset default (currently
@@ -1547,6 +1915,275 @@ impl Config {
         self.multi_agent_version_override()
             .or(model_multi_agent_version)
             .unwrap_or_else(|| self.multi_agent_version_from_features())
+    }
+
+    /// Validate the fully merged runtime configuration for a locked public lane.
+    ///
+    /// This runs after every config layer and invocation override has been
+    /// applied, so project-local config, profiles, role files, and CLI flags
+    /// cannot silently weaken the selected lane.
+    pub fn validate_locked_model_policy(&self) -> std::io::Result<()> {
+        let Some(lane) = locked_model_policy_lane()? else {
+            return Ok(());
+        };
+        let invalid = |field: &str, actual: String, expected: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy rejects {field}={actual}; required {expected}",
+                    lane.as_str()
+                ),
+            )
+        };
+        let required_model = lane.required_model();
+        if self.model.as_deref() != Some(required_model) {
+            return Err(invalid(
+                "model",
+                format!("{:?}", self.model),
+                required_model.to_string(),
+            ));
+        }
+        let required_review_model = lane.required_review_model();
+        if self.review_model.as_deref() != Some(required_review_model) {
+            return Err(invalid(
+                "review_model",
+                format!("{:?}", self.review_model),
+                required_review_model.to_string(),
+            ));
+        }
+        let required_effort = lane.required_local_effort();
+        if self.model_reasoning_effort.as_ref() != Some(&required_effort) {
+            return Err(invalid(
+                "model_reasoning_effort",
+                format!("{:?}", self.model_reasoning_effort),
+                required_effort.to_string(),
+            ));
+        }
+        if self.plan_mode_reasoning_effort.as_ref() != Some(&required_effort) {
+            return Err(invalid(
+                "plan_mode_reasoning_effort",
+                format!("{:?}", self.plan_mode_reasoning_effort),
+                required_effort.to_string(),
+            ));
+        }
+        if self.model_reasoning_mode != lane.required_reasoning_mode() {
+            return Err(invalid(
+                "model_reasoning_mode",
+                format!("{:?}", self.model_reasoning_mode),
+                format!("{:?}", lane.required_reasoning_mode()),
+            ));
+        }
+        if self.model_provider_id != "openai" || !self.model_provider.is_openai() {
+            return Err(invalid(
+                "model_provider",
+                self.model_provider_id.clone(),
+                "built-in openai".to_string(),
+            ));
+        }
+        if self.forced_login_method != Some(lane.required_login_method()) {
+            return Err(invalid(
+                "forced_login_method",
+                format!("{:?}", self.forced_login_method),
+                lane.required_login_method().to_string(),
+            ));
+        }
+        let service_tier = self.service_tier.as_deref();
+        if !lane.allows_bootstrap_service_tier(service_tier) {
+            let required_config_service_tier = lane.required_config_service_tier();
+            let required_root_service_tier = Some(lane.required_root_service_tier());
+            let expected = if required_config_service_tier == required_root_service_tier {
+                format!("{required_config_service_tier:?}")
+            } else {
+                format!("{required_config_service_tier:?} or {required_root_service_tier:?}")
+            };
+            return Err(invalid(
+                "service_tier",
+                format!("{:?}", self.service_tier),
+                expected,
+            ));
+        }
+        let fast_mode_enabled = self.features.enabled(Feature::FastMode);
+        let required_fast_mode = lane.allows_user_service_tier_selection();
+        if fast_mode_enabled != required_fast_mode {
+            return Err(invalid(
+                "features.fast_mode",
+                fast_mode_enabled.to_string(),
+                required_fast_mode.to_string(),
+            ));
+        }
+        let multi_agent_enabled = self.features.enabled(Feature::Collab);
+        if multi_agent_enabled != lane.multi_agent_enabled() {
+            return Err(invalid(
+                "features.multi_agent",
+                multi_agent_enabled.to_string(),
+                lane.multi_agent_enabled().to_string(),
+            ));
+        }
+        if self.agents_enabled != lane.multi_agent_enabled() {
+            return Err(invalid(
+                "agents.enabled",
+                self.agents_enabled.to_string(),
+                lane.multi_agent_enabled().to_string(),
+            ));
+        }
+        if self.multi_agent_v2.expose_spawn_agent_model_overrides {
+            return Err(invalid(
+                "features.multi_agent_v2.expose_spawn_agent_model_overrides",
+                "true".to_string(),
+                "false".to_string(),
+            ));
+        }
+        match lane {
+            ModelPolicyLane::Subscription | ModelPolicyLane::Api => {
+                if self
+                    .agent_default_subagent_model
+                    .as_deref()
+                    .is_some_and(|model| model != required_model)
+                {
+                    return Err(invalid(
+                        "agents.default_subagent_model",
+                        format!("{:?}", self.agent_default_subagent_model),
+                        format!("unset or {required_model}"),
+                    ));
+                }
+                if self
+                    .agent_default_subagent_reasoning_effort
+                    .as_ref()
+                    .is_some_and(|effort| effort != &required_effort)
+                {
+                    return Err(invalid(
+                        "agents.default_subagent_reasoning_effort",
+                        format!("{:?}", self.agent_default_subagent_reasoning_effort),
+                        format!("unset or {required_effort}"),
+                    ));
+                }
+            }
+            ModelPolicyLane::Spark => {
+                if self.agent_default_subagent_model.is_some() {
+                    return Err(invalid(
+                        "agents.default_subagent_model",
+                        format!("{:?}", self.agent_default_subagent_model),
+                        "unset for the root-only Spark lane".to_string(),
+                    ));
+                }
+                if self.agent_default_subagent_reasoning_effort.is_some() {
+                    return Err(invalid(
+                        "agents.default_subagent_reasoning_effort",
+                        format!("{:?}", self.agent_default_subagent_reasoning_effort),
+                        "unset for the root-only Spark lane".to_string(),
+                    ));
+                }
+                if self.features.enabled(Feature::MemoryTool) {
+                    return Err(invalid(
+                        "features.memories",
+                        "true".to_string(),
+                        "false for the root-only Spark lane".to_string(),
+                    ));
+                }
+                if self.approvals_reviewer != ApprovalsReviewer::User {
+                    return Err(invalid(
+                        "approvals_reviewer",
+                        self.approvals_reviewer.to_string(),
+                        ApprovalsReviewer::User.to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate mutable or role-derived inference settings without requiring
+    /// the rest of the root-session feature topology to remain unchanged.
+    fn validate_locked_inference_settings_inner(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&ReasoningEffort>,
+        service_tier: Option<&str>,
+        allow_user_model_selection: bool,
+    ) -> std::io::Result<()> {
+        let Some(lane) = locked_model_policy_lane()? else {
+            return Ok(());
+        };
+        lane.validate_model_and_effort(model, reasoning_effort, allow_user_model_selection)?;
+        if self.model_reasoning_mode != lane.required_reasoning_mode() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy rejected reasoning mode {:?}; required {:?}",
+                    lane.as_str(),
+                    self.model_reasoning_mode,
+                    lane.required_reasoning_mode()
+                ),
+            ));
+        }
+        if self.model_provider_id != "openai" || !self.model_provider.is_openai() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy requires the built-in openai provider",
+                    lane.as_str()
+                ),
+            ));
+        }
+        lane.validate_service_tier(service_tier, allow_user_model_selection)?;
+        Ok(())
+    }
+
+    /// Validate root-session inference settings. The subscription lane keeps
+    /// managed defaults but permits an explicit in-session `/model` choice.
+    pub fn validate_locked_inference_settings(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&ReasoningEffort>,
+        service_tier: Option<&str>,
+    ) -> std::io::Result<()> {
+        self.validate_locked_inference_settings_inner(
+            model,
+            reasoning_effort,
+            service_tier,
+            /*allow_user_model_selection*/ true,
+        )
+    }
+
+    /// Validate child-agent inference settings. Children and role files must
+    /// stay on the managed model even when the root explicitly selects another
+    /// subscription model for its current conversation.
+    pub fn validate_locked_subagent_inference_settings(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&ReasoningEffort>,
+        service_tier: Option<&str>,
+    ) -> std::io::Result<()> {
+        self.validate_locked_inference_settings_inner(
+            model,
+            reasoning_effort,
+            service_tier,
+            /*allow_user_model_selection*/ false,
+        )
+    }
+
+    /// Select the root or non-root validator from the immutable session source.
+    pub fn validate_locked_session_inference_settings(
+        &self,
+        is_non_root_agent: bool,
+        model: &str,
+        reasoning_effort: Option<&ReasoningEffort>,
+        service_tier: Option<&str>,
+    ) -> std::io::Result<()> {
+        if is_non_root_agent {
+            if let Some(lane) = locked_model_policy_lane()?
+                && !lane.allows_non_root_sessions()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} model policy rejects non-root sessions", lane.as_str()),
+                ));
+            }
+            self.validate_locked_subagent_inference_settings(model, reasoning_effort, service_tier)
+        } else {
+            self.validate_locked_inference_settings(model, reasoning_effort, service_tier)
+        }
     }
 
     pub(crate) fn effective_agent_max_threads(
@@ -4178,6 +4815,7 @@ impl Config {
                 .unwrap_or(false),
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
+            model_reasoning_mode: cfg.model_reasoning_mode,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
@@ -4299,6 +4937,7 @@ impl Config {
                 .unwrap_or_default(),
             otel,
         };
+        config.validate_locked_model_policy()?;
         Ok(config)
         })
         .await
