@@ -76,12 +76,16 @@ use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
 
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningMode as ReasoningModeConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::openai_models::is_user_selectable_wire_effort;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -115,8 +119,11 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
@@ -254,6 +261,7 @@ impl RequestRouteTelemetry {
 pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
+    model_reasoning_mode: Option<ReasoningModeConfig>,
     prompt_cache_key_override: Option<String>,
     http_client_factory: HttpClientFactory,
 }
@@ -468,6 +476,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
             agent_identity_policy,
+            model_reasoning_mode: None,
             prompt_cache_key_override: None,
             http_client_factory,
         }
@@ -478,6 +487,14 @@ impl ModelClient {
         prompt_cache_key_override: Option<String>,
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
+        self
+    }
+
+    pub fn with_model_reasoning_mode(
+        mut self,
+        model_reasoning_mode: Option<ReasoningModeConfig>,
+    ) -> Self {
+        self.model_reasoning_mode = model_reasoning_mode;
         self
     }
 
@@ -501,6 +518,274 @@ impl ModelClient {
 
     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.state.provider.auth_manager()
+    }
+
+    fn locked_policy_lane(&self) -> Result<Option<ModelPolicyLane>> {
+        locked_model_policy_lane().map_err(|err| CodexErr::InvalidRequest(err.to_string()))
+    }
+
+    /// Reasoning mode for an outbound request.
+    ///
+    /// A managed lane derives this from the model actually being sent, so the
+    /// configured value can never drift from what the model accepts. Unmanaged
+    /// sessions keep stock behaviour and use the configured mode.
+    fn locked_reasoning_mode_for(&self, model: &str) -> Result<Option<ReasoningModeConfig>> {
+        match self.locked_policy_lane()? {
+            Some(lane) => Ok(lane.required_reasoning_mode_for_model(model)),
+            None => Ok(self.model_reasoning_mode),
+        }
+    }
+
+    /// Resolve the service tier that reaches a Responses request body.
+    ///
+    /// `default` remains an internal sentinel for stock, subscription, and
+    /// Spark traffic, where the upstream client intentionally omits it. The
+    /// managed API lane is different: omission delegates billing to the
+    /// mutable project setting, so cdxpro must make Standard explicit. A
+    /// missing managed API value is normalized to the same explicit Standard
+    /// value so no resumed or background request can silently become premium.
+    fn service_tier_for_request_for_lane(
+        lane: Option<ModelPolicyLane>,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+    ) -> Option<String> {
+        if matches!(lane, Some(ModelPolicyLane::Api))
+            && matches!(
+                service_tier.as_deref(),
+                None | Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+            )
+        {
+            return Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+        }
+
+        model_info.service_tier_for_request(service_tier)
+    }
+
+    fn validate_locked_client_setup(&self, setup: &CurrentClientSetup) -> Result<()> {
+        let Some(lane) = self.locked_policy_lane()? else {
+            return Ok(());
+        };
+        let auth_mode = setup.auth.as_ref().map(CodexAuth::auth_mode);
+        let expected_auth_mode = match lane {
+            ModelPolicyLane::Api => AuthMode::ApiKey,
+            ModelPolicyLane::Subscription | ModelPolicyLane::Spark => AuthMode::Chatgpt,
+        };
+        if auth_mode != Some(expected_auth_mode) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected resolved authentication mode {auth_mode:?}; required {expected_auth_mode}",
+                lane.as_str()
+            )));
+        }
+
+        let base_url = setup.api_provider.base_url.trim_end_matches('/');
+        let expected_base_url = match lane {
+            ModelPolicyLane::Api => "https://api.openai.com/v1",
+            ModelPolicyLane::Subscription | ModelPolicyLane::Spark => {
+                "https://chatgpt.com/backend-api/codex"
+            }
+        };
+        if base_url != expected_base_url {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected API base URL `{base_url}`; required `{expected_base_url}`",
+                lane.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_locked_responses_request(
+        &self,
+        lane: Option<ModelPolicyLane>,
+        request: &ResponsesApiRequest,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<()> {
+        let Some(lane) = lane else {
+            return Ok(());
+        };
+        Self::validate_locked_responses_request_for_request_kind(
+            lane,
+            self.state.session_source.is_non_root_agent(),
+            responses_metadata.request_kind,
+            request,
+        )
+    }
+
+    #[cfg(test)]
+    fn validate_locked_responses_request_for_lane(
+        lane: ModelPolicyLane,
+        is_non_root_agent: bool,
+        request: &ResponsesApiRequest,
+    ) -> Result<()> {
+        Self::validate_locked_responses_request_for_request_kind(
+            lane,
+            is_non_root_agent,
+            Some(CodexResponsesRequestKind::Turn),
+            request,
+        )
+    }
+
+    fn validate_locked_responses_request_for_request_kind(
+        lane: ModelPolicyLane,
+        is_non_root_agent: bool,
+        request_kind: Option<CodexResponsesRequestKind>,
+        request: &ResponsesApiRequest,
+    ) -> Result<()> {
+        let Some(request_kind) = request_kind else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires explicit request-kind metadata",
+                lane.as_str()
+            )));
+        };
+        let managed_background = match request_kind {
+            CodexResponsesRequestKind::Turn => false,
+            CodexResponsesRequestKind::Prewarm => true,
+            CodexResponsesRequestKind::Compaction(_) => true,
+            CodexResponsesRequestKind::Memory => true,
+        };
+        if is_non_root_agent && !lane.allows_non_root_sessions() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejects non-root requests",
+                lane.as_str()
+            )));
+        }
+        // Only an ordinary root turn may select its own model. Root-owned
+        // background work is Sol/Ultra even when the interactive root is
+        // Spark; children and other non-root work retain their existing pin.
+        let root_turn = !is_non_root_agent && !managed_background;
+        let user_selecting = lane.allows_user_model_selection() && root_turn;
+        let required_model = if managed_background {
+            lane.required_background_model()
+        } else {
+            lane.required_model()
+        };
+        if user_selecting {
+            lane.validate_user_selected_model(request.model.as_str())
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        } else if request.model != required_model {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected request model `{}`; required `{}`",
+                lane.as_str(),
+                request.model,
+                required_model
+            )));
+        }
+
+        let Some(reasoning) = request.reasoning.as_ref() else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires an explicit reasoning payload",
+                lane.as_str()
+            )));
+        };
+
+        // Hoisted above the selection fork on purpose. This invariant used to
+        // live inside both branches, where an early return could skip it and a
+        // later edit could let the two copies disagree. Derived from the model
+        // actually being sent, so config cannot decide it.
+        let required_mode = lane.required_reasoning_mode_for_model(request.model.as_str());
+        if reasoning.mode != required_mode {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected reasoning mode {:?} for `{}`; required {:?}",
+                lane.as_str(),
+                reasoning.mode,
+                request.model,
+                required_mode
+            )));
+        }
+
+        if user_selecting {
+            match reasoning.effort.as_ref() {
+                None => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "{} model policy requires an explicit reasoning effort for `{}`",
+                        lane.as_str(),
+                        request.model
+                    )));
+                }
+                // Fail closed on wire-invalid efforts instead of letting a
+                // config- or RPC-supplied `minimal`/literal-`ultra` become a
+                // live 400 on every request (probed 2026-08-05).
+                Some(effort) if !is_user_selectable_wire_effort(effort) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "{} model policy rejected wire reasoning effort {effort:?} for `{}`; selectable efforts are low, medium, high, xhigh, and max",
+                        lane.as_str(),
+                        request.model
+                    )));
+                }
+                Some(_) => {}
+            }
+        } else {
+            let required_effort = if managed_background {
+                lane.required_background_wire_effort()
+            } else {
+                lane.required_wire_effort()
+            };
+            if reasoning.effort.as_ref() != Some(&required_effort) {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "{} model policy rejected wire reasoning effort {:?}; required {}",
+                    lane.as_str(),
+                    reasoning.effort,
+                    required_effort
+                )));
+            }
+        }
+
+        if matches!(lane, ModelPolicyLane::Api) && request.service_tier.is_none() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires an explicit service tier on every Responses request",
+                lane.as_str()
+            )));
+        }
+
+        lane.validate_service_tier(
+            request.service_tier.as_deref(),
+            /*allow_user_service_tier_selection*/ root_turn,
+        )
+        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        Ok(())
+    }
+
+    fn validate_locked_memory_request(
+        &self,
+        model: &str,
+        reasoning: Option<&Reasoning>,
+    ) -> Result<()> {
+        let Some(lane) = self.locked_policy_lane()? else {
+            return Ok(());
+        };
+        Self::validate_locked_memory_request_for_lane(lane, model, reasoning)
+    }
+
+    fn validate_locked_memory_request_for_lane(
+        lane: ModelPolicyLane,
+        model: &str,
+        reasoning: Option<&Reasoning>,
+    ) -> Result<()> {
+        if model != lane.required_background_model() {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected memory model `{model}`; required `{}`",
+                lane.as_str(),
+                lane.required_background_model()
+            )));
+        }
+        let Some(reasoning) = reasoning else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy requires explicit memory reasoning",
+                lane.as_str()
+            )));
+        };
+        let required_effort = lane.required_background_wire_effort();
+        let required_mode = lane.required_reasoning_mode_for_model(model);
+        if reasoning.effort.as_ref() != Some(&required_effort) || reasoning.mode != required_mode {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{} model policy rejected memory reasoning mode={:?} effort={:?}; required mode={:?} effort={}",
+                lane.as_str(),
+                reasoning.mode,
+                reasoning.effort,
+                required_mode,
+                required_effort
+            )));
+        }
+        Ok(())
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -577,6 +862,7 @@ impl ModelClient {
             self.state.auth_env_telemetry.clone(),
         );
         let request = self.build_responses_request(
+            self.locked_policy_lane()?,
             prompt,
             model_info,
             settings.effort,
@@ -720,17 +1006,20 @@ impl ModelClient {
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
+        let memory_reasoning_mode = self.locked_reasoning_mode_for(&model_info.slug)?;
         let payload = ApiMemorySummarizeInput {
             model: model_info.slug.clone(),
             raw_memories,
             reasoning: effort
                 .map(reasoning_effort_for_request)
                 .map(|effort| Reasoning {
+                    mode: memory_reasoning_mode,
                     effort: Some(effort),
                     summary: None,
                     context: None,
                 }),
         };
+        self.validate_locked_memory_request(&payload.model, payload.reasoning.as_ref())?;
 
         client
             .summarize_input(&payload, self.build_subagent_headers())
@@ -822,11 +1111,17 @@ impl ModelClient {
     }
 
     fn build_reasoning(
+        &self,
+        lane: Option<ModelPolicyLane>,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
     ) -> Reasoning {
         Reasoning {
+            mode: match lane {
+                Some(lane) => lane.required_reasoning_mode_for_model(&model_info.slug),
+                None => self.model_reasoning_mode,
+            },
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
                 .map(reasoning_effort_for_request),
@@ -841,8 +1136,13 @@ impl ModelClient {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "request construction keeps policy and telemetry inputs explicit"
+    )]
     fn build_responses_request(
         &self,
+        lane: Option<ModelPolicyLane>,
         prompt: &Prompt,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
@@ -894,7 +1194,7 @@ impl ModelClient {
                 Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
             )
         };
-        let reasoning = Self::build_reasoning(model_info, effort, summary);
+        let reasoning = self.build_reasoning(lane, model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
             && reasoning.summary.is_some())
@@ -919,7 +1219,7 @@ impl ModelClient {
             prompt.output_schema_strict,
         );
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
-        let service_tier = model_info.service_tier_for_request(service_tier);
+        let service_tier = Self::service_tier_for_request_for_lane(lane, model_info, service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
@@ -937,6 +1237,7 @@ impl ModelClient {
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
         };
+        self.validate_locked_responses_request(lane, &request, responses_metadata)?;
         Ok(request)
     }
 
@@ -977,12 +1278,14 @@ impl ModelClient {
                 agent_identity_session_fallback: self.state.agent_identity_session_fallback.clone(),
             })
             .await?;
-        Ok(CurrentClientSetup {
+        let setup = CurrentClientSetup {
             auth,
             api_provider,
             api_auth: resolved_auth.auth,
             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
-        })
+        };
+        self.validate_locked_client_setup(&setup)?;
+        Ok(setup)
     }
 
     fn build_routing_hint_header(
@@ -1452,6 +1755,13 @@ impl ModelClientSession {
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        // Flex is best-effort by contract: a 429 `resource_unavailable` is an
+        // unbilled "no spare capacity this instant" signal, not a failure.
+        // Wait briefly and retry the SAME tier a bounded number of times; on
+        // exhaustion the honest error surfaces. Never silently change tier —
+        // what a turn costs is the operator's decision alone.
+        const FLEX_CAPACITY_MAX_RETRIES: u32 = 4;
+        let mut flex_capacity_attempts: u32 = 0;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let transport = self
@@ -1479,6 +1789,7 @@ impl ModelClientSession {
                 .await;
 
             let mut request = self.client.build_responses_request(
+                self.client.locked_policy_lane()?,
                 prompt,
                 model_info,
                 effort.clone(),
@@ -1550,6 +1861,26 @@ impl ModelClientSession {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
+                    if matches!(
+                        err.details(),
+                        codex_protocol::error::CodexErrorDetails::ResourceUnavailable(_)
+                    ) && service_tier.as_deref() == Some(ServiceTier::Flex.request_value())
+                        && flex_capacity_attempts < FLEX_CAPACITY_MAX_RETRIES
+                    {
+                        flex_capacity_attempts += 1;
+                        // 2s/4s/8s/16s — capacity blips at single-user volume
+                        // clear in seconds, and every retry is unbilled.
+                        let delay =
+                            Duration::from_secs(2u64 << (flex_capacity_attempts - 1).min(3));
+                        tracing::warn!(
+                            attempt = flex_capacity_attempts,
+                            max = FLEX_CAPACITY_MAX_RETRIES,
+                            delay_secs = delay.as_secs(),
+                            "flex capacity unavailable; retrying the same tier"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     return Err(err);
                 }
             }
@@ -1599,6 +1930,7 @@ impl ModelClientSession {
                 pending_retry,
             );
             let mut request = self.client.build_responses_request(
+                self.client.locked_policy_lane()?,
                 prompt,
                 model_info,
                 effort.clone(),

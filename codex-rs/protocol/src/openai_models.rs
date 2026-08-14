@@ -37,6 +37,61 @@ const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 /// Backend model-catalog specialty identifying cybersecurity-focused models.
 pub const MODEL_SPECIALTY_CYBER: &str = "cyber";
 pub const SPEED_TIER_FAST: &str = "fast";
+const AUTO_ROUTING_MODEL_PREFIX: &str = "codex-auto-";
+
+fn unqualified_model_slug(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Returns whether a model slug belongs to the dedicated Spark family.
+pub fn is_spark_model_family(model: &str) -> bool {
+    unqualified_model_slug(model)
+        .to_ascii_lowercase()
+        .contains("codex-spark")
+}
+
+/// Returns whether a model slug selects automatic model routing.
+///
+/// Provider namespaces and ASCII case do not change the family identity.
+pub fn is_auto_routing_model_family(model: &str) -> bool {
+    unqualified_model_slug(model)
+        .get(..AUTO_ROUTING_MODEL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(AUTO_ROUTING_MODEL_PREFIX))
+}
+
+/// Returns whether a model slug accepts the typed `reasoning.mode` field.
+///
+/// The Responses API advertises no capability for this — a model either accepts
+/// `reasoning.mode` or rejects the whole request. Verified live on 2026-08-05:
+/// the gpt-5.6 family (sol, terra, luna) accepts `pro` at every supported
+/// effort, while gpt-5.4-mini answers 400 `reasoning.mode is not supported with
+/// this model`. An unrecognised slug is treated as incapable on purpose, so a
+/// new model silently loses Pro instead of failing every request.
+pub fn is_pro_capable_model(model: &str) -> bool {
+    let slug = unqualified_model_slug(model).to_ascii_lowercase();
+    matches!(
+        slug.as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
+/// Wire-valid reasoning efforts an explicit user-selected root may send.
+///
+/// Probed live on 2026-08-05 against gpt-5.6 sol/terra/luna: low through max
+/// all return 200; `minimal` is rejected (`unsupported_value`) and a literal
+/// `ultra` is rejected (`invalid_value`) — `ultra` exists only as a client
+/// label that must be translated to `max` before egress. Gating here keeps a
+/// config- or RPC-supplied invalid effort from becoming a live 400 loop.
+pub fn is_user_selectable_wire_effort(effort: &ReasoningEffort) -> bool {
+    matches!(
+        effort,
+        ReasoningEffort::Low
+            | ReasoningEffort::Medium
+            | ReasoningEffort::High
+            | ReasoningEffort::XHigh
+            | ReasoningEffort::Max
+    )
+}
 
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
 #[derive(Debug, Default, Clone, PartialEq, Eq, TS, Hash)]
@@ -855,6 +910,27 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::from_str;
     use serde_json::to_string;
+
+    #[test]
+    fn model_family_detection_normalizes_namespace_and_ascii_case() {
+        for model in [
+            "codex-auto-balanced",
+            "openai/codex-auto-balanced",
+            "OPENAI/CODEX-AUTO-BALANCED",
+        ] {
+            assert!(is_auto_routing_model_family(model), "{model}");
+        }
+        assert!(!is_auto_routing_model_family("gpt-5.6-sol"));
+
+        for model in [
+            "gpt-5.3-codex-spark",
+            "openai/gpt-5.3-codex-spark",
+            "OPENAI/GPT-5.3-CODEX-SPARK",
+        ] {
+            assert!(is_spark_model_family(model), "{model}");
+        }
+        assert!(!is_spark_model_family("gpt-5.6-sol"));
+    }
 
     fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {

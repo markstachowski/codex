@@ -552,7 +552,7 @@ fn run_bwrap_in_child_with_synthetic_mount_cleanup(bwrap_args: crate::bwrap::Bwr
             let err = std::io::Error::last_os_error();
             panic!("failed to place bubblewrap child in its own process group: {err}");
         }
-        terminate_with_parent(parent_pid);
+        kill_with_parent(parent_pid);
         wait_for_parent_exec_start(exec_start_pipe[0], exec_start_pipe[1]);
         exec_bwrap(args, preserved_files);
     }
@@ -806,15 +806,15 @@ impl ForwardedSignalMask {
     }
 }
 
-fn terminate_with_parent(parent_pid: libc::pid_t) {
-    let res = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+fn kill_with_parent(parent_pid: libc::pid_t) {
+    let res = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
     if res < 0 {
         let err = std::io::Error::last_os_error();
         panic!("failed to set bubblewrap child parent-death signal: {err}");
     }
     if unsafe { libc::getppid() } != parent_pid {
         unsafe {
-            libc::raise(libc::SIGTERM);
+            libc::raise(libc::SIGKILL);
         }
     }
 }

@@ -3,6 +3,7 @@ use codex_core::REVIEW_PROMPT;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
+use codex_core::config::MODEL_POLICY_LANE_ENV;
 use codex_core::find_thread_path_by_id_str;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
@@ -10,13 +11,19 @@ use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ReasoningMode;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelTokenBudgetConfig;
+use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::AskForApproval;
@@ -45,12 +52,17 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use wiremock::MockServer;
+
+const MANAGED_REVIEW_CONTEXT_SUBPROCESS_ENV_VAR: &str = "CODEX_MANAGED_REVIEW_CONTEXT_SUBPROCESS";
+const MANAGED_REVIEW_CONTEXT_TEST_NAME: &str =
+    "suite::review::managed_review_context_is_relocked_after_upstream_transforms";
 
 /// Verify that submitting `Op::Review` emits review item lifecycle,
 /// legacy review events, and TurnComplete when the model returns a structured review payload.
@@ -568,6 +580,182 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
 
     let _codex_home_guard = codex_home;
     server.verify().await;
+}
+
+/// Managed reviews re-pin their outer context and final delegate settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_review_context_is_relocked_after_upstream_transforms() {
+    skip_if_no_network!();
+
+    if std::env::var_os(MANAGED_REVIEW_CONTEXT_SUBPROCESS_ENV_VAR).is_none() {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg(MANAGED_REVIEW_CONTEXT_TEST_NAME)
+            .env(MANAGED_REVIEW_CONTEXT_SUBPROCESS_ENV_VAR, "1")
+            .env_remove(MODEL_POLICY_LANE_ENV)
+            .env_remove("CDX_USER_CONFIG_HOMES");
+        for &key in codex_network_proxy::PROXY_ENV_KEYS {
+            command.env_remove(key);
+        }
+        let output = command.output().expect("run managed review subprocess");
+        assert!(
+            output.status.success(),
+            "subprocess test `{MANAGED_REVIEW_CONTEXT_TEST_NAME}` failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    struct ReviewContextRecorder {
+        mode_tx: async_channel::Sender<CollaborationMode>,
+        delegate_tx: async_channel::Sender<Config>,
+    }
+
+    impl codex_extension_api::TurnLifecycleContributor for ReviewContextRecorder {
+        fn on_turn_start<'a>(
+            &'a self,
+            input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                let _ = self.mode_tx.try_send(input.collaboration_mode.clone());
+            })
+        }
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for ReviewContextRecorder {
+        fn on_thread_start<'a>(
+            &'a self,
+            input: codex_extension_api::ThreadStartInput<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                if input.session_source.is_non_root_agent() {
+                    let _ = self.delegate_tx.try_send(input.config.clone());
+                }
+            })
+        }
+    }
+
+    let server = start_mock_server().await;
+    let (mode_tx, mode_rx) = async_channel::bounded(1);
+    let (delegate_tx, delegate_rx) = async_channel::bounded(1);
+    let recorder = Arc::new(ReviewContextRecorder {
+        mode_tx,
+        delegate_tx,
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    extensions.turn_lifecycle_contributor(recorder.clone());
+    extensions.thread_lifecycle_contributor(recorder);
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.visibility = ModelVisibility::List;
+            model_info.supported_reasoning_levels = vec![ReasoningEffortPreset {
+                effort: ReasoningEffort::XHigh,
+                description: ReasoningEffort::XHigh.to_string(),
+            }];
+            model_info.service_tiers = vec![ModelServiceTier {
+                id: ServiceTier::Fast.request_value().to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing".to_string(),
+            }];
+        })
+        .with_model_info_override("gpt-5.6-sol", |model_info| {
+            model_info.supported_reasoning_levels = [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+            .into_iter()
+            .map(|effort| ReasoningEffortPreset {
+                description: effort.to_string(),
+                effort,
+            })
+            .collect();
+            model_info.default_reasoning_level = Some(ReasoningEffort::Medium);
+        })
+        .with_config(|config| {
+            config.review_model = Some("gpt-5.6-sol".to_string());
+            config
+                .features
+                .enable(Feature::FastMode)
+                .expect("Fast mode should be available");
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("managed review conversation should be created");
+
+    // SAFETY: this exact test case runs alone in a dedicated subprocess. The
+    // parent removes the managed lane, TestCodex is fully built while
+    // unmanaged, and no other test can concurrently observe this child-only
+    // mutation.
+    unsafe {
+        std::env::set_var(MODEL_POLICY_LANE_ENV, "subscription");
+    }
+
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            model: Some("gpt-5.4".to_string()),
+            effort: Some(Some(ReasoningEffort::XHigh)),
+            service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("managed root should accept its explicit model, XHigh, and Fast selection");
+
+    test.codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "verify managed review context".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .expect("review should start");
+    let review_mode = tokio::time::timeout(Duration::from_secs(10), mode_rx.recv())
+        .await
+        .expect("review turn context should reach the lifecycle boundary")
+        .expect("outer review turn should be recorded first");
+    assert_eq!(
+        review_mode,
+        CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: "gpt-5.6-sol".to_string(),
+                reasoning_effort: Some(ReasoningEffort::Ultra),
+                developer_instructions: None,
+            },
+        }
+    );
+    let delegate_config = tokio::time::timeout(Duration::from_secs(10), delegate_rx.recv())
+        .await
+        .expect("review delegate should reach the thread lifecycle boundary")
+        .expect("review delegate settings should be recorded");
+    assert_eq!(
+        (
+            delegate_config.model,
+            delegate_config.model_reasoning_effort,
+            delegate_config.model_reasoning_mode,
+            delegate_config.service_tier,
+        ),
+        (
+            Some("gpt-5.6-sol".to_string()),
+            Some(ReasoningEffort::Ultra),
+            None::<ReasoningMode>,
+            Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+        ),
+    );
+
+    test.codex
+        .shutdown_and_wait()
+        .await
+        .expect("managed review test conversation should shut down");
 }
 
 /// Reviews inherit current session settings without inheriting another model's defaults.
