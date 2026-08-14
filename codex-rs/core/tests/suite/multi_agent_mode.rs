@@ -2,6 +2,7 @@ use anyhow::Result;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_features::Feature;
+use codex_protocol::config_types::ReasoningMode;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -52,6 +53,11 @@ fn configure_custom_mode_hint(config: &mut Config) {
 fn configure_ultra(config: &mut Config) {
     configure_multi_agent_v2(config);
     config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+}
+
+fn configure_pro_ultra(config: &mut Config) {
+    configure_ultra(config);
+    config.model_reasoning_mode = Some(ReasoningMode::Pro);
 }
 
 fn developer_texts(input: &[Value]) -> Vec<&str> {
@@ -111,6 +117,45 @@ async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
     assert_eq!(
         request.body_json()["reasoning"]["effort"].as_str(),
         Some("max")
+    );
+    assert_eq!(request.body_json()["reasoning"].get("mode"), None);
+    let input = request.input();
+    let texts = developer_texts(&input);
+    assert_eq!(
+        (
+            count_containing(&texts, NO_SPAWN_TEXT),
+            count_containing(&texts, PROACTIVE_TEXT),
+        ),
+        (0, 1)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pro_ultra_uses_pro_and_max() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.6-sol", add_ultra_reasoning)
+        .with_config(configure_pro_ultra)
+        .build(&server)
+        .await?;
+
+    submit_turn(&test.codex, "hello", /*effort*/ None).await?;
+
+    let request = response.single_request();
+    let body = request.body_json();
+    let reasoning = &body["reasoning"];
+    assert_eq!(
+        (reasoning["mode"].as_str(), reasoning["effort"].as_str()),
+        (Some("pro"), Some("max"))
     );
     let input = request.input();
     let texts = developer_texts(&input);

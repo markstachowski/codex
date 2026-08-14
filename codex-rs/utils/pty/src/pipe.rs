@@ -6,6 +6,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::AsyncRead;
@@ -20,6 +22,7 @@ use tokio::task::JoinHandle;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
+use crate::process::ProcessTerminationStrategy;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
 
@@ -37,6 +40,127 @@ struct PipeChildTerminator {
     windows: WindowsChildTerminator,
     #[cfg(unix)]
     process_group_id: u32,
+    #[cfg(target_os = "linux")]
+    termination_request: LinuxTerminationRequest,
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxTerminationRequest {
+    KillImmediately,
+    GracefulThenKill {
+        tx: Option<oneshot::Sender<()>>,
+        state: Arc<StdMutex<LinuxTerminationState>>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxTerminationState {
+    Running,
+    TerminationRequested,
+    Reaped(std::process::ExitStatus),
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxTokioChildGuard {
+    child: tokio::process::Child,
+    process_group_id: u32,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxTokioChildGuard {
+    fn new(child: tokio::process::Child, process_group_id: u32) -> Self {
+        Self {
+            child,
+            process_group_id,
+            armed: true,
+        }
+    }
+
+    fn hard_kill(&mut self) {
+        let _ = crate::process_group::kill_process_group(self.process_group_id);
+        let _ = self.child.start_kill();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxTokioChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hard_kill();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_linux_child(
+    mut child: LinuxTokioChildGuard,
+    graceful_termination: Option<(
+        oneshot::Receiver<()>,
+        Duration,
+        Arc<StdMutex<LinuxTerminationState>>,
+    )>,
+) -> io::Result<std::process::ExitStatus> {
+    const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    let wait_result = if let Some((mut termination_rx, grace_period, state)) = graceful_termination
+    {
+        loop {
+            let termination_requested = {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| io::Error::other("pipe termination state poisoned"))?;
+                match *state {
+                    LinuxTerminationState::Running => {
+                        if let Some(status) = child.child.try_wait()? {
+                            *state = LinuxTerminationState::Reaped(status);
+                            break Ok(status);
+                        }
+                        false
+                    }
+                    LinuxTerminationState::TerminationRequested => true,
+                    LinuxTerminationState::Reaped(status) => break Ok(status),
+                }
+            };
+            if termination_requested {
+                let _ = crate::process_group::terminate_process_group(child.process_group_id);
+                // Keep the root child owned and unreaped for the complete interval so the
+                // captured PID and PGID cannot be recycled before hard-kill escalation.
+                tokio::time::sleep(grace_period).await;
+                child.hard_kill();
+                match child.child.wait().await {
+                    Ok(status) => {
+                        if let Ok(mut state) = state.lock() {
+                            *state = LinuxTerminationState::Reaped(status);
+                        }
+                        break Ok(status);
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+
+            match tokio::time::timeout(EXIT_POLL_INTERVAL, &mut termination_rx).await {
+                Err(_) | Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "pipe termination requester dropped before child exit",
+                    ));
+                }
+            }
+        }
+    } else {
+        child.child.wait().await
+    };
+    if wait_result.is_ok() {
+        child.disarm();
+    }
+    wait_result
 }
 
 impl ChildTerminator for PipeChildTerminator {
@@ -62,6 +186,30 @@ impl ChildTerminator for PipeChildTerminator {
     }
 
     fn kill(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        match &mut self.termination_request {
+            LinuxTerminationRequest::KillImmediately => {}
+            LinuxTerminationRequest::GracefulThenKill { tx, state } => {
+                // The child-owning wait task performs both signals so the root PID,
+                // and therefore its PGID, cannot be reused between TERM and KILL.
+                let should_wake = {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| io::Error::other("pipe termination state poisoned"))?;
+                    if matches!(*state, LinuxTerminationState::Running) {
+                        *state = LinuxTerminationState::TerminationRequested;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_wake && let Some(tx) = tx.take() {
+                    let _ = tx.send(());
+                }
+                return Ok(());
+            }
+        }
+
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             crate::process_group::kill_process_group(self.process_group_id)
@@ -130,6 +278,7 @@ enum PipeStdinMode {
 
 /// On Windows, process-tree containment is best-effort because Tokio returns
 /// only after the root process starts, so job assignment cannot be atomic.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_process_with_stdin_mode(
     program: &str,
     args: &[String],
@@ -138,6 +287,7 @@ async fn spawn_process_with_stdin_mode(
     arg0: &Option<String>,
     stdin_mode: PipeStdinMode,
     inherited_fds: &[i32],
+    termination_strategy: ProcessTerminationStrategy,
 ) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for pipe spawn");
@@ -185,6 +335,8 @@ async fn spawn_process_with_stdin_mode(
     }
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    command.kill_on_drop(true);
 
     #[cfg(windows)]
     let job = crate::win::JobObject::create().map(Arc::new);
@@ -217,10 +369,30 @@ async fn spawn_process_with_stdin_mode(
     let process_group_id = child
         .id()
         .ok_or_else(|| io::Error::other("missing child pid"))?;
-
+    #[cfg(target_os = "linux")]
+    let (termination_request, graceful_termination) = match termination_strategy {
+        ProcessTerminationStrategy::KillImmediately => {
+            (LinuxTerminationRequest::KillImmediately, None)
+        }
+        ProcessTerminationStrategy::GracefulThenKill { grace_period } => {
+            let (tx, rx) = oneshot::channel();
+            let state = Arc::new(StdMutex::new(LinuxTerminationState::Running));
+            (
+                LinuxTerminationRequest::GracefulThenKill {
+                    tx: Some(tx),
+                    state: Arc::clone(&state),
+                },
+                Some((rx, grace_period, state)),
+            )
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = termination_strategy;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    #[cfg(target_os = "linux")]
+    let child = LinuxTokioChildGuard::new(child, process_group_id);
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -277,7 +449,12 @@ async fn spawn_process_with_stdin_mode(
         WindowsChildTerminator::Process(_) => None,
     };
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
-        let code = match child.wait().await {
+        #[cfg(target_os = "linux")]
+        let wait_result = wait_for_linux_child(child, graceful_termination).await;
+        #[cfg(not(target_os = "linux"))]
+        let wait_result = child.wait().await;
+
+        let code = match wait_result {
             Ok(status) => {
                 #[cfg(windows)]
                 if let Some(job) = wait_job
@@ -305,6 +482,8 @@ async fn spawn_process_with_stdin_mode(
             windows: windows_terminator,
             #[cfg(unix)]
             process_group_id,
+            #[cfg(target_os = "linux")]
+            termination_request,
         }),
         reader_handle,
         reader_abort_handles,
@@ -342,6 +521,30 @@ pub async fn spawn_process(
         arg0,
         PipeStdinMode::Piped,
         inherited_fds,
+        ProcessTerminationStrategy::KillImmediately,
+    )
+    .await
+}
+
+/// Spawn a piped process with an explicit termination strategy.
+pub async fn spawn_process_with_termination_strategy(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    inherited_fds: &[i32],
+    termination_strategy: ProcessTerminationStrategy,
+) -> Result<SpawnedProcess> {
+    spawn_process_with_stdin_mode(
+        program,
+        args,
+        cwd,
+        env,
+        arg0,
+        PipeStdinMode::Piped,
+        inherited_fds,
+        termination_strategy,
     )
     .await
 }
@@ -364,10 +567,34 @@ pub async fn spawn_process_no_stdin(
         arg0,
         PipeStdinMode::Null,
         inherited_fds,
+        ProcessTerminationStrategy::KillImmediately,
     )
     .await
 }
 
-#[cfg(all(test, windows))]
+/// Spawn a process with closed stdin and an explicit termination strategy.
+pub async fn spawn_process_no_stdin_with_termination_strategy(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    inherited_fds: &[i32],
+    termination_strategy: ProcessTerminationStrategy,
+) -> Result<SpawnedProcess> {
+    spawn_process_with_stdin_mode(
+        program,
+        args,
+        cwd,
+        env,
+        arg0,
+        PipeStdinMode::Null,
+        inherited_fds,
+        termination_strategy,
+    )
+    .await
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
 #[path = "pipe_tests.rs"]
 mod tests;

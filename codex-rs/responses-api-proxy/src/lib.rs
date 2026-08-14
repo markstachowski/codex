@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Read;
@@ -29,9 +30,30 @@ use tiny_http::Server;
 use tiny_http::StatusCode;
 
 mod dump;
+#[cfg(test)]
+#[path = "model_policy_tests.rs"]
+mod model_policy_tests;
 mod read_api_key;
 use dump::ExchangeDumper;
 use read_api_key::read_auth_header_from_stdin;
+
+const MODEL_POLICY_LANE_ENV: &str = "CDX_MODEL_POLICY_LANE";
+
+#[derive(Clone, Copy)]
+enum ModelPolicyMarkerRequirement {
+    OptionalForUnmanaged,
+    RequiredForManagedRelease,
+}
+
+impl ModelPolicyMarkerRequirement {
+    const fn for_codex_entrypoint() -> Self {
+        if cfg!(debug_assertions) {
+            Self::OptionalForUnmanaged
+        } else {
+            Self::RequiredForManagedRelease
+        }
+    }
+}
 
 /// CLI arguments for the proxy.
 #[derive(Debug, Clone, Parser)]
@@ -71,6 +93,30 @@ struct ForwardConfig {
 
 /// Entry point for the library main, for parity with other crates.
 pub fn run_main(args: Args) -> Result<()> {
+    let lane = std::env::var_os(MODEL_POLICY_LANE_ENV);
+    run_main_for_model_policy_lane(
+        args,
+        lane.as_deref(),
+        ModelPolicyMarkerRequirement::OptionalForUnmanaged,
+    )
+}
+
+/// Entry point for the proxy hidden inside the managed `codex` executable.
+pub fn run_main_from_codex(args: Args) -> Result<()> {
+    let lane = std::env::var_os(MODEL_POLICY_LANE_ENV);
+    run_main_for_model_policy_lane(
+        args,
+        lane.as_deref(),
+        ModelPolicyMarkerRequirement::for_codex_entrypoint(),
+    )
+}
+
+fn run_main_for_model_policy_lane(
+    args: Args,
+    lane: Option<&OsStr>,
+    marker_requirement: ModelPolicyMarkerRequirement,
+) -> Result<()> {
+    reject_managed_model_policy_lane(lane, marker_requirement)?;
     let auth_header = read_auth_header_from_stdin()?;
 
     let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
@@ -133,6 +179,26 @@ pub fn run_main(args: Args) -> Result<()> {
     }
 
     Err(anyhow!("server stopped unexpectedly"))
+}
+
+fn reject_managed_model_policy_lane(
+    lane: Option<&OsStr>,
+    marker_requirement: ModelPolicyMarkerRequirement,
+) -> Result<()> {
+    if lane.is_some() {
+        return Err(anyhow!(
+            "responses-api-proxy is unavailable when {MODEL_POLICY_LANE_ENV} is set; managed Codex traffic must use validated inference paths"
+        ));
+    }
+    if matches!(
+        marker_requirement,
+        ModelPolicyMarkerRequirement::RequiredForManagedRelease
+    ) {
+        return Err(anyhow!(
+            "{MODEL_POLICY_LANE_ENV} is required for managed release execution; use the codex, cdxpro, or cdxspark launcher"
+        ));
+    }
+    Ok(())
 }
 
 fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {

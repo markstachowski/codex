@@ -205,14 +205,15 @@ async fn realtime_ws_e2e_session_create_and_event_flow() {
 
 #[tokio::test]
 async fn realtime_ws_connect_webrtc_sideband_retries_join_until_server_is_available() {
-    let reserving_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = reserving_listener.local_addr().expect("local addr");
-    drop(reserving_listener);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
 
     let server = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let listener = TcpListener::bind(addr).await.expect("bind delayed server");
-        let (stream, _) = listener.accept().await.expect("accept");
+        // Retain the port while rejecting the first WebSocket handshake to force a retry.
+        let (stream, _) = listener.accept().await.expect("accept initial connection");
+        drop(stream);
+
+        let (stream, _) = listener.accept().await.expect("accept retry connection");
         let mut ws = accept_async(stream).await.expect("accept ws");
 
         let first = ws

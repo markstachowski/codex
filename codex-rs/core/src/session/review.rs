@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::protocol::ErrorEvent;
 use std::sync::atomic::AtomicBool;
 
 /// Spawn a review thread using the given prompt.
@@ -9,7 +10,7 @@ pub(super) async fn spawn_review_thread(
     sub_id: String,
     resolved: crate::review_prompts::ResolvedReviewRequest,
 ) {
-    let model = config
+    let requested_model = config
         .review_model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info.slug.clone());
@@ -21,7 +22,29 @@ pub(super) async fn spawn_review_thread(
             config.http_client_factory(),
         )
         .await;
-    let review_model_info = sess
+    // Upstream (alpha.10) derives the review config from the parent turn's
+    // config while preserving the session token budget; the locked review
+    // policy then owns the model/effort/mode fields on top of that base.
+    let mut per_turn_config = (*parent_turn_context.config).clone();
+    per_turn_config.token_budget = config.token_budget.clone();
+    let model = match crate::tasks::apply_locked_review_inference_settings(
+        &mut per_turn_config,
+        requested_model,
+    ) {
+        Ok(model) => model,
+        Err(error) => {
+            sess.send_event(
+                parent_turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut review_model_info = sess
         .services
         .models_manager
         .get_model_info(&model, &config.to_models_manager_config())
@@ -42,13 +65,8 @@ pub(super) async fn spawn_review_thread(
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
-    let model_info = review_model_info.clone();
 
     // Build per‑turn client with the requested model/family.
-    let mut per_turn_config = (*parent_turn_context.config).clone();
-    // Preserve configured overrides without carrying over the parent model's defaults.
-    per_turn_config.token_budget = config.token_budget.clone();
-    per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
     if let Some(current_effort) = per_turn_config.model_reasoning_effort.as_ref()
         && review_model_info.slug != parent_turn_context.model_info.slug
@@ -74,17 +92,6 @@ pub(super) async fn spawn_review_thread(
         );
     }
 
-    let session_telemetry = parent_turn_context
-        .session_telemetry
-        .clone()
-        .with_model(model.as_str(), review_model_info.slug.as_str());
-    let auth_manager_for_context = auth_manager.clone();
-    let provider_for_context = provider.clone();
-    let session_telemetry_for_context = session_telemetry.clone();
-    let reasoning_effort = per_turn_config.model_reasoning_effort.clone();
-    let reasoning_summary = per_turn_config
-        .model_reasoning_summary
-        .unwrap_or(model_info.default_reasoning_summary);
     let session_source = parent_turn_context.session_source.clone();
     let (forked_from_thread_id, thread_source, service_tier) = {
         let state = sess.state.lock().await;
@@ -99,6 +106,49 @@ pub(super) async fn spawn_review_thread(
         )
     };
     per_turn_config.service_tier = service_tier;
+
+    // Apply the locked review contract after every upstream compatibility and
+    // parent-inheritance transform. The early resolution selects authoritative
+    // model metadata; this final resolution prevents later transforms from
+    // weakening managed review context.
+    let final_model = match crate::tasks::apply_locked_review_inference_settings(
+        &mut per_turn_config,
+        model.clone(),
+    ) {
+        Ok(model) => model,
+        Err(error) => {
+            sess.send_event(
+                parent_turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+    if final_model != model {
+        review_model_info = sess
+            .services
+            .models_manager
+            .get_model_info(&final_model, &config.to_models_manager_config())
+            .await;
+    }
+    let model = final_model;
+
+    let model_info = review_model_info.clone();
+    let session_telemetry = parent_turn_context
+        .session_telemetry
+        .clone()
+        .with_model(model.as_str(), review_model_info.slug.as_str());
+    let auth_manager_for_context = auth_manager.clone();
+    let provider_for_context = provider.clone();
+    let session_telemetry_for_context = session_telemetry.clone();
+    let reasoning_effort = per_turn_config.model_reasoning_effort.clone();
+    let reasoning_summary = per_turn_config
+        .model_reasoning_summary
+        .unwrap_or(model_info.default_reasoning_summary);
 
     let auto_review_enabled = crate::guardian::routes_approval_policy_to_guardian(
         per_turn_config.permissions.approval_policy.value(),
@@ -170,7 +220,6 @@ pub(super) async fn spawn_review_thread(
         extension_data,
         turn_timing_state: Arc::new(TurnTimingState::default()),
         terminal_error: Arc::new(Mutex::new(None)),
-        server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
     };
 

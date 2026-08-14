@@ -34,6 +34,10 @@ A strict HTTP proxy that only forwards `POST` requests to `/v1/responses` to the
 
 **IMPORTANT:** `codex-responses-api-proxy` is designed to be run by a privileged user with access to `OPENAI_API_KEY` so that an unprivileged user cannot inspect or tamper with the process. Though if `--http-shutdown` is specified, an unprivileged user _can_ make a `GET` request to `/shutdown` to shutdown the server, as an unprivileged user could not send `SIGTERM` to kill the process.
 
+The proxy is a separate unmanaged utility. It rejects startup whenever
+`CDX_MODEL_POLICY_LANE` is set, so managed Codex launchers cannot use it to
+bypass their validated inference paths.
+
 A privileged user (i.e., `root` or a user with `sudo`) who has access to `OPENAI_API_KEY` would run the following to start the server, as `codex-responses-api-proxy` reads the auth token from `stdin`:
 
 ```shell

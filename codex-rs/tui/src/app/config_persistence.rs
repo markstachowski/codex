@@ -761,16 +761,27 @@ impl App {
     }
 
     pub(super) fn on_update_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
+        let current_model = self.chat_widget.current_model().to_string();
         let clear_ephemeral_plan_effort = effort != Some(ReasoningEffortConfig::Ultra)
             && self.chat_widget.config_ref().plan_mode_reasoning_effort
                 == Some(ReasoningEffortConfig::Ultra)
             && self.config.plan_mode_reasoning_effort != Some(ReasoningEffortConfig::Ultra);
+        let compatible_plan_effort = if clear_ephemeral_plan_effort {
+            effort.clone()
+        } else {
+            self.compatible_plan_reasoning_effort_for_model(
+                current_model.as_str(),
+                effort.clone(),
+                /*preserve_current_override*/ true,
+            )
+        };
         // TODO(aibrahim): Remove this and don't use config as a state object.
         // Instead, explicitly pass the stored collaboration mode's effort into new sessions.
         self.config.model_reasoning_effort = effort.clone();
-        self.chat_widget.set_reasoning_effort(effort.clone());
-        if clear_ephemeral_plan_effort {
-            self.chat_widget.set_plan_mode_reasoning_effort(effort);
+        self.chat_widget.set_reasoning_effort(effort);
+        if self.chat_widget.config_ref().plan_mode_reasoning_effort != compatible_plan_effort {
+            self.chat_widget
+                .set_plan_mode_reasoning_effort(compatible_plan_effort);
         }
     }
 
@@ -793,6 +804,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn on_apply_advanced_reasoning(
         &mut self,
         model: &str,
@@ -810,6 +822,7 @@ impl App {
         default_effort
     }
 
+    #[cfg(test)]
     fn default_reasoning_effort_for_conversation_model(
         &self,
         model: &str,
@@ -840,6 +853,55 @@ impl App {
                     .find(|option| option.effort != ReasoningEffortConfig::Ultra)
                     .map(|option| option.effort.clone())
             })
+    }
+
+    pub(super) fn compatible_plan_reasoning_effort_for_model(
+        &self,
+        model: &str,
+        conversation_effort: Option<ReasoningEffortConfig>,
+        preserve_current_override: bool,
+    ) -> Option<ReasoningEffortConfig> {
+        let conservative_unknown_model_effort = || {
+            conversation_effort
+                .clone()
+                .or(Some(ReasoningEffortConfig::None))
+        };
+        let models = self
+            .model_catalog
+            .try_list_models()
+            .expect("in-memory model catalog is infallible");
+        let preset = models.into_iter().find(|preset| preset.model == model);
+        let Some(preset) = preset else {
+            return conservative_unknown_model_effort();
+        };
+        let supported = &preset.supported_reasoning_efforts;
+        let default_effort = preset.default_reasoning_effort.clone();
+        let is_supported = |effort: &ReasoningEffortConfig| {
+            if supported.is_empty() {
+                *effort == default_effort
+            } else {
+                supported.iter().any(|option| option.effort == *effort)
+            }
+        };
+
+        let mut candidates = Vec::with_capacity(3);
+        if preserve_current_override {
+            candidates.push(
+                self.chat_widget
+                    .config_ref()
+                    .plan_mode_reasoning_effort
+                    .clone(),
+            );
+        }
+        candidates.push(self.config.plan_mode_reasoning_effort.clone());
+        candidates.push(conversation_effort);
+
+        candidates
+            .into_iter()
+            .flatten()
+            .find(is_supported)
+            .or_else(|| is_supported(&default_effort).then(|| default_effort.clone()))
+            .or_else(|| supported.first().map(|option| option.effort.clone()))
     }
 
     pub(super) fn resume_model_settings(&self) -> crate::app_server_session::ResumeModelSettings {
@@ -1271,6 +1333,108 @@ mod tests {
                 new_thread_config.model_reasoning_effort,
             ),
             (Some("gpt-5.4"), Some(ReasoningEffortConfig::Low))
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_model_selection_uses_compatible_plan_effort() {
+        let mut app = make_test_app().await;
+        let mut non_ultra_preset = app
+            .model_catalog
+            .try_list_models()
+            .expect("model catalog is infallible")
+            .into_iter()
+            .find(|preset| preset.model == "gpt-5.4")
+            .expect("gpt-5.4 preset");
+        non_ultra_preset.model = "gpt-5.5".to_string();
+        non_ultra_preset.default_reasoning_effort = ReasoningEffortConfig::High;
+        non_ultra_preset.supported_reasoning_efforts = vec![
+            ReasoningEffortPreset {
+                effort: ReasoningEffortConfig::High,
+                description: "High reasoning".to_string(),
+            },
+            ReasoningEffortPreset {
+                effort: ReasoningEffortConfig::XHigh,
+                description: "Extra high reasoning".to_string(),
+            },
+        ];
+        let mut ultra_preset = non_ultra_preset.clone();
+        ultra_preset.model = "gpt-5.6-sol".to_string();
+        ultra_preset.default_reasoning_effort = ReasoningEffortConfig::Ultra;
+        ultra_preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        }];
+        app.model_catalog = Arc::new(ModelCatalog::new(vec![non_ultra_preset, ultra_preset]));
+        app.config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
+        app.chat_widget
+            .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Ultra));
+        app.chat_widget.set_model("gpt-5.5");
+
+        app.on_update_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+        assert_eq!(
+            app.chat_widget.config_ref().plan_mode_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(
+            app.config.plan_mode_reasoning_effort,
+            Some(ReasoningEffortConfig::Ultra),
+            "the managed Sol/Ultra default must not be rewritten"
+        );
+        assert_eq!(
+            app.compatible_plan_reasoning_effort_for_model(
+                "gpt-5.5",
+                Some(ReasoningEffortConfig::High),
+                /*preserve_current_override*/ false,
+            ),
+            Some(ReasoningEffortConfig::High),
+            "resuming the conversation must not restore unsupported Ultra"
+        );
+        assert_eq!(
+            app.compatible_plan_reasoning_effort_for_model(
+                "gpt-5.6-sol",
+                Some(ReasoningEffortConfig::High),
+                /*preserve_current_override*/ false,
+            ),
+            Some(ReasoningEffortConfig::Ultra),
+            "switching back to Sol must restore the managed Ultra Plan default"
+        );
+
+        let mut empty_supported = app
+            .model_catalog
+            .try_list_models()
+            .expect("model catalog is infallible")
+            .into_iter()
+            .find(|preset| preset.model == "gpt-5.5")
+            .expect("gpt-5.5 preset");
+        empty_supported.supported_reasoning_efforts.clear();
+        app.model_catalog = Arc::new(ModelCatalog::new(vec![empty_supported]));
+        assert_eq!(
+            app.compatible_plan_reasoning_effort_for_model(
+                "gpt-5.5",
+                Some(ReasoningEffortConfig::High),
+                /*preserve_current_override*/ false,
+            ),
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(
+            app.compatible_plan_reasoning_effort_for_model(
+                "unlisted-model",
+                Some(ReasoningEffortConfig::Medium),
+                /*preserve_current_override*/ false,
+            ),
+            Some(ReasoningEffortConfig::Medium),
+            "missing catalog metadata must not assume Ultra support"
+        );
+        assert_eq!(
+            app.compatible_plan_reasoning_effort_for_model(
+                "unlisted-model",
+                None,
+                /*preserve_current_override*/ false,
+            ),
+            Some(ReasoningEffortConfig::None),
+            "missing catalog metadata without a conversation effort must fail closed instead of restoring Ultra"
         );
     }
 

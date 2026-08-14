@@ -18,6 +18,7 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -464,6 +465,25 @@ impl SessionConfiguration {
                 environments.environments.as_slice()
             });
         next_configuration.validate_auto_review_requirement(next_environments)?;
+        let reasoning_effort = next_configuration.collaboration_mode.reasoning_effort();
+        next_configuration
+            .original_config_do_not_use
+            .validate_locked_session_inference_settings(
+                next_configuration.session_source.is_non_root_agent(),
+                next_configuration.collaboration_mode.model(),
+                reasoning_effort.as_ref(),
+                next_configuration.service_tier.as_deref(),
+            )
+            .map_err(|err| ConstraintError::InvalidValue {
+                field_name: "collaboration_mode",
+                candidate: format!(
+                    "model={}, effort={reasoning_effort:?}, service_tier={:?}",
+                    next_configuration.collaboration_mode.model(),
+                    next_configuration.service_tier
+                ),
+                allowed: err.to_string(),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            })?;
         Ok(next_configuration)
     }
 
@@ -502,6 +522,104 @@ impl SessionConfiguration {
         self.permission_profile_state
             .set_permission_profile_snapshot(permission_snapshot)
     }
+}
+
+pub(crate) fn validate_root_model_selection_for_lane(
+    lane: crate::config::ModelPolicyLane,
+    model: &str,
+    reasoning_effort: Option<&ReasoningEffortConfig>,
+    available_models: &[ModelPreset],
+) -> std::io::Result<()> {
+    lane.validate_user_selected_model(model)?;
+    let preset = available_models
+        .iter()
+        .find(|preset| preset.show_in_picker && preset.model == model)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy rejected `{}` because it is not present and visible in the current model picker catalog",
+                    lane.as_str(),
+                    model
+                ),
+            )
+        })?;
+    let effort_supported = reasoning_effort.is_some_and(|effort| {
+        effort == &preset.default_reasoning_effort
+            || preset
+                .supported_reasoning_efforts
+                .iter()
+                .any(|candidate| &candidate.effort == effort)
+    });
+    if !effort_supported {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} model policy rejected reasoning effort {:?} for `{}` because the current picker catalog does not advertise it",
+                lane.as_str(),
+                reasoning_effort,
+                model
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model_selection_update_for_lane(
+    lane: crate::config::ModelPolicyLane,
+    is_non_root_agent: bool,
+    model: &str,
+    reasoning_effort: Option<&ReasoningEffortConfig>,
+    available_models: Option<&[ModelPreset]>,
+) -> std::io::Result<()> {
+    if is_non_root_agent {
+        if !lane.allows_non_root_sessions() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} model policy rejects non-root sessions", lane.as_str()),
+            ));
+        }
+        return lane.validate_model_and_effort(
+            model,
+            reasoning_effort,
+            /*allow_user_model_selection*/ false,
+        );
+    }
+    if lane.allows_user_model_selection() {
+        let available_models = available_models.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} model policy requires the current picker catalog",
+                    lane.as_str()
+                ),
+            )
+        })?;
+        validate_root_model_selection_for_lane(lane, model, reasoning_effort, available_models)
+    } else {
+        lane.validate_model_and_effort(
+            model,
+            reasoning_effort,
+            /*allow_user_model_selection*/ false,
+        )
+    }
+}
+
+pub(crate) fn validate_service_tier_update_for_lane(
+    lane: crate::config::ModelPolicyLane,
+    is_non_root_agent: bool,
+    service_tier: Option<&Option<String>>,
+) -> std::io::Result<()> {
+    let Some(service_tier) = service_tier else {
+        return Ok(());
+    };
+    let service_tier = service_tier
+        .as_deref()
+        .unwrap_or(SERVICE_TIER_DEFAULT_REQUEST_VALUE);
+    lane.validate_service_tier(
+        Some(service_tier),
+        /*allow_user_service_tier_selection*/ !is_non_root_agent,
+    )
 }
 
 #[derive(Default, Clone)]
@@ -1276,6 +1394,7 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                 )
+                .with_model_reasoning_mode(config.model_reasoning_mode)
                 .with_prompt_cache_key_override(
                     crate::guardian::prompt_cache_key_override_for_review_session(
                         &session_configuration.session_source,
@@ -1397,7 +1516,7 @@ impl Session {
             )
             .await?;
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+            sess.schedule_startup_prewarm(sess.get_base_instructions().await)
                 .await;
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
@@ -1436,6 +1555,194 @@ impl Session {
                 live_thread_init.discard().await;
                 Err(err)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_selection_update_tests {
+    use super::*;
+    use codex_protocol::openai_models::InputModality;
+    use codex_protocol::openai_models::ReasoningEffortPreset;
+
+    fn preset(model: &str, show_in_picker: bool) -> ModelPreset {
+        ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            model_specialty: None,
+            display_name: model.to_string(),
+            description: String::new(),
+            default_reasoning_effort: ReasoningEffortConfig::Medium,
+            supported_reasoning_efforts: vec![ReasoningEffortPreset {
+                effort: ReasoningEffortConfig::High,
+                description: "high".to_string(),
+            }],
+            supports_personality: false,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            is_default: false,
+            upgrade: None,
+            show_in_picker,
+            multi_agent_version: None,
+            availability_nux: None,
+            supported_in_api: true,
+            input_modalities: vec![InputModality::Text],
+        }
+    }
+
+    #[test]
+    fn subscription_root_model_update_catalog_contract_is_exact() {
+        let catalog = vec![
+            preset("gpt-5.5", true),
+            preset("hidden-model", false),
+            preset(crate::config::SPARK_MODEL, true),
+            preset("codex-auto-balanced", true),
+        ];
+        validate_model_selection_update_for_lane(
+            crate::config::ModelPolicyLane::Subscription,
+            /*is_non_root_agent*/ false,
+            "gpt-5.5",
+            Some(&ReasoningEffortConfig::High),
+            Some(&catalog),
+        )
+        .expect("visible catalog model with advertised effort should apply");
+
+        for (model, effort, expected) in [
+            (
+                "hidden-model",
+                ReasoningEffortConfig::High,
+                "not present and visible",
+            ),
+            (
+                "unknown-model",
+                ReasoningEffortConfig::High,
+                "not present and visible",
+            ),
+            (
+                crate::config::SPARK_MODEL,
+                ReasoningEffortConfig::XHigh,
+                "reserved model",
+            ),
+            (
+                "codex-auto-balanced",
+                ReasoningEffortConfig::Medium,
+                "reserved model",
+            ),
+            ("gpt-5.5", ReasoningEffortConfig::Low, "does not advertise"),
+        ] {
+            let error = validate_model_selection_update_for_lane(
+                crate::config::ModelPolicyLane::Subscription,
+                /*is_non_root_agent*/ false,
+                model,
+                Some(&effort),
+                Some(&catalog),
+            )
+            .expect_err("invalid root selection must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_model_updates_keep_non_root_api_and_spark_strict() {
+        for (lane, is_non_root_agent, model, effort) in [
+            (
+                crate::config::ModelPolicyLane::Subscription,
+                true,
+                "gpt-5.5",
+                ReasoningEffortConfig::High,
+            ),
+            (
+                crate::config::ModelPolicyLane::Api,
+                false,
+                "gpt-5.5",
+                ReasoningEffortConfig::High,
+            ),
+            (
+                crate::config::ModelPolicyLane::Spark,
+                false,
+                "gpt-5.5",
+                ReasoningEffortConfig::High,
+            ),
+            (
+                crate::config::ModelPolicyLane::Spark,
+                true,
+                crate::config::SPARK_MODEL,
+                ReasoningEffortConfig::XHigh,
+            ),
+        ] {
+            validate_model_selection_update_for_lane(
+                lane,
+                is_non_root_agent,
+                model,
+                Some(&effort),
+                /*available_models*/ None,
+            )
+            .expect_err("managed non-root and exact lanes must reject drift");
+        }
+    }
+
+    #[test]
+    fn locked_service_tier_updates_scope_priority_to_subscription_and_api_roots() {
+        for lane in [
+            crate::config::ModelPolicyLane::Subscription,
+            crate::config::ModelPolicyLane::Api,
+            crate::config::ModelPolicyLane::Spark,
+        ] {
+            validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(&None),
+            )
+            .expect("resetting to default must remain allowed");
+            validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(&Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
+            )
+            .expect("the explicit default tier must remain allowed");
+
+            let priority = Some("priority".to_string());
+            let result = validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(&priority),
+            );
+            if matches!(
+                lane,
+                crate::config::ModelPolicyLane::Subscription | crate::config::ModelPolicyLane::Api
+            ) {
+                result.expect("the subscription or API root may explicitly enable Fast");
+            } else {
+                result.expect_err("Spark roots must reject Fast");
+            }
+
+            validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ true,
+                Some(&priority),
+            )
+            .expect_err("all non-root sessions must reject Fast");
+
+            // Flex became an explicit API-root tier on 2026-08-05; the other
+            // lanes keep rejecting it, and no non-root session may hold it.
+            let flex = Some("flex".to_string());
+            let flex_result = validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ false,
+                Some(&flex),
+            );
+            if matches!(lane, crate::config::ModelPolicyLane::Api) {
+                flex_result.expect("an explicit API root may select flex");
+            } else {
+                flex_result.expect_err("only the API lane may select flex");
+            }
+            validate_service_tier_update_for_lane(
+                lane,
+                /*is_non_root_agent*/ true,
+                Some(&flex),
+            )
+            .expect_err("all non-root sessions must reject flex");
         }
     }
 }
