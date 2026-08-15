@@ -1617,8 +1617,10 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 "responses-api-proxy",
             )?;
-            tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
-                .await??;
+            tokio::task::spawn_blocking(move || {
+                codex_responses_api_proxy::run_main_from_codex(args)
+            })
+            .await??;
         }
         Some(Subcommand::StdioToUds(cmd)) => {
             reject_remote_mode_for_subcommand(

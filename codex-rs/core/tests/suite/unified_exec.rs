@@ -2034,6 +2034,95 @@ async fn unified_exec_respects_early_exit_notifications() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_short_lived_process_includes_trailing_output_after_exit() -> Result<()> {
+    skip_if_target_windows!(Ok(()), "uses POSIX fork semantics");
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let call_id = "uexec-trailing-output";
+    let args = serde_json::json!({
+        "cmd": r#"python3 - <<'PY'
+import os
+import time
+
+print("HEAD", flush=True)
+if os.fork() == 0:
+    time.sleep(0.010)
+    print("TRAILING-OUTPUT", flush=True)
+    os._exit(0)
+os._exit(0)
+PY
+"#,
+        "yield_time_ms": 1_000,
+    });
+    let responses = vec![
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    submit_unified_exec_turn(
+        &test,
+        "capture trailing process output",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let end_event = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::ExecCommandEnd(event) if event.call_id == call_id => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(end_event.aggregated_output.contains("HEAD"));
+    assert!(
+        end_event.aggregated_output.contains("TRAILING-OUTPUT"),
+        "terminal event omitted output produced after the parent exited: {:?}",
+        end_event.aggregated_output
+    );
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let outputs = collect_tool_outputs(
+        &request_log
+            .requests()
+            .into_iter()
+            .map(|request| request.body_json())
+            .collect::<Vec<_>>(),
+    )?;
+    let output = outputs
+        .get(call_id)
+        .expect("missing short-lived unified exec output");
+    assert!(output.output.contains("HEAD"));
+    assert!(
+        output.output.contains("TRAILING-OUTPUT"),
+        "model-visible output omitted output produced after the parent exited: {:?}",
+        output.output
+    );
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.process_id.is_none());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_stdin_returns_exit_metadata_and_clears_session() -> Result<()> {
     // TODO(anp): Remove after unified-exec interactive fixtures support Windows/ConPTY.
     skip_if_target_windows!(Ok(()), "uses POSIX interactive-process and EOF semantics");
@@ -3085,6 +3174,7 @@ async fn unified_exec_formats_large_output_summary() -> Result<()> {
         b"HEAD\n".len() + output_line.len() * output_repetitions + b"TAIL\n".len();
     let expected_original_token_count =
         usize::try_from(approx_tokens_from_byte_count(original_output_bytes)).unwrap_or(usize::MAX);
+    let expected_omission_marker = "... 251434 bytes omitted ...";
     let script = format!(
         r#"python3 - <<'PY'
 import sys
@@ -3124,9 +3214,12 @@ PY
     .await;
     assert!(end_event.aggregated_output.contains("HEAD\n"));
     assert!(end_event.aggregated_output.contains("TAIL\n"));
-    assert_regex_match(
-        r"\.\.\. \d+ bytes omitted \.\.\.",
-        &end_event.aggregated_output,
+    assert!(
+        end_event
+            .aggregated_output
+            .contains(expected_omission_marker),
+        "terminal aggregate should contain the exact bounded-output omission marker: {:?}",
+        end_event.aggregated_output
     );
 
     wait_for_event(&test.codex, |event| {
@@ -3148,7 +3241,10 @@ PY
     assert!(output_text.starts_with(&format!(
         "Warning: truncated output (original token count: {expected_original_token_count})\n"
     )));
-    assert_regex_match(r"\.\.\. \d+ bytes omitted \.\.\.", &output_text);
+    assert!(
+        output_text.contains(expected_omission_marker),
+        "model-visible output should contain the exact bounded-output omission marker: {output_text:?}"
+    );
     assert!(output_text.contains("HEAD\n"));
     assert!(output_text.contains("TAIL\n"));
     assert_eq!(

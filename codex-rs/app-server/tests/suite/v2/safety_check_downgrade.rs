@@ -7,16 +7,16 @@ use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::ModelRerouteReason;
-use codex_app_server_protocol::ModelReroutedNotification;
 use codex_app_server_protocol::ModelVerification;
 use codex_app_server_protocol::ModelVerificationNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnModerationMetadataNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_features::Feature;
 use core_test_support::responses;
@@ -34,7 +34,7 @@ const CYBER_POLICY_MESSAGE: &str =
     "This request has been flagged for potentially high-risk cyber activity.";
 
 #[tokio::test]
-async fn openai_model_header_mismatch_emits_model_rerouted_notification_v2() -> Result<()> {
+async fn openai_model_header_mismatch_is_terminal_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -74,17 +74,8 @@ async fn openai_model_header_mismatch_emits_model_rerouted_notification_v2() -> 
         })
         .await?;
 
-    let rerouted = collect_turn_notifications_and_validate_no_warning_item(&mut mcp).await?;
-    assert_eq!(
-        rerouted,
-        ModelReroutedNotification {
-            thread_id: thread.id,
-            turn_id: turn_start.turn.id,
-            from_model: REQUESTED_MODEL.to_string(),
-            to_model: SERVER_MODEL.to_string(),
-            reason: ModelRerouteReason::HighRiskCyberActivity,
-        }
-    );
+    let (error, completed) = collect_terminal_model_mismatch(&mut mcp).await?;
+    assert_terminal_model_mismatch(&thread.id, &turn_start.turn.id, &error, &completed);
 
     Ok(())
 }
@@ -151,8 +142,8 @@ async fn cyber_policy_response_emits_typed_error_notification_v2() -> Result<()>
 }
 
 #[tokio::test]
-async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when_header_matches_requested()
--> Result<()> {
+async fn response_model_field_mismatch_is_terminal_v2_when_header_matches_requested() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -200,17 +191,8 @@ async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when
         })
         .await?;
 
-    let rerouted = collect_turn_notifications_and_validate_no_warning_item(&mut mcp).await?;
-    assert_eq!(
-        rerouted,
-        ModelReroutedNotification {
-            thread_id: thread.id,
-            turn_id: turn_start.turn.id,
-            from_model: REQUESTED_MODEL.to_string(),
-            to_model: SERVER_MODEL.to_string(),
-            reason: ModelRerouteReason::HighRiskCyberActivity,
-        }
-    );
+    let (error, completed) = collect_terminal_model_mismatch(&mut mcp).await?;
+    assert_terminal_model_mismatch(&thread.id, &turn_start.turn.id, &error, &completed);
 
     Ok(())
 }
@@ -341,10 +323,10 @@ async fn turn_moderation_metadata_emits_typed_notification_v2() -> Result<()> {
     Ok(())
 }
 
-async fn collect_turn_notifications_and_validate_no_warning_item(
+async fn collect_terminal_model_mismatch(
     mcp: &mut TestAppServer,
-) -> Result<ModelReroutedNotification> {
-    let mut rerouted = None;
+) -> Result<(ErrorNotification, TurnCompletedNotification)> {
+    let mut error = None;
 
     loop {
         let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
@@ -353,34 +335,76 @@ async fn collect_turn_notifications_and_validate_no_warning_item(
         };
         match notification.method.as_str() {
             "model/rerouted" => {
-                let params = notification.params.ok_or_else(|| {
-                    anyhow::anyhow!("model/rerouted notifications must include params")
-                })?;
-                let payload: ModelReroutedNotification = serde_json::from_value(params)?;
-                rerouted = Some(payload);
+                anyhow::bail!("server model mismatch must not emit model/rerouted");
+            }
+            "error" => {
+                let params = notification
+                    .params
+                    .ok_or_else(|| anyhow::anyhow!("error notifications must include params"))?;
+                let payload: ErrorNotification = serde_json::from_value(params)?;
+                if !payload.error.message.contains("server-reported model") {
+                    anyhow::bail!("unexpected error notification: {}", payload.error.message);
+                }
+                error = Some(payload);
             }
             "item/started" => {
                 let params = notification.params.ok_or_else(|| {
                     anyhow::anyhow!("item/started notifications must include params")
                 })?;
                 let payload: ItemStartedNotification = serde_json::from_value(params)?;
-                assert!(!is_warning_user_message_item(&payload.item));
+                if is_model_output_item(&payload.item) {
+                    anyhow::bail!("server model mismatch must not start model output items");
+                }
             }
             "item/completed" => {
                 let params = notification.params.ok_or_else(|| {
                     anyhow::anyhow!("item/completed notifications must include params")
                 })?;
                 let payload: ItemCompletedNotification = serde_json::from_value(params)?;
-                assert!(!is_warning_user_message_item(&payload.item));
+                if is_model_output_item(&payload.item) {
+                    anyhow::bail!("server model mismatch must not complete model output items");
+                }
             }
             "turn/completed" => {
-                return rerouted.ok_or_else(|| {
-                    anyhow::anyhow!("expected model/rerouted notification before turn/completed")
-                });
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("turn/completed notifications must include params")
+                })?;
+                let completed: TurnCompletedNotification = serde_json::from_value(params)?;
+                let error = error.ok_or_else(|| {
+                    anyhow::anyhow!("expected model mismatch error before turn/completed")
+                })?;
+                return Ok((error, completed));
             }
             _ => {}
         }
     }
+}
+
+fn assert_terminal_model_mismatch(
+    thread_id: &str,
+    turn_id: &str,
+    error: &ErrorNotification,
+    completed: &TurnCompletedNotification,
+) {
+    assert_eq!(error.thread_id, thread_id);
+    assert_eq!(error.turn_id, turn_id);
+    assert!(!error.will_retry);
+    assert_eq!(error.error.codex_error_info, Some(CodexErrorInfo::Other));
+    assert!(error.error.message.contains(REQUESTED_MODEL));
+    assert!(error.error.message.contains(SERVER_MODEL));
+    assert!(error.error.message.contains("silently rerouted model"));
+    assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(completed.turn.id, turn_id);
+    assert_eq!(completed.turn.status, TurnStatus::Failed);
+    assert_eq!(completed.turn.error.as_ref(), Some(&error.error));
+    assert!(completed.turn.items.is_empty());
+}
+
+fn is_model_output_item(item: &ThreadItem) -> bool {
+    matches!(
+        item,
+        ThreadItem::AgentMessage { .. } | ThreadItem::CommandExecution { .. }
+    )
 }
 
 async fn collect_model_verification_notifications_and_validate_no_warning_item(

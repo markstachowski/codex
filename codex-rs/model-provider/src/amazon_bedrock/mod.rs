@@ -29,6 +29,7 @@ use codex_protocol::openai_models::ModelsResponse;
 
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth as resolve_configured_provider_auth;
+use crate::model_policy::ManagedProviderPolicy;
 use crate::provider::ModelProvider;
 use crate::provider::ModelProviderFuture;
 use crate::provider::ProviderAccountResult;
@@ -110,13 +111,19 @@ impl AmazonBedrockModelProvider {
         }
     }
 
-    async fn api_provider(&self) -> Result<Provider> {
+    async fn api_provider_with_policy(&self, policy: ManagedProviderPolicy) -> Result<Provider> {
+        policy.validate_before_auth(&self.info)?;
         let mut api_provider_info = self.info.clone();
-        api_provider_info.base_url = self.runtime_base_url().await?;
-        api_provider_info.to_api_provider(/*auth_mode*/ None)
+        api_provider_info.base_url = self.resolve_runtime_base_url().await?;
+        policy.resolve_api_provider(&api_provider_info, /*auth_mode*/ None)
     }
 
-    async fn runtime_base_url(&self) -> Result<Option<String>> {
+    async fn api_provider(&self) -> Result<Provider> {
+        let policy = ManagedProviderPolicy::from_environment()?;
+        self.api_provider_with_policy(policy).await
+    }
+
+    async fn resolve_runtime_base_url(&self) -> Result<Option<String>> {
         if let Some(base_url) = self.info.base_url.clone() {
             return Ok(Some(base_url));
         }
@@ -132,13 +139,35 @@ impl AmazonBedrockModelProvider {
         Ok(Some(base_url))
     }
 
-    async fn api_auth(&self) -> Result<SharedAuthProvider> {
+    async fn runtime_base_url_with_policy(
+        &self,
+        policy: ManagedProviderPolicy,
+    ) -> Result<Option<String>> {
+        policy.validate_before_auth(&self.info)?;
+        self.resolve_runtime_base_url().await
+    }
+
+    async fn runtime_base_url(&self) -> Result<Option<String>> {
+        let policy = ManagedProviderPolicy::from_environment()?;
+        self.runtime_base_url_with_policy(policy).await
+    }
+
+    async fn api_auth_with_policy(
+        &self,
+        policy: ManagedProviderPolicy,
+    ) -> Result<SharedAuthProvider> {
+        policy.validate_before_auth(&self.info)?;
         if self.info.has_command_auth() {
             let auth = self.auth().await;
             return resolve_configured_provider_auth(auth.as_ref(), &self.info);
         }
         let managed_auth = self.managed_auth();
         resolve_bedrock_provider_auth(managed_auth.as_ref(), &self.aws, self.endpoint).await
+    }
+
+    async fn api_auth(&self) -> Result<SharedAuthProvider> {
+        let policy = ManagedProviderPolicy::from_environment()?;
+        self.api_auth_with_policy(policy).await
     }
 
     fn default_model_catalog(&self) -> ModelsResponse {
@@ -252,6 +281,7 @@ mod error_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::num::NonZeroU64;
 
     use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -259,6 +289,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::model_policy::ManagedProviderBuildMode;
+
+    fn unmanaged_policy() -> ManagedProviderPolicy {
+        ManagedProviderPolicy::from_marker(/*marker*/ None, ManagedProviderBuildMode::Debug)
+            .expect("missing marker denotes unmanaged debug execution")
+    }
 
     fn command_auth_provider(base_url: Option<&str>) -> ModelProviderInfo {
         let mut provider = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
@@ -303,7 +339,7 @@ mod tests {
 
         assert_eq!(
             provider
-                .runtime_base_url()
+                .runtime_base_url_with_policy(unmanaged_policy())
                 .await
                 .expect("configured base URL should resolve"),
             Some("https://proxy.example.com/v1".to_string())
@@ -362,14 +398,14 @@ mod tests {
         );
         assert_eq!(
             provider
-                .runtime_base_url()
+                .runtime_base_url_with_policy(unmanaged_policy())
                 .await
                 .expect("managed Bedrock region should resolve"),
             Some("https://bedrock-mantle.us-east-1.api.aws/openai/v1".to_string())
         );
         assert_eq!(
             provider
-                .api_auth()
+                .api_auth_with_policy(unmanaged_policy())
                 .await
                 .expect("managed Bedrock auth should resolve")
                 .to_auth_headers()
@@ -398,6 +434,37 @@ mod tests {
                 requires_openai_auth: false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn managed_policy_rejects_bedrock_before_endpoint_or_auth_resolution() {
+        let provider = AmazonBedrockModelProvider::new(
+            command_auth_provider(Some("https://proxy.example.com/v1")),
+            /*auth_manager*/ None,
+        );
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(OsStr::new("subscription")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+
+        let provider_error = provider
+            .api_provider_with_policy(policy)
+            .await
+            .expect_err("managed execution must reject Bedrock before endpoint resolution");
+        let base_url_error = provider
+            .runtime_base_url_with_policy(policy)
+            .await
+            .expect_err("managed execution must reject Bedrock before endpoint resolution");
+        let auth_error = provider
+            .api_auth_with_policy(policy)
+            .await
+            .err()
+            .expect("managed execution must reject Bedrock before auth resolution");
+
+        for error in [provider_error, base_url_error, auth_error] {
+            assert!(error.to_string().contains("base URL override"));
+        }
     }
 
     #[test]
@@ -453,7 +520,7 @@ mod tests {
 
         assert_eq!(
             provider
-                .runtime_base_url()
+                .runtime_base_url_with_policy(unmanaged_policy())
                 .await
                 .expect("managed Bedrock Runtime region should resolve"),
             Some("https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1".to_string())

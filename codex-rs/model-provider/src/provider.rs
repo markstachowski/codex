@@ -25,6 +25,7 @@ use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
+use crate::model_policy::ManagedProviderPolicy;
 use crate::models_endpoint::OpenAiModelsEndpoint;
 
 /// Remote context-compaction protocols supported by a model provider.
@@ -289,6 +290,55 @@ impl ConfiguredModelProvider {
             auth_manager,
         }
     }
+
+    async fn validated_api_setup(
+        &self,
+        policy: ManagedProviderPolicy,
+        auth: ModelProviderFuture<'_, Option<CodexAuth>>,
+    ) -> codex_protocol::error::Result<(Option<CodexAuth>, Provider)> {
+        policy.validate_before_auth(&self.info)?;
+        let auth = auth.await;
+        let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
+        let api_provider = policy.resolve_api_provider(&self.info, auth_mode)?;
+        Ok((auth, api_provider))
+    }
+
+    async fn api_auth_with_policy(
+        &self,
+        policy: ManagedProviderPolicy,
+    ) -> codex_protocol::error::Result<SharedAuthProvider> {
+        if !policy.is_managed() {
+            let auth = self.auth().await;
+            return resolve_provider_auth(auth.as_ref(), &self.info);
+        }
+        let (auth, _api_provider) = self.validated_api_setup(policy, self.auth()).await?;
+        resolve_provider_auth(auth.as_ref(), &self.info)
+    }
+
+    async fn api_auth_for_scope_with_policy(
+        &self,
+        policy: ManagedProviderPolicy,
+        scope: ProviderAuthScope,
+    ) -> codex_protocol::error::Result<ResolvedProviderAuth> {
+        if !policy.is_managed() {
+            if !provider_uses_first_party_auth_path(&self.info) {
+                return self
+                    .api_auth_with_policy(policy)
+                    .await
+                    .map(ResolvedProviderAuth::new);
+            }
+            let auth = self.auth().await;
+            return resolve_provider_auth_for_scope(
+                self.auth_manager(),
+                auth.as_ref(),
+                &self.info,
+                scope,
+            )
+            .await;
+        }
+        let (auth, _api_provider) = self.validated_api_setup(policy, self.auth()).await?;
+        resolve_provider_auth_for_scope(self.auth_manager(), auth.as_ref(), &self.info, scope).await
+    }
 }
 
 impl ModelProvider for ConfiguredModelProvider {
@@ -309,6 +359,33 @@ impl ModelProvider for ConfiguredModelProvider {
             remote_compaction,
             ..ProviderCapabilities::default()
         }
+    }
+
+    fn api_provider(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Provider>> {
+        Box::pin(async move {
+            let policy = ManagedProviderPolicy::from_environment()?;
+            let (_auth, api_provider) = self.validated_api_setup(policy, self.auth()).await?;
+            Ok(api_provider)
+        })
+    }
+
+    fn api_auth(
+        &self,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<SharedAuthProvider>> {
+        Box::pin(async move {
+            let policy = ManagedProviderPolicy::from_environment()?;
+            self.api_auth_with_policy(policy).await
+        })
+    }
+
+    fn api_auth_for_scope(
+        &self,
+        scope: ProviderAuthScope,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedProviderAuth>> {
+        Box::pin(async move {
+            let policy = ManagedProviderPolicy::from_environment()?;
+            self.api_auth_for_scope_with_policy(policy, scope).await
+        })
     }
 
     fn approval_review_preferred_model(&self) -> &'static str {
@@ -461,6 +538,8 @@ impl ModelProvider for ConfiguredModelProvider {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
@@ -486,6 +565,7 @@ mod tests {
 
     use super::*;
     use crate::auth::AgentIdentitySessionFallback;
+    use crate::model_policy::ManagedProviderBuildMode;
 
     fn provider_info_with_command_auth() -> ModelProviderInfo {
         ModelProviderInfo {
@@ -564,21 +644,152 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_auth_ignores_scope_for_non_openai_provider() {
-        let provider = create_model_provider(
+        let provider = ConfiguredModelProvider::new(
             create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses),
             /*auth_manager*/ None,
         );
+        let policy = ManagedProviderPolicy::from_marker(
+            /*marker*/ None,
+            ManagedProviderBuildMode::Debug,
+        )
+        .expect("missing marker denotes unmanaged debug execution");
 
         let auth = provider
-            .api_auth_for_scope(ProviderAuthScope {
-                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
-                session_source: SessionSource::Cli,
-                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
-            })
+            .api_auth_for_scope_with_policy(
+                policy,
+                ProviderAuthScope {
+                    agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+                    session_source: SessionSource::Cli,
+                    agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+                },
+            )
             .await
             .expect("auth should resolve");
 
         assert!(auth.auth.to_auth_headers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_custom_provider_is_rejected_before_auth_is_polled() {
+        let mut guardian_retry_limited =
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        guardian_retry_limited.request_max_retries = Some(1);
+        guardian_retry_limited.stream_max_retries = Some(1);
+        let mut guardian_with_base_url = guardian_retry_limited.clone();
+        guardian_with_base_url.base_url = Some("https://example.invalid/v1".to_string());
+        let mut guardian_with_header = guardian_retry_limited.clone();
+        guardian_with_header
+            .http_headers
+            .as_mut()
+            .expect("built-in version header")
+            .insert("x-managed-override".to_string(), "rejected".to_string());
+        let mut guardian_with_env_header = guardian_retry_limited.clone();
+        guardian_with_env_header
+            .env_http_headers
+            .as_mut()
+            .expect("built-in OpenAI environment headers")
+            .insert(
+                "x-managed-env-override".to_string(),
+                "MANAGED_SECRET".to_string(),
+            );
+        let mut guardian_with_query = guardian_retry_limited.clone();
+        guardian_with_query.query_params = Some(std::collections::HashMap::from([(
+            "managed-override".to_string(),
+            "rejected".to_string(),
+        )]));
+        let mut guardian_with_auth_change = guardian_retry_limited.clone();
+        guardian_with_auth_change.requires_openai_auth = false;
+        let mut guardian_with_bearer = guardian_retry_limited.clone();
+        guardian_with_bearer.experimental_bearer_token = Some("rejected".to_string());
+        let mut guardian_with_name_change = guardian_retry_limited;
+        guardian_with_name_change.name = "OpenAI override".to_string();
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(std::ffi::OsStr::new("subscription")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+
+        for (label, expected_error, provider_info) in [
+            (
+                "base URL override",
+                "base URL override",
+                guardian_with_base_url,
+            ),
+            (
+                "header override",
+                "modified model provider",
+                guardian_with_header,
+            ),
+            (
+                "environment header override",
+                "modified model provider",
+                guardian_with_env_header,
+            ),
+            (
+                "query override",
+                "modified model provider",
+                guardian_with_query,
+            ),
+            (
+                "auth override",
+                "modified model provider",
+                guardian_with_auth_change,
+            ),
+            (
+                "bearer override",
+                "modified model provider",
+                guardian_with_bearer,
+            ),
+            (
+                "provider name override",
+                "modified model provider",
+                guardian_with_name_change,
+            ),
+        ] {
+            let provider = ConfiguredModelProvider::new(provider_info, /*auth_manager*/ None);
+            let auth_polled = Arc::new(AtomicBool::new(false));
+            let auth_polled_for_future = Arc::clone(&auth_polled);
+            let auth: ModelProviderFuture<'_, Option<CodexAuth>> = Box::pin(async move {
+                auth_polled_for_future.store(true, Ordering::SeqCst);
+                None
+            });
+
+            let error = provider
+                .validated_api_setup(policy, auth)
+                .await
+                .expect_err(label);
+
+            assert!(error.to_string().contains(expected_error));
+            assert_eq!(auth_polled.load(Ordering::SeqCst), false);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_guardian_retry_limited_provider_reaches_auth_resolution() {
+        let mut provider_info = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        provider_info.request_max_retries = Some(1);
+        provider_info.stream_max_retries = Some(1);
+        let provider = ConfiguredModelProvider::new(provider_info, /*auth_manager*/ None);
+        let policy = ManagedProviderPolicy::from_marker(
+            Some(std::ffi::OsStr::new("api")),
+            ManagedProviderBuildMode::Release,
+        )
+        .expect("known managed lane");
+        let auth_polled = Arc::new(AtomicBool::new(false));
+        let auth_polled_for_future = Arc::clone(&auth_polled);
+        let auth: ModelProviderFuture<'_, Option<CodexAuth>> = Box::pin(async move {
+            auth_polled_for_future.store(true, Ordering::SeqCst);
+            Some(CodexAuth::from_api_key("managed-api-key"))
+        });
+
+        let (auth, api_provider) = provider
+            .validated_api_setup(policy, auth)
+            .await
+            .expect("Guardian's exact retry-limited provider should reach auth resolution");
+
+        assert!(auth.expect("resolved auth").is_api_key_auth());
+        assert_eq!(api_provider.base_url, "https://api.openai.com/v1");
+        assert_eq!(auth_polled.load(Ordering::SeqCst), true);
     }
 
     #[test]

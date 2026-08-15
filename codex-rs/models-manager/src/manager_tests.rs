@@ -17,6 +17,7 @@ use codex_login::ExternalAuthRefreshContext;
 use codex_login::TokenData;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -32,6 +33,121 @@ mod model_info_overrides_tests;
 
 const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+
+#[test]
+fn model_policy_picker_contract_keeps_subscription_catalog() {
+    assert_eq!(
+        picker_contract_for_lane(/*lane*/ None),
+        PickerContract::Upstream
+    );
+    assert_eq!(
+        picker_contract_for_lane(Some("subscription")),
+        PickerContract::Subscription
+    );
+    // The API lane opened root model selection on 2026-08-05: its locked
+    // catalog file is the model boundary, so it shares the filtered-catalog
+    // contract instead of a single-model pin.
+    assert_eq!(
+        picker_contract_for_lane(Some("api")),
+        PickerContract::Subscription
+    );
+    assert_eq!(
+        picker_contract_for_lane(Some("spark")),
+        PickerContract::Exact {
+            model: SPARK_MODEL,
+            effort: ReasoningEffort::XHigh,
+        }
+    );
+    assert_eq!(
+        picker_contract_for_lane(Some("invalid")),
+        PickerContract::Invalid
+    );
+}
+
+#[test]
+fn model_policy_picker_contract_filters_the_actual_catalog_path() {
+    let mut sol = remote_model(SOL_MODEL, "Sol", /*priority*/ 0);
+    sol.default_reasoning_level = Some(ReasoningEffort::Ultra);
+    sol.supported_reasoning_levels = vec![ReasoningEffortPreset {
+        effort: ReasoningEffort::Ultra,
+        description: "ultra".to_string(),
+    }];
+    let terra = remote_model("gpt-5.6-terra", "Terra", /*priority*/ 1);
+    let mut spark = remote_model(SPARK_MODEL, "Spark", /*priority*/ 2);
+    spark.default_reasoning_level = Some(ReasoningEffort::XHigh);
+    spark.supported_reasoning_levels = vec![ReasoningEffortPreset {
+        effort: ReasoningEffort::XHigh,
+        description: "xhigh".to_string(),
+    }];
+    let automatic = remote_model("codex-auto-balanced", "Automatic", /*priority*/ 3);
+    let namespaced_automatic = remote_model(
+        "openai/codex-auto-balanced",
+        "Namespaced automatic",
+        /*priority*/ 4,
+    );
+    let uppercase_automatic = remote_model(
+        "CODEX-AUTO-BALANCED",
+        "Uppercase automatic",
+        /*priority*/ 5,
+    );
+    let catalog = vec![
+        sol,
+        terra,
+        spark,
+        automatic,
+        namespaced_automatic,
+        uppercase_automatic,
+    ];
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: catalog.clone(),
+    });
+
+    let subscription = build_available_models_with_contract(
+        &manager,
+        catalog.clone(),
+        PickerContract::Subscription,
+    );
+    assert_eq!(
+        subscription
+            .iter()
+            .map(|preset| preset.model.as_str())
+            .collect::<Vec<_>>(),
+        vec![SOL_MODEL, "gpt-5.6-terra"]
+    );
+    assert_eq!(subscription[1].supported_reasoning_efforts.len(), 2);
+
+    for (contract, expected_model, expected_effort) in [
+        (
+            PickerContract::Exact {
+                model: SOL_MODEL,
+                effort: ReasoningEffort::Ultra,
+            },
+            SOL_MODEL,
+            ReasoningEffort::Ultra,
+        ),
+        (
+            PickerContract::Exact {
+                model: SPARK_MODEL,
+                effort: ReasoningEffort::XHigh,
+            },
+            SPARK_MODEL,
+            ReasoningEffort::XHigh,
+        ),
+    ] {
+        let filtered = build_available_models_with_contract(&manager, catalog.clone(), contract);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].model, expected_model);
+        assert_eq!(
+            filtered[0].default_reasoning_effort,
+            expected_effort.clone()
+        );
+        assert_eq!(filtered[0].supported_reasoning_efforts.len(), 1);
+        assert_eq!(
+            filtered[0].supported_reasoning_efforts[0].effort,
+            expected_effort
+        );
+    }
+}
 
 fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
     remote_model_with_visibility(slug, display, priority, "list")

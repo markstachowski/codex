@@ -4,6 +4,10 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::config::ModelPolicyLane;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_base_instructions_for_model;
+use crate::config::managed_background_inference_for_lane;
 use crate::context::world_state::WorldState;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -30,6 +34,7 @@ use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -40,6 +45,8 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -132,6 +139,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         turn_context,
         input,
         initial_context_injection,
+        locked_model_policy_lane()?,
         CompactionTrigger::Auto,
         reason,
         phase,
@@ -158,6 +166,7 @@ pub(crate) async fn run_compact_task(
         turn_context,
         input,
         InitialContextInjection::DoNotInject,
+        locked_model_policy_lane()?,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -166,11 +175,16 @@ pub(crate) async fn run_compact_task(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "compaction lifecycle inputs remain explicit at the task boundary"
+)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    lane: Option<ModelPolicyLane>,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -207,6 +221,7 @@ async fn run_compact_task_inner(
         Arc::clone(&turn_context),
         input,
         initial_context_injection,
+        lane,
         compaction_metadata,
     )
     .await;
@@ -242,6 +257,7 @@ async fn run_compact_task_inner_impl(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    lane: Option<ModelPolicyLane>,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -267,16 +283,45 @@ async fn run_compact_task_inner_impl(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
+    let inference = managed_background_inference_for_lane(
+        turn_context.model_info.slug.clone(),
+        turn_context.reasoning_effort.clone(),
+        turn_context.config.service_tier.clone(),
+        lane,
+    );
+    let model_info = match lane {
+        Some(_) => {
+            sess.services
+                .models_manager
+                .get_model_info(
+                    inference.model.as_str(),
+                    &turn_context.config.to_models_manager_config(),
+                )
+                .await
+        }
+        None => turn_context.model_info.clone(),
+    };
+    let session_telemetry = match lane {
+        Some(_) => turn_context
+            .session_telemetry
+            .clone()
+            .with_model(model_info.slug.as_str(), model_info.slug.as_str()),
+        None => turn_context.session_telemetry.clone(),
+    };
+    let base_instructions = managed_background_base_instructions_for_model(
+        sess.get_base_instructions().await,
+        &model_info,
+        turn_context.personality,
+        lane,
+    );
 
     loop {
         // Clone is required because of the loop
-        let turn_input = history
-            .clone()
-            .for_prompt(&turn_context.model_info.input_modalities);
+        let turn_input = history.clone().for_prompt(&model_info.input_modalities);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
-            base_instructions: sess.get_base_instructions().await,
+            base_instructions: base_instructions.clone(),
             ..Default::default()
         };
         let attempt_result = drain_to_completed(
@@ -285,6 +330,10 @@ async fn run_compact_task_inner_impl(
             &mut client_session,
             &responses_metadata,
             &prompt,
+            &model_info,
+            &session_telemetry,
+            inference.reasoning_effort.clone(),
+            inference.service_tier.clone(),
         )
         .await;
 
@@ -716,21 +765,29 @@ fn build_compacted_history_with_limit(
     history
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream construction keeps managed request policy inputs explicit"
+)]
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
+    model_info: &ModelInfo,
+    session_telemetry: &SessionTelemetry,
+    reasoning_effort: Option<ReasoningEffort>,
+    service_tier: Option<String>,
 ) -> CodexResult<()> {
     let mut stream = client_session
         .stream(
             prompt,
-            &turn_context.model_info,
-            &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
+            model_info,
+            session_telemetry,
+            reasoning_effort,
             turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
+            service_tier,
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.

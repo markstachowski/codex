@@ -18,6 +18,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -31,6 +33,7 @@ use tokio::task::JoinHandle;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
+use crate::process::ProcessTerminationStrategy;
 use crate::process::PtyHandles;
 use crate::process::PtyMasterHandle;
 use crate::process::SpawnedProcess;
@@ -93,6 +96,25 @@ impl ChildTerminator for PtyChildTerminator {
 #[cfg(unix)]
 struct RawPidTerminator {
     process_group_id: u32,
+    #[cfg(target_os = "linux")]
+    termination_request: LinuxPtyTerminationRequest,
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxPtyTerminationRequest {
+    KillImmediately,
+    GracefulThenKill {
+        tx: Option<std_mpsc::Sender<()>>,
+        state: Arc<StdMutex<LinuxPtyTerminationState>>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxPtyTerminationState {
+    Running,
+    TerminationRequested,
+    Reaped(std::process::ExitStatus),
 }
 
 #[cfg(unix)]
@@ -106,8 +128,140 @@ impl ChildTerminator for RawPidTerminator {
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        match &mut self.termination_request {
+            LinuxPtyTerminationRequest::KillImmediately => {}
+            LinuxPtyTerminationRequest::GracefulThenKill { tx, state } => {
+                if let Ok(mut state) = state.lock()
+                    && matches!(*state, LinuxPtyTerminationState::Running)
+                {
+                    *state = LinuxPtyTerminationState::TerminationRequested;
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         crate::process_group::kill_process_group(self.process_group_id)
     }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxRawPtyChildGuard {
+    child: std::process::Child,
+    process_group_id: u32,
+    _pty_keepalive: Option<File>,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRawPtyChildGuard {
+    fn new(child: std::process::Child, process_group_id: u32) -> Self {
+        Self {
+            child,
+            process_group_id,
+            _pty_keepalive: None,
+            armed: true,
+        }
+    }
+
+    fn keep_pty_open(&mut self, pty_keepalive: File) {
+        self._pty_keepalive = Some(pty_keepalive);
+    }
+
+    fn hard_kill(&mut self) {
+        let _ = crate::process_group::kill_process_group(self.process_group_id);
+        let _ = self.child.kill();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxRawPtyChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hard_kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_raw_pty_child(
+    child: &mut LinuxRawPtyChildGuard,
+    grace_period: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let _ = crate::process_group::terminate_process_group(child.process_group_id);
+    // Do not poll or reap during the grace period: the owned zombie reserves
+    // the exact PID and PGID until hard-kill escalation has completed.
+    std::thread::sleep(grace_period);
+    child.hard_kill();
+    child.child.wait()
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_linux_raw_pty_child(
+    mut child: LinuxRawPtyChildGuard,
+    graceful_termination: Option<(
+        std_mpsc::Receiver<()>,
+        Duration,
+        Arc<StdMutex<LinuxPtyTerminationState>>,
+    )>,
+) -> std::io::Result<std::process::ExitStatus> {
+    const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    let wait_result = if let Some((termination_rx, grace_period, state)) = graceful_termination {
+        loop {
+            let termination_requested = {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| std::io::Error::other("PTY termination state poisoned"))?;
+                match *state {
+                    LinuxPtyTerminationState::Running => {
+                        if let Some(status) = child.child.try_wait()? {
+                            *state = LinuxPtyTerminationState::Reaped(status);
+                            break Ok(status);
+                        }
+                        false
+                    }
+                    LinuxPtyTerminationState::TerminationRequested => true,
+                    LinuxPtyTerminationState::Reaped(status) => break Ok(status),
+                }
+            };
+            if termination_requested {
+                match terminate_linux_raw_pty_child(&mut child, grace_period) {
+                    Ok(status) => {
+                        if let Ok(mut state) = state.lock() {
+                            *state = LinuxPtyTerminationState::Reaped(status);
+                        }
+                        break Ok(status);
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+
+            match termination_rx.recv_timeout(EXIT_POLL_INTERVAL) {
+                Ok(()) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "PTY termination requester dropped before child exit",
+                    ));
+                }
+            }
+        }
+    } else {
+        child.child.wait()
+    };
+    if wait_result.is_ok() {
+        child.disarm();
+    }
+    wait_result
 }
 
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
@@ -133,6 +287,31 @@ pub async fn spawn_process(
     size: TerminalSize,
     inherited_fds: &[i32],
 ) -> Result<SpawnedProcess> {
+    spawn_process_with_termination_strategy(
+        program,
+        args,
+        cwd,
+        env,
+        arg0,
+        size,
+        inherited_fds,
+        ProcessTerminationStrategy::KillImmediately,
+    )
+    .await
+}
+
+/// Spawn a PTY-backed process with an explicit termination strategy.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_process_with_termination_strategy(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    size: TerminalSize,
+    inherited_fds: &[i32],
+    termination_strategy: ProcessTerminationStrategy,
+) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for PTY spawn");
     }
@@ -140,11 +319,31 @@ pub async fn spawn_process(
     #[cfg(not(unix))]
     let _ = inherited_fds;
 
+    #[cfg(target_os = "linux")]
+    let use_raw_unix_pty = !inherited_fds.is_empty()
+        || matches!(
+            termination_strategy,
+            ProcessTerminationStrategy::GracefulThenKill { .. }
+        );
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let use_raw_unix_pty = !inherited_fds.is_empty();
     #[cfg(unix)]
-    if !inherited_fds.is_empty() {
-        return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
-            .await;
+    if use_raw_unix_pty {
+        return spawn_process_preserving_fds(
+            program,
+            args,
+            cwd,
+            env,
+            arg0,
+            size,
+            inherited_fds,
+            termination_strategy,
+        )
+        .await;
     }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = termination_strategy;
 
     spawn_process_portable(program, args, cwd, env, arg0, size).await
 }
@@ -270,6 +469,7 @@ async fn spawn_process_portable(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn spawn_process_preserving_fds(
     program: &str,
     args: &[String],
@@ -278,6 +478,7 @@ async fn spawn_process_preserving_fds(
     arg0: &Option<String>,
     size: TerminalSize,
     inherited_fds: &[RawFd],
+    termination_strategy: ProcessTerminationStrategy,
 ) -> Result<SpawnedProcess> {
     let (master, slave) = open_unix_pty(size)?;
     let mut command = StdCommand::new(program);
@@ -300,6 +501,8 @@ async fn spawn_process_preserving_fds(
     let stdout = slave.try_clone()?;
     let stderr = slave.try_clone()?;
     let inherited_fds = inherited_fds.to_vec();
+    #[cfg(target_os = "linux")]
+    let parent_pid = unsafe { libc::getpid() };
 
     unsafe {
         command
@@ -333,19 +536,75 @@ async fn spawn_process_preserving_fds(
                     return Err(std::io::Error::last_os_error());
                 }
 
+                #[cfg(target_os = "linux")]
+                crate::process_group::set_parent_death_signal_to_kill(parent_pid)?;
+
                 close_inherited_fds_except(&inherited_fds);
                 Ok(())
             });
     }
 
+    #[cfg(target_os = "linux")]
+    let child = command.spawn()?;
+    #[cfg(not(target_os = "linux"))]
     let mut child = command.spawn()?;
     drop(slave);
     let process_group_id = child.id();
+    #[cfg(target_os = "linux")]
+    let (termination_request, graceful_termination) = match termination_strategy {
+        ProcessTerminationStrategy::KillImmediately => {
+            (LinuxPtyTerminationRequest::KillImmediately, None)
+        }
+        ProcessTerminationStrategy::GracefulThenKill { grace_period } => {
+            let (tx, rx) = std_mpsc::channel();
+            let state = Arc::new(StdMutex::new(LinuxPtyTerminationState::Running));
+            (
+                LinuxPtyTerminationRequest::GracefulThenKill {
+                    tx: Some(tx),
+                    state: Arc::clone(&state),
+                },
+                Some((rx, grace_period, state)),
+            )
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = termination_strategy;
+
+    // Arm child cleanup before any post-spawn fallible setup, then complete all
+    // PTY cloning before transferring ownership to the waiter.
+    #[cfg(target_os = "linux")]
+    let mut child = LinuxRawPtyChildGuard::new(child, process_group_id);
+    let mut reader = master.try_clone()?;
+    let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
+    #[cfg(target_os = "linux")]
+    child.keep_pty_open(master.try_clone()?);
+
+    let (exit_tx, exit_rx) = oneshot::channel::<i32>();
+    let exit_status = Arc::new(AtomicBool::new(false));
+    let wait_exit_status = Arc::clone(&exit_status);
+    let exit_code = Arc::new(StdMutex::new(None));
+    let wait_exit_code = Arc::clone(&exit_code);
+    // Enqueue the owning waiter before any blocking reader. This ensures a
+    // saturated one-thread blocking pool cannot strand the child behind PTY I/O.
+    let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "linux")]
+        let wait_result = wait_for_linux_raw_pty_child(child, graceful_termination);
+        #[cfg(not(target_os = "linux"))]
+        let wait_result = child.wait();
+        let code = match wait_result {
+            Ok(status) => exit_code_from_status(status),
+            Err(_) => -1,
+        };
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut guard) = wait_exit_code.lock() {
+            *guard = Some(code);
+        }
+        let _ = exit_tx.send(code);
+    });
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let mut reader = master.try_clone()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
@@ -364,7 +623,6 @@ async fn spawn_process_preserving_fds(
         }
     });
 
-    let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
         async move {
@@ -377,23 +635,6 @@ async fn spawn_process_preserving_fds(
         }
     });
 
-    let (exit_tx, exit_rx) = oneshot::channel::<i32>();
-    let exit_status = Arc::new(AtomicBool::new(false));
-    let wait_exit_status = Arc::clone(&exit_status);
-    let exit_code = Arc::new(StdMutex::new(None));
-    let wait_exit_code = Arc::clone(&exit_code);
-    let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
-        let code = match child.wait() {
-            Ok(status) => exit_code_from_status(status),
-            Err(_) => -1,
-        };
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = wait_exit_code.lock() {
-            *guard = Some(code);
-        }
-        let _ = exit_tx.send(code);
-    });
-
     let handles = PtyHandles {
         _slave: None,
         _master: PtyMasterHandle::Opaque {
@@ -404,7 +645,11 @@ async fn spawn_process_preserving_fds(
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(RawPidTerminator { process_group_id }),
+        Box::new(RawPidTerminator {
+            process_group_id,
+            #[cfg(target_os = "linux")]
+            termination_request,
+        }),
         reader_handle,
         Vec::new(),
         writer_handle,

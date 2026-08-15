@@ -1,5 +1,11 @@
+use std::cell::Cell;
+use std::io;
+
 use super::*;
 use crate::legacy_core::config::ConfigBuilder;
+use crate::resume_picker::SessionTarget;
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 
@@ -20,6 +26,44 @@ fn defaults() -> NewThreadModelDefaults {
     }
 }
 
+#[test]
+fn managed_defaults_selection_dispatch_is_fail_closed() {
+    let target = SessionTarget {
+        path: None,
+        thread_id: ThreadId::new(),
+        history_mode: None,
+    };
+
+    for selection in [
+        SessionSelection::StartFresh,
+        SessionSelection::Fork(target.clone()),
+        SessionSelection::Exit,
+    ] {
+        let called = Cell::new(false);
+        let error = apply_managed_new_thread_defaults_for_selection(&selection, || {
+            called.set(true);
+            Err(io::Error::other("managed-defaults-sentinel"))
+        })
+        .expect_err("new root selections must apply managed defaults");
+        assert!(called.get(), "selection: {selection:?}");
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (
+                io::ErrorKind::Other,
+                "managed-defaults-sentinel".to_string()
+            )
+        );
+    }
+
+    let called = Cell::new(false);
+    apply_managed_new_thread_defaults_for_selection(&SessionSelection::Resume(target), || {
+        called.set(true);
+        Ok(())
+    })
+    .expect("resuming an existing root must preserve its settings");
+    assert!(!called.get());
+}
+
 #[tokio::test]
 async fn applies_managed_defaults_to_a_new_thread_config() {
     let mut actual = test_config().await;
@@ -31,11 +75,12 @@ async fn applies_managed_defaults_to_a_new_thread_config() {
     expected.model_reasoning_effort = Some(ReasoningEffort::High);
     expected.service_tier = Some(ServiceTier::Fast.request_value().to_string());
 
-    apply_managed_new_thread_defaults(
+    apply_managed_new_thread_defaults_for_lane(
         &mut actual,
         Some(&defaults()),
         &[],
         &ConfigOverrides::default(),
+        /*lane*/ None,
     );
 
     assert_eq!(actual, expected);
@@ -54,7 +99,13 @@ async fn explicit_model_skips_managed_model_and_reasoning_effort() {
         ..ConfigOverrides::default()
     };
 
-    apply_managed_new_thread_defaults(&mut actual, Some(&defaults()), &[], &harness_overrides);
+    apply_managed_new_thread_defaults_for_lane(
+        &mut actual,
+        Some(&defaults()),
+        &[],
+        &harness_overrides,
+        /*lane*/ None,
+    );
 
     assert_eq!(actual, expected);
 }
@@ -72,11 +123,12 @@ async fn explicit_reasoning_effort_skips_managed_model_and_reasoning_effort() {
         TomlValue::String("low".to_string()),
     )];
 
-    apply_managed_new_thread_defaults(
+    apply_managed_new_thread_defaults_for_lane(
         &mut actual,
         Some(&defaults()),
         &cli_kv_overrides,
         &ConfigOverrides::default(),
+        /*lane*/ None,
     );
 
     assert_eq!(actual, expected);
@@ -99,11 +151,88 @@ async fn explicit_launch_overrides_take_precedence() {
         ..ConfigOverrides::default()
     };
 
-    apply_managed_new_thread_defaults(
+    apply_managed_new_thread_defaults_for_lane(
         &mut actual,
         Some(&defaults()),
         &cli_kv_overrides,
         &harness_overrides,
+        /*lane*/ None,
+    );
+
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn managed_lanes_reset_new_threads_to_required_defaults() {
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        let mut actual = test_config().await;
+        actual.model = Some("previous-conversation-model".to_string());
+        actual.model_reasoning_effort = Some(ReasoningEffort::Low);
+        actual.plan_mode_reasoning_effort = Some(ReasoningEffort::Low);
+        actual.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+        let mut expected = actual.clone();
+        expected.model = Some(lane.required_model().to_string());
+        expected.model_reasoning_effort = Some(lane.required_local_effort());
+        expected.plan_mode_reasoning_effort = Some(lane.required_local_effort());
+        expected.service_tier = Some(lane.required_root_service_tier().to_string());
+
+        apply_managed_new_thread_defaults_for_lane(
+            &mut actual,
+            Some(&defaults()),
+            &[],
+            &ConfigOverrides::default(),
+            Some(lane),
+        );
+
+        assert_eq!(actual, expected, "lane: {}", lane.as_str());
+    }
+}
+
+#[tokio::test]
+async fn api_fast_toggle_is_conversation_local_and_fresh_roots_return_to_standard() {
+    let mut config = test_config().await;
+    // Start from a conversation that opted into Fast: the selection must not
+    // leak into the next root, which returns to the lane's Standard baseline.
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+
+    apply_managed_new_thread_defaults_for_lane(
+        &mut config,
+        Some(&defaults()),
+        &[],
+        &ConfigOverrides::default(),
+        Some(ModelPolicyLane::Api),
+    );
+
+    assert_eq!(
+        config.service_tier.as_deref(),
+        Some(ModelPolicyLane::Api.required_root_service_tier())
+    );
+}
+
+#[tokio::test]
+async fn subscription_lane_does_not_inherit_conversation_model_selection() {
+    let mut actual = test_config().await;
+    actual.model = Some("gpt-5.5".to_string());
+    actual.model_reasoning_effort = Some(ReasoningEffort::High);
+    actual.plan_mode_reasoning_effort = Some(ReasoningEffort::High);
+    actual.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    let mut expected = actual.clone();
+    expected.model = Some(ModelPolicyLane::Subscription.required_model().to_string());
+    expected.model_reasoning_effort = Some(ModelPolicyLane::Subscription.required_local_effort());
+    expected.plan_mode_reasoning_effort =
+        Some(ModelPolicyLane::Subscription.required_local_effort());
+    expected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+
+    apply_managed_new_thread_defaults_for_lane(
+        &mut actual,
+        Some(&defaults()),
+        &[],
+        &ConfigOverrides::default(),
+        Some(ModelPolicyLane::Subscription),
     );
 
     assert_eq!(actual, expected);

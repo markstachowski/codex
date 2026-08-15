@@ -676,6 +676,55 @@ async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell() {
 }
 
 #[tokio::test]
+async fn guardian_omits_environment_tools_when_any_ready_environment_is_not_managed() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::ViewImage, /*enabled*/ true);
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other(
+            crate::guardian::GUARDIAN_REVIEWER_NAME.to_string(),
+        ));
+        assert!(matches!(
+            turn.permission_profile(),
+            codex_protocol::models::PermissionProfile::Managed { .. }
+        ));
+
+        let TurnEnvironmentState::Ready(managed_environment) = turn
+            .environments
+            .environments
+            .first_mut()
+            .expect("primary environment")
+        else {
+            panic!("primary environment should be ready");
+        };
+        managed_environment.config_mut().permission_profile =
+            crate::config::PermissionProfileSnapshot::legacy(
+                codex_protocol::models::PermissionProfile::read_only(),
+            );
+        duplicate_primary_environment(turn);
+        let TurnEnvironmentState::Ready(external_environment) = turn
+            .environments
+            .environments
+            .last_mut()
+            .expect("secondary environment")
+        else {
+            panic!("secondary environment should be ready");
+        };
+        external_environment.config_origin =
+            crate::environment_selection::EnvironmentConfigOrigin::Owner;
+        external_environment.config_mut().permission_profile =
+            crate::config::PermissionProfileSnapshot::legacy(
+                codex_protocol::models::PermissionProfile::External {
+                    network: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                },
+            );
+    })
+    .await;
+
+    let environment_tools = ["exec_command", "write_stdin", "view_image"];
+    plan.assert_visible_lacks(&environment_tools);
+    plan.assert_registered_lacks(&environment_tools);
+}
+
+#[tokio::test]
 async fn login_shell_parameter_follows_selected_environment() {
     for (tool_name, guardian) in [
         ("shell_command", false),

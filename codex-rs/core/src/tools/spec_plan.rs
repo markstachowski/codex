@@ -891,14 +891,22 @@ fn code_mode_namespace_descriptions(
 #[instrument(level = "trace", skip_all)]
 fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     // Guardian reviewers receive only `exec_command`, `write_stdin`, and `view_image`
-    // when a managed sandbox can enforce the parent's filesystem restrictions;
-    // all general tool sources stay excluded.
+    // when managed sandboxes can enforce the thread and every resolved environment's
+    // filesystem restrictions; all general tool sources stay excluded.
     if crate::guardian::is_guardian_reviewer_source(&context.turn_context.session_source) {
         let turn_context = context.turn_context;
+        let all_ready_environments_are_managed =
+            context.environments.turn_environments().all(|environment| {
+                matches!(
+                    environment.permission_profile(),
+                    PermissionProfile::Managed { .. }
+                )
+            });
         if !matches!(
             turn_context.permission_profile(),
             PermissionProfile::Managed { .. }
-        ) {
+        ) || !all_ready_environments_are_managed
+        {
             return;
         }
         let environment_mode = tool_environment_mode(context.environments);

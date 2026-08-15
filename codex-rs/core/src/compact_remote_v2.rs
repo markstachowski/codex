@@ -16,6 +16,8 @@ use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::should_keep_compacted_history_item;
 use crate::compact_remote_history::HistoryItemGroup;
 use crate::compact_remote_history::history_item_groups;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_inference_for_lane;
 use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -36,6 +38,7 @@ use codex_analytics::CompactionTrigger;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -44,6 +47,8 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
@@ -218,12 +223,19 @@ async fn run_remote_compact_task_inner_impl(
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
+    let lane = locked_model_policy_lane()?;
+    let inference = managed_background_inference_for_lane(
+        turn_context.model_info.slug.clone(),
+        turn_context.reasoning_effort.clone(),
+        turn_context.config.service_tier.clone(),
+        lane,
+    );
     let context_compaction_item = ContextCompactionItem::new();
     let compaction_id = context_compaction_item.id.clone();
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),
         compaction_id.as_str(),
-        turn_context.model_info.slug.as_str(),
+        inference.model.as_str(),
         turn_context.provider.info().name.as_str(),
     );
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
@@ -249,11 +261,17 @@ async fn run_remote_compact_task_inner_impl(
                 return Err(error);
             }
             let fallback_turn_context = &fallback_step_context.turn;
+            let fallback_inference = managed_background_inference_for_lane(
+                fallback_turn_context.model_info.slug.clone(),
+                fallback_turn_context.reasoning_effort.clone(),
+                fallback_turn_context.config.service_tier.clone(),
+                lane,
+            );
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
                     compaction_id.as_str(),
-                    fallback_turn_context.model_info.slug.as_str(),
+                    fallback_inference.model.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
                 );
             let fallback_result = run_remote_compact_v2_attempt(
@@ -267,8 +285,8 @@ async fn run_remote_compact_task_inner_impl(
             .await;
             record_model_fallback(
                 &sess.services.session_telemetry,
-                turn_context.model_info.slug.as_str(),
-                fallback_turn_context.model_info.slug.as_str(),
+                inference.model.as_str(),
+                fallback_inference.model.as_str(),
                 compaction_metadata.reason(),
                 compaction_metadata.implementation(),
                 fallback_result.as_ref().err(),
@@ -347,11 +365,19 @@ struct RemoteCompactionV2Output {
     token_usage: Option<TokenUsage>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "remote compaction keeps managed request policy inputs explicit"
+)]
 async fn run_remote_compaction_request_v2(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
+    model_info: &ModelInfo,
+    session_telemetry: &SessionTelemetry,
+    reasoning_effort: Option<ReasoningEffort>,
+    service_tier: Option<String>,
     responses_metadata: &CodexResponsesMetadata,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let max_retries = turn_context
@@ -364,11 +390,11 @@ async fn run_remote_compaction_request_v2(
         let result = match client_session
             .stream(
                 prompt,
-                &turn_context.model_info,
-                &turn_context.session_telemetry,
-                turn_context.reasoning_effort.clone(),
+                model_info,
+                session_telemetry,
+                reasoning_effort.clone(),
                 turn_context.reasoning_summary,
-                turn_context.config.service_tier.clone(),
+                service_tier.clone(),
                 responses_metadata,
                 &InferenceTraceContext::disabled(),
             )
