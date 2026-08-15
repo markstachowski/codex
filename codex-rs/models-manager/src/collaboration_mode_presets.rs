@@ -18,11 +18,17 @@ pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
 }
 
 fn plan_preset() -> CollaborationModeMask {
+    let reasoning_effort = match std::env::var("CDX_MODEL_POLICY_LANE") {
+        Ok(value) if value.trim() == "spark" => ReasoningEffort::XHigh,
+        Ok(_) => ReasoningEffort::Ultra,
+        Err(std::env::VarError::NotPresent) if cfg!(debug_assertions) => ReasoningEffort::Medium,
+        Err(_) => ReasoningEffort::Ultra,
+    };
     CollaborationModeMask {
         name: ModeKind::Plan.display_name().to_string(),
         mode: Some(ModeKind::Plan),
         model: None,
-        reasoning_effort: Some(Some(ReasoningEffort::Medium)),
+        reasoning_effort: Some(Some(reasoning_effort)),
         developer_instructions: Some(Some(COLLABORATION_MODE_PLAN.to_string())),
     }
 }

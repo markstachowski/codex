@@ -12,10 +12,10 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use std::net::TcpListener;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::net::TcpSocket;
 use tokio::sync::mpsc;
 use tracing::Event;
 use tracing::Subscriber;
@@ -1289,9 +1289,9 @@ async fn connection_failures_increment_retry_telemetry_without_consuming_retry_b
 
     let mut telemetry = RetryTelemetryCapture::install();
     let bootstrap_server = responses::start_mock_server().await;
-    let unavailable_listener = TcpListener::bind("127.0.0.1:0")?;
-    let unavailable_address = unavailable_listener.local_addr()?;
-    drop(unavailable_listener);
+    let unavailable_socket = TcpSocket::new_v4()?;
+    unavailable_socket.bind("127.0.0.1:0".parse()?)?;
+    let unavailable_address = unavailable_socket.local_addr()?;
 
     let test = test_codex()
         .with_config(move |config| {
@@ -1328,8 +1328,9 @@ async fn connection_failures_increment_retry_telemetry_without_consuming_retry_b
         }
     );
 
+    let recovered_listener = unavailable_socket.listen(1024)?;
     let recovered_server = MockServer::builder()
-        .listener(TcpListener::bind(unavailable_address)?)
+        .listener(recovered_listener.into_std()?)
         .start()
         .await;
     let response_mock = responses::mount_sse_once(

@@ -15,6 +15,35 @@ use codex_config::types::WindowsSandboxModeToml;
 
 const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 
+fn should_persist_model_selection_for_lane(
+    lane: Option<&str>,
+    release_default_is_managed: bool,
+) -> std::result::Result<bool, String> {
+    match lane {
+        Some("subscription" | "api" | "spark") => Ok(false),
+        Some(unknown) => Err(format!(
+            "invalid model policy lane: unsupported CDX_MODEL_POLICY_LANE value `{unknown}`; expected subscription, api, or spark"
+        )),
+        None => Ok(!release_default_is_managed),
+    }
+}
+
+fn should_persist_model_selection() -> std::result::Result<bool, String> {
+    match std::env::var("CDX_MODEL_POLICY_LANE") {
+        Ok(value) => should_persist_model_selection_for_lane(
+            Some(value.trim()),
+            /*release_default_is_managed*/ !cfg!(debug_assertions),
+        ),
+        Err(std::env::VarError::NotPresent) => should_persist_model_selection_for_lane(
+            None,
+            /*release_default_is_managed*/ !cfg!(debug_assertions),
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("invalid model policy lane: CDX_MODEL_POLICY_LANE must be valid UTF-8".to_string())
+        }
+    }
+}
+
 impl App {
     pub(super) async fn handle_event(
         &mut self,
@@ -233,12 +262,22 @@ impl App {
                 if let Some(thread_id) = self.chat_widget.thread_id() {
                     self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
                         .await;
-                    let mut fork_config = self.config.clone();
-                    fork_config.model = Some(self.chat_widget.current_model().to_string());
-                    fork_config.model_reasoning_effort =
-                        self.chat_widget.current_reasoning_effort();
-                    match app_server.fork_thread(fork_config, thread_id).await {
+                    let mut fork_config = self.fresh_session_config();
+                    if let Err(err) = apply_managed_new_thread_defaults(
+                        &mut fork_config,
+                        app_server.managed_new_thread_defaults(),
+                        &self.cli_kv_overrides,
+                        &self.harness_overrides,
+                    ) {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to validate managed fork defaults: {err}"
+                        ));
+                        tui.frame_requester().schedule_frame();
+                        return Ok(AppRunControl::Continue);
+                    }
+                    match app_server.fork_thread(fork_config.clone(), thread_id).await {
                         Ok(mut forked) => {
+                            self.config = fork_config;
                             let name_error = if let Some(name) = name {
                                 match app_server
                                     .thread_set_name(forked.session.thread_id, name.clone())
@@ -322,7 +361,19 @@ impl App {
                 );
                 self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
                     .await;
-                let config = self.fresh_session_config();
+                let mut config = self.fresh_session_config();
+                if let Err(err) = apply_managed_new_thread_defaults(
+                    &mut config,
+                    app_server.managed_new_thread_defaults(),
+                    &self.cli_kv_overrides,
+                    &self.harness_overrides,
+                ) {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to validate managed fork defaults: {err}"
+                    ));
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
                 let turns = match self.thread_event_channels.get(&thread_id) {
                     Some(channel) => {
                         let store = channel.store.lock().await;
@@ -414,6 +465,7 @@ impl App {
                 };
                 match started {
                     Ok(forked) => {
+                        self.config = config;
                         self.shutdown_current_thread(app_server).await;
                         match self
                             .replace_chat_widget_with_app_server_thread(
@@ -1289,11 +1341,33 @@ impl App {
                 self.chat_widget.on_connectors_loaded(result, is_final);
             }
             AppEvent::UpdateReasoningEffort(effort) => {
+                if crate::legacy_core::config::locked_model_policy_lane()
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    self.chat_widget.add_error_message(
+                        "Managed model policy requires using the native /model picker to change reasoning effort."
+                            .to_string(),
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 self.on_update_reasoning_effort(effort.clone());
                 self.sync_active_thread_reasoning_setting(app_server, effort)
                     .await;
             }
             AppEvent::UpdateModel(model) => {
+                if crate::legacy_core::config::locked_model_policy_lane()
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    self.chat_widget.add_error_message(
+                        "Managed model policy requires using the native /model picker to change models."
+                            .to_string(),
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 let model_changed = self.chat_widget.current_model() != model
                     || self.chat_widget.current_collaboration_mode().model() != model;
                 if model_changed {
@@ -1302,6 +1376,130 @@ impl App {
                         .await;
                     self.sync_active_thread_service_tier_to_cached_session()
                         .await;
+                }
+            }
+            AppEvent::ApplyThreadModelSelection {
+                model,
+                effort,
+                scope,
+            } => {
+                let model_changed = self.chat_widget.current_model() != model
+                    || self.chat_widget.current_collaboration_mode().model() != model;
+                let desired_mode = self
+                    .chat_widget
+                    .effective_collaboration_mode()
+                    .with_updates(
+                        Some(model.clone()),
+                        Some(effort.clone()),
+                        /*developer_instructions*/ None,
+                    );
+                match crate::legacy_core::config::locked_model_policy_lane() {
+                    Err(err) => self
+                        .chat_widget
+                        .add_error_message(format!("Invalid managed model policy: {err}")),
+                    // Any selecting lane (subscription, and API since
+                    // 2026-08-05) applies through the server-side settings
+                    // update, where the session layer validates the selection
+                    // against the picker catalog. Spark stays on the
+                    // rejection arm below.
+                    Ok(Some(lane)) if lane.allows_user_model_selection() => {
+                        let Some(mut params) = (if model_changed {
+                            self.active_thread_model_setting_update_params(model.clone())
+                        } else {
+                            self.active_thread_reasoning_setting_update_params(effort.clone())
+                        }) else {
+                            self.chat_widget.add_error_message(
+                                "Cannot apply a model selection before a root thread is active."
+                                    .to_string(),
+                            );
+                            return Ok(AppRunControl::Continue);
+                        };
+                        params.model = Some(model.clone());
+                        params.effort = effort.clone();
+                        params.collaboration_mode = Some(desired_mode.clone());
+                        match app_server.thread_settings_update(params).await {
+                            Ok(_settings_updated) => {
+                                self.chat_widget
+                                    .set_effective_collaboration_mode(desired_mode);
+                                if matches!(
+                                    scope,
+                                    crate::app_event::ModelSelectionScope::PlanOnly
+                                        | crate::app_event::ModelSelectionScope::ConversationAndPlan
+                                ) {
+                                    self.chat_widget
+                                        .set_plan_mode_reasoning_effort(effort.clone());
+                                } else {
+                                    let compatible_plan_effort = self
+                                        .compatible_plan_reasoning_effort_for_model(
+                                            model.as_str(),
+                                            effort.clone(),
+                                            /*preserve_current_override*/ false,
+                                        );
+                                    self.chat_widget
+                                        .set_plan_mode_reasoning_effort(compatible_plan_effort);
+                                }
+                                self.sync_active_thread_service_tier_to_cached_session()
+                                    .await;
+                                self.chat_widget.add_info_message(
+                                    format!(
+                                        "Model changed to {model} {} for this conversation",
+                                        Self::reasoning_label(effort.as_ref())
+                                    ),
+                                    /*hint*/ None,
+                                );
+                            }
+                            Err(err) => self.chat_widget.add_error_message(format!(
+                                "Model selection was not applied: {err}"
+                            )),
+                        }
+                    }
+                    Ok(Some(lane)) => self.chat_widget.add_error_message(format!(
+                        "The {} lane does not allow changing its managed model.",
+                        lane.as_str()
+                    )),
+                    Ok(None) => {
+                        self.chat_widget.set_model(&model);
+                        match scope {
+                            crate::app_event::ModelSelectionScope::Conversation => {
+                                self.on_update_reasoning_effort(effort.clone());
+                            }
+                            crate::app_event::ModelSelectionScope::PlanOnly => {
+                                self.on_update_plan_mode_reasoning_effort(effort.clone());
+                            }
+                            crate::app_event::ModelSelectionScope::ConversationAndPlan => {
+                                self.on_update_reasoning_effort(effort.clone());
+                                self.on_update_plan_mode_reasoning_effort(effort.clone());
+                            }
+                        }
+                        if let Some(mut params) = if model_changed {
+                            self.active_thread_model_setting_update_params(model.clone())
+                        } else {
+                            self.active_thread_reasoning_setting_update_params(effort.clone())
+                        } {
+                            params.model = Some(model.clone());
+                            params.effort = effort.clone();
+                            params.collaboration_mode = Some(desired_mode);
+                            self.send_thread_settings_update(app_server, params).await;
+                        }
+                        if matches!(
+                            scope,
+                            crate::app_event::ModelSelectionScope::Conversation
+                                | crate::app_event::ModelSelectionScope::ConversationAndPlan
+                        ) {
+                            self.app_event_tx.send(AppEvent::PersistModelSelection {
+                                model: model.clone(),
+                                effort: effort.clone(),
+                            });
+                        }
+                        if matches!(
+                            scope,
+                            crate::app_event::ModelSelectionScope::PlanOnly
+                                | crate::app_event::ModelSelectionScope::ConversationAndPlan
+                        ) {
+                            self.app_event_tx
+                                .send(AppEvent::PersistPlanModeReasoningEffort(effort));
+                        }
+                    }
                 }
             }
             AppEvent::UpdatePersonality(personality) => {
@@ -1324,49 +1522,6 @@ impl App {
             }
             AppEvent::OpenAdvancedReasoningPopup { model } => {
                 self.chat_widget.open_advanced_reasoning_popup(model);
-            }
-            AppEvent::ApplyAdvancedReasoning { model, effort } => {
-                let model_changed = self.chat_widget.current_model() != model
-                    || self.chat_widget.current_collaboration_mode().model() != model;
-                let default_effort =
-                    self.on_apply_advanced_reasoning(model.as_str(), effort.clone());
-                if model_changed {
-                    self.sync_active_thread_model_setting(
-                        app_server,
-                        model.clone(),
-                        Some(effort.clone()),
-                    )
-                    .await;
-                } else if let Some(mut params) =
-                    self.active_thread_reasoning_setting_update_params(Some(effort.clone()))
-                {
-                    params.collaboration_mode =
-                        Some(self.chat_widget.effective_collaboration_mode());
-                    self.send_thread_settings_update(app_server, params).await;
-                }
-                self.sync_active_thread_service_tier_to_cached_session()
-                    .await;
-
-                if let Some(default_effort) = default_effort.as_ref()
-                    && let Err(err) = crate::config_update::write_config_batch(
-                        app_server.request_handle(),
-                        crate::config_update::build_model_selection_edits(
-                            model.as_str(),
-                            Some(default_effort),
-                        ),
-                    )
-                    .await
-                {
-                    let error = format_config_error(&err);
-                    tracing::error!(error = %error, "failed to persist conversation model");
-                    self.chat_widget
-                        .add_error_message(format!("Failed to save default model: {error}"));
-                } else {
-                    self.chat_widget.add_info_message(
-                        format!("Model changed to {model} {effort} for this conversation"),
-                        /*hint*/ None,
-                    );
-                }
             }
             AppEvent::OpenPlanReasoningScopePrompt { model, effort } => {
                 self.chat_widget
@@ -1881,16 +2036,12 @@ impl App {
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
-                match crate::config_update::write_config_batch(
-                    app_server.request_handle(),
-                    crate::config_update::build_model_selection_edits(
-                        model.as_str(),
-                        effort.as_ref(),
-                    ),
-                )
-                .await
-                {
-                    Ok(_) => {
+                match should_persist_model_selection() {
+                    Err(error) => {
+                        tracing::error!(error = %error, "invalid model policy lane");
+                        self.chat_widget.add_error_message(error);
+                    }
+                    Ok(false) => {
                         let effort_label = effort
                             .as_ref()
                             .map(std::string::ToString::to_string)
@@ -1901,16 +2052,47 @@ impl App {
                             message.push(' ');
                             message.push_str(&label);
                         }
+                        message.push_str(" for this conversation");
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
-                    Err(err) => {
-                        let error = format_config_error(&err);
-                        tracing::error!(
-                            error = %error,
-                            "failed to persist model selection"
-                        );
-                        self.chat_widget
-                            .add_error_message(format!("Failed to save default model: {error}"));
+                    Ok(true) => {
+                        match crate::config_update::write_config_batch(
+                            app_server.request_handle(),
+                            crate::config_update::build_model_selection_edits(
+                                model.as_str(),
+                                effort.as_ref(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let effort_label = effort
+                                    .as_ref()
+                                    .map(std::string::ToString::to_string)
+                                    .unwrap_or_else(|| "default".to_string());
+                                tracing::info!(
+                                    "Selected model: {model}, Selected effort: {effort_label}"
+                                );
+                                let mut message = format!("Model changed to {model}");
+                                if let Some(label) =
+                                    Self::reasoning_label_for(&model, effort.as_ref())
+                                {
+                                    message.push(' ');
+                                    message.push_str(&label);
+                                }
+                                self.chat_widget.add_info_message(message, /*hint*/ None);
+                            }
+                            Err(err) => {
+                                let error = format_config_error(&err);
+                                tracing::error!(
+                                    error = %error,
+                                    "failed to persist model selection"
+                                );
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to save default model: {error}"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1977,28 +2159,49 @@ impl App {
             }
             AppEvent::PersistServiceTierSelection { service_tier } => {
                 self.refresh_status_line();
-                self.config.service_tier = service_tier.clone();
-                self.sync_active_thread_service_tier_to_cached_session()
-                    .await;
-                let edits = crate::config_update::build_service_tier_selection_edits(
-                    service_tier.as_deref(),
-                );
-                match crate::config_update::write_config_batch(app_server.request_handle(), edits)
-                    .await
-                {
-                    Ok(_) => {
+                match should_persist_model_selection() {
+                    Err(error) => {
+                        tracing::error!(error = %error, "invalid model policy lane");
+                        self.chat_widget.add_error_message(error);
+                    }
+                    Ok(false) => {
+                        self.sync_active_thread_service_tier_to_cached_session()
+                            .await;
                         let message = if let Some(service_tier) = service_tier {
-                            format!("Service tier set to {service_tier}")
+                            format!("Service tier set to {service_tier} for this conversation")
                         } else {
-                            "Service tier cleared".to_string()
+                            "Service tier cleared for this conversation".to_string()
                         };
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
-                    Err(err) => {
-                        tracing::error!(error = %err, "failed to persist service tier selection");
-                        self.chat_widget.add_error_message(format!(
-                            "Failed to save default service tier: {err}"
-                        ));
+                    Ok(true) => {
+                        self.config.service_tier = service_tier.clone();
+                        self.sync_active_thread_service_tier_to_cached_session()
+                            .await;
+                        let edits = crate::config_update::build_service_tier_selection_edits(
+                            service_tier.as_deref(),
+                        );
+                        match crate::config_update::write_config_batch(
+                            app_server.request_handle(),
+                            edits,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let message = if let Some(service_tier) = service_tier {
+                                    format!("Service tier set to {service_tier}")
+                                } else {
+                                    "Service tier cleared".to_string()
+                                };
+                                self.chat_widget.add_info_message(message, /*hint*/ None);
+                            }
+                            Err(err) => {
+                                tracing::error!(error = %err, "failed to persist service tier selection");
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to save default service tier: {err}"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2182,28 +2385,37 @@ impl App {
                 }
             }
             AppEvent::PersistPlanModeReasoningEffort(effort) => {
-                let key_path = "plan_mode_reasoning_effort";
-                let edit = if let Some(effort) = effort {
-                    crate::config_update::replace_config_value(
-                        key_path,
-                        serde_json::json!(effort.to_string()),
-                    )
-                } else {
-                    crate::config_update::clear_config_value(key_path)
-                };
-                if let Err(err) = crate::config_update::write_config_batch(
-                    app_server.request_handle(),
-                    vec![edit],
-                )
-                .await
-                {
-                    tracing::error!(
-                        error = %err,
-                        "failed to persist plan mode reasoning effort"
-                    );
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to save Plan mode reasoning effort: {err}"
-                    ));
+                match should_persist_model_selection() {
+                    Err(error) => {
+                        tracing::error!(error = %error, "invalid model policy lane");
+                        self.chat_widget.add_error_message(error);
+                    }
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let key_path = "plan_mode_reasoning_effort";
+                        let edit = if let Some(effort) = effort {
+                            crate::config_update::replace_config_value(
+                                key_path,
+                                serde_json::json!(effort.to_string()),
+                            )
+                        } else {
+                            crate::config_update::clear_config_value(key_path)
+                        };
+                        if let Err(err) = crate::config_update::write_config_batch(
+                            app_server.request_handle(),
+                            vec![edit],
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                error = %err,
+                                "failed to persist plan mode reasoning effort"
+                            );
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save Plan mode reasoning effort: {err}"
+                            ));
+                        }
+                    }
                 }
             }
             AppEvent::PersistModelMigrationPromptAcknowledged {
@@ -2794,6 +3006,40 @@ impl App {
                     .add_error_message(format!("Failed to delete current thread: {err}"));
                 AppRunControl::Continue
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_policy_tests {
+    use super::should_persist_model_selection_for_lane;
+
+    #[test]
+    fn managed_model_selection_does_not_persist_as_default() {
+        for lane in ["subscription", "api", "spark"] {
+            assert_eq!(
+                should_persist_model_selection_for_lane(Some(lane), false),
+                Ok(false)
+            );
+        }
+        assert_eq!(
+            should_persist_model_selection_for_lane(None, false),
+            Ok(true)
+        );
+        assert_eq!(
+            should_persist_model_selection_for_lane(None, true),
+            Ok(false)
+        );
+        assert!(should_persist_model_selection_for_lane(Some("invalid"), false).is_err());
+    }
+
+    #[test]
+    fn managed_service_tier_selection_does_not_persist_as_default() {
+        for lane in ["subscription", "api", "spark"] {
+            assert_eq!(
+                should_persist_model_selection_for_lane(Some(lane), false),
+                Ok(false)
+            );
         }
     }
 }

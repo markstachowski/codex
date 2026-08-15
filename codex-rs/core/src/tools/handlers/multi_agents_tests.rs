@@ -4601,3 +4601,71 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("permission profile set");
     assert_eq!(config, expected);
 }
+
+#[tokio::test]
+async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
+    let (_session, turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.model = Some("gpt-5.5".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+
+    apply_locked_non_root_inference_defaults(
+        &mut config,
+        crate::config::ModelPolicyLane::Subscription,
+    )
+    .expect("subscription children should be repinned");
+    assert_eq!(config.model.as_deref(), Some(crate::config::SOL_MODEL));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Ultra));
+    assert_eq!(
+        config.service_tier.as_deref(),
+        Some(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+    );
+
+    let error = apply_locked_non_root_inference_defaults(
+        &mut config,
+        crate::config::ModelPolicyLane::Spark,
+    )
+    .expect_err("Spark is root-only");
+    assert!(error.to_string().contains("rejects non-root sessions"));
+}
+
+#[test]
+fn locked_spawn_service_tier_rejects_child_fast_overrides() {
+    let lane = crate::config::ModelPolicyLane::Subscription;
+    assert_eq!(
+        locked_spawn_service_tier_for_lane(
+            lane, /*configured_service_tier*/ None, /*requested_service_tier*/ None,
+        )
+        .expect("a managed child should start Standard"),
+        codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE
+    );
+    locked_spawn_service_tier_for_lane(
+        lane,
+        Some("priority"),
+        /*requested_service_tier*/ None,
+    )
+    .expect_err("role-derived Fast must be rejected for a child");
+    locked_spawn_service_tier_for_lane(
+        lane,
+        /*configured_service_tier*/ None,
+        Some("priority"),
+    )
+    .expect_err("an explicit child Fast request must be rejected");
+
+    // Flex (API-lane root tier since 2026-08-05) follows the same child
+    // contract as Fast: a flex root's children stay on Standard, and neither a
+    // role config nor the child itself can select flex.
+    let api = crate::config::ModelPolicyLane::Api;
+    assert_eq!(
+        locked_spawn_service_tier_for_lane(
+            api, /*configured_service_tier*/ None, /*requested_service_tier*/ None,
+        )
+        .expect("a flex-era API child still starts Standard"),
+        codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE
+    );
+    locked_spawn_service_tier_for_lane(api, Some("flex"), /*requested_service_tier*/ None)
+        .expect_err("role-derived flex must be rejected for a child");
+    locked_spawn_service_tier_for_lane(api, /*configured_service_tier*/ None, Some("flex"))
+        .expect_err("an explicit child flex request must be rejected");
+}

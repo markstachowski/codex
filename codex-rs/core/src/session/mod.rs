@@ -183,6 +183,7 @@ use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
 use crate::config::Constrained;
+use crate::config::ConstraintError;
 use crate::config::ConstraintResult;
 use crate::config::PermissionProfileSnapshot;
 use crate::config::PermissionProfileState;
@@ -322,8 +323,6 @@ use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
-use codex_protocol::protocol::ModelRerouteEvent;
-use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::ModelVerificationEvent;
 use codex_protocol::protocol::NetworkApprovalContext;
@@ -448,11 +447,58 @@ pub(crate) fn resolve_multi_agent_version(
         })
 }
 
+fn apply_locked_new_root_inference_defaults_for_lane(
+    config: &mut Config,
+    conversation_history: &InitialHistory,
+    session_source: &SessionSource,
+    lane: Option<crate::config::ModelPolicyLane>,
+) {
+    let Some(lane) = lane else {
+        return;
+    };
+    let Some((model, effort)) = locked_new_root_inference_defaults_for_lane(
+        conversation_history,
+        session_source,
+        Some(lane),
+    ) else {
+        return;
+    };
+
+    config.model = Some(model.to_string());
+    config.model_reasoning_effort = Some(effort.clone());
+    config.plan_mode_reasoning_effort = Some(effort);
+    config.service_tier = Some(lane.required_root_service_tier().to_string());
+}
+
+fn locked_new_root_inference_defaults_for_lane(
+    conversation_history: &InitialHistory,
+    session_source: &SessionSource,
+    lane: Option<crate::config::ModelPolicyLane>,
+) -> Option<(&'static str, ReasoningEffortConfig)> {
+    if session_source.is_non_root_agent()
+        || matches!(conversation_history, InitialHistory::Resumed(_))
+    {
+        return None;
+    }
+    lane.map(|lane| (lane.required_model(), lane.required_local_effort()))
+}
+
+fn apply_locked_new_root_inference_defaults(
+    config: &mut Config,
+    conversation_history: &InitialHistory,
+    session_source: &SessionSource,
+) -> std::io::Result<()> {
+    apply_locked_new_root_inference_defaults_for_lane(
+        config,
+        conversation_history,
+        session_source,
+        crate::config::locked_model_policy_lane()?,
+    );
+    Ok(())
+}
+
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
-const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
-const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
-
 impl Session {
     /// Spawn and initialize a new session.
     pub(crate) async fn spawn(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
@@ -520,6 +566,21 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
         } = args;
+        if allow_provider_model_fallback
+            && crate::config::locked_model_policy_lane()
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?
+                .is_some()
+        {
+            return Err(CodexErr::InvalidRequest(
+                "locked model lanes reject provider model fallback".to_string(),
+            ));
+        }
+        apply_locked_new_root_inference_defaults(
+            &mut config,
+            &conversation_history,
+            &session_source,
+        )
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -568,16 +629,19 @@ impl Session {
         } else {
             codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
         };
-        if config.model.is_none()
+        let available_models_snapshot = if config.model.is_none()
             || !matches!(
                 refresh_strategy,
                 codex_models_manager::manager::RefreshStrategy::Offline
+            ) {
+            Some(
+                models_manager
+                    .list_models(refresh_strategy, config.http_client_factory())
+                    .await,
             )
-        {
-            let _ = models_manager
-                .list_models(refresh_strategy, config.http_client_factory())
-                .await;
-        }
+        } else {
+            None
+        };
         let model = models_manager
             .get_default_model(
                 &config.model,
@@ -586,13 +650,61 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        // Resume restores the root's own prior selection on any lane that
+        // permits selection; fresh roots still reset to the lane defaults.
+        let locked_lane = crate::config::locked_model_policy_lane()
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        let restored_model_selection = if !session_source.is_non_root_agent()
+            && locked_lane.is_some_and(super::config::ModelPolicyLane::allows_user_model_selection)
+        {
+            conversation_history.get_resumed_model_selection()
+        } else {
+            None
+        };
+        if let (Some((restored_model, restored_effort)), Some(lane)) =
+            (restored_model_selection.as_ref(), locked_lane)
+        {
+            let available_models = match available_models_snapshot.as_ref() {
+                Some(available_models) => available_models.clone(),
+                None => {
+                    models_manager
+                        .list_models(
+                            codex_models_manager::manager::RefreshStrategy::Offline,
+                            config.http_client_factory(),
+                        )
+                        .await
+                }
+            };
+            session::validate_root_model_selection_for_lane(
+                lane,
+                restored_model,
+                restored_effort.as_ref(),
+                &available_models,
+            )
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        }
+        config
+            .validate_locked_session_inference_settings(
+                session_source.is_non_root_agent(),
+                model.as_str(),
+                config.model_reasoning_effort.as_ref(),
+                config.service_tier.as_deref(),
+            )
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+        let effective_model = restored_model_selection
+            .as_ref()
+            .map_or_else(|| model.clone(), |(model, _)| model.clone());
+        let effective_reasoning_effort = restored_model_selection.as_ref().map_or_else(
+            || config.model_reasoning_effort.clone(),
+            |(_, effort)| effort.clone(),
+        );
         let trusted_guardian_reviewer =
             crate::guardian::is_guardian_reviewer_source(&session_source)
                 && !matches!(conversation_history, InitialHistory::Resumed(_));
         if config
             .config_layer_stack
             .requirements()
-            .auto_review_required_for_model(&model)
+            .auto_review_required_for_model(&effective_model)
             && !trusted_guardian_reviewer
         {
             let config = Arc::make_mut(&mut config);
@@ -638,7 +750,7 @@ impl Session {
         // 2. conversation history => session_meta.base_instructions
         // 3. rendered instructions_template for current model
         let model_info = models_manager
-            .get_model_info(model.as_str(), &config.to_models_manager_config())
+            .get_model_info(effective_model.as_str(), &config.to_models_manager_config())
             .await;
         let configured_config = Arc::clone(&config);
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
@@ -664,8 +776,8 @@ impl Session {
         let collaboration_mode = CollaborationMode {
             mode: ModeKind::Default,
             settings: Settings {
-                model: model.clone(),
-                reasoning_effort: config.model_reasoning_effort.clone(),
+                model: effective_model,
+                reasoning_effort: effective_reasoning_effort,
                 developer_instructions: None,
             },
         };
@@ -1568,49 +1680,8 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
-        let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (previous_config, new_config, permission_profile_changed, mcp_inputs_changed) = {
-            let mut state = self.state.lock().await;
-            let updated = match self.apply_session_settings(&state.session_configuration, &updates)
-            {
-                Ok(updated) => updated,
-                Err(err) => {
-                    warn!("rejected session settings update: {err}");
-                    return Err(err);
-                }
-            };
-
-            let previous_config = notify_config_contributors
-                .then(|| self.build_effective_session_config(&state.session_configuration));
-            let previous_permission_profile = state.session_configuration.permission_profile();
-            let updated_permission_profile = updated.permission_profile();
-            let permission_profile_changed =
-                previous_permission_profile != updated_permission_profile;
-            let mcp_inputs_changed =
-                self.mcp_inputs_differ(&state.session_configuration, &updated, &updates);
-            let environment_config = updated.turn_environment_config();
-            if let Some(environments) = &updates.environments {
-                self.services
-                    .turn_environments
-                    .update_selections(&environments.environments, &environment_config);
-            } else if state.session_configuration.turn_environment_config() != environment_config {
-                self.services
-                    .turn_environments
-                    .update_environment_configs(&environment_config);
-            }
-            state.session_configuration = updated;
-            let new_config = notify_config_contributors
-                .then(|| self.build_effective_session_config(&state.session_configuration));
-            if mcp_inputs_changed {
-                self.mark_mcp_runtime_dirty();
-            }
-            (
-                previous_config,
-                new_config,
-                permission_profile_changed,
-                mcp_inputs_changed,
-            )
-        };
+        let (_, mcp_inputs_changed, permission_profile_changed, previous_config, new_config) =
+            self.apply_settings_update(&updates).await?;
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         if permission_profile_changed {
             self.refresh_managed_network_proxy_for_current_permission_profile()
@@ -1622,10 +1693,94 @@ impl Session {
         Ok(())
     }
 
+    async fn apply_settings_update(
+        &self,
+        updates: &SessionSettingsUpdate,
+    ) -> ConstraintResult<(
+        SessionConfiguration,
+        bool,
+        bool,
+        Option<Config>,
+        Option<Config>,
+    )> {
+        let lane = Self::model_policy_lane_for_update(updates)?;
+        self.apply_settings_update_for_lane(updates, lane).await
+    }
+
+    async fn apply_settings_update_for_lane(
+        &self,
+        updates: &SessionSettingsUpdate,
+        lane: Option<crate::config::ModelPolicyLane>,
+    ) -> ConstraintResult<(
+        SessionConfiguration,
+        bool,
+        bool,
+        Option<Config>,
+        Option<Config>,
+    )> {
+        self.validate_model_selection_update_for_lane(updates, lane)
+            .await?;
+        let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
+        let mut state = self.state.lock().await;
+        let updated = match self.apply_session_settings(&state.session_configuration, updates) {
+            Ok(updated) => updated,
+            Err(err) => {
+                warn!("rejected session settings update: {err}");
+                return Err(err);
+            }
+        };
+
+        let previous_config = notify_config_contributors
+            .then(|| self.build_effective_session_config(&state.session_configuration));
+        let previous_permission_profile = state.session_configuration.permission_profile();
+        let updated_permission_profile = updated.permission_profile();
+        let permission_profile_changed = previous_permission_profile != updated_permission_profile;
+        let mcp_inputs_changed =
+            self.mcp_inputs_differ(&state.session_configuration, &updated, updates);
+        // Environment configs refresh whenever they changed, not only when
+        // selections were explicitly updated. This is the shared body every
+        // settings-update path funnels through.
+        let environment_config = updated.turn_environment_config();
+        if let Some(environments) = &updates.environments {
+            self.services
+                .turn_environments
+                .update_selections(&environments.environments, &environment_config);
+        } else if state.session_configuration.turn_environment_config() != environment_config {
+            self.services
+                .turn_environments
+                .update_environment_configs(&environment_config);
+        }
+        if mcp_inputs_changed {
+            self.mark_mcp_runtime_dirty();
+        }
+        state.session_configuration = updated.clone();
+        let new_config = notify_config_contributors
+            .then(|| self.build_effective_session_config(&state.session_configuration));
+
+        Ok((
+            updated,
+            mcp_inputs_changed,
+            permission_profile_changed,
+            previous_config,
+            new_config,
+        ))
+    }
+
     pub(crate) async fn preview_settings(
         &self,
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<ThreadConfigSnapshot> {
+        let lane = Self::model_policy_lane_for_update(updates)?;
+        self.preview_settings_for_lane(updates, lane).await
+    }
+
+    async fn preview_settings_for_lane(
+        &self,
+        updates: &SessionSettingsUpdate,
+        lane: Option<crate::config::ModelPolicyLane>,
+    ) -> ConstraintResult<ThreadConfigSnapshot> {
+        self.validate_model_selection_update_for_lane(updates, lane)
+            .await?;
         let state = self.state.lock().await;
         let configuration = self.apply_session_settings(&state.session_configuration, updates)?;
         let environments = updates.environments.as_ref().map_or_else(
@@ -1633,6 +1788,112 @@ impl Session {
             |environments| environments.environments.clone(),
         );
         Ok(configuration.thread_config_snapshot(environments))
+    }
+
+    fn model_policy_lane_for_update(
+        updates: &SessionSettingsUpdate,
+    ) -> ConstraintResult<Option<crate::config::ModelPolicyLane>> {
+        if updates.collaboration_mode.is_none() && updates.service_tier.is_none() {
+            return Ok(None);
+        }
+        let candidate = updates.collaboration_mode.as_ref().map_or_else(
+            || format!("service_tier={:?}", updates.service_tier),
+            |collaboration_mode| {
+                format!(
+                    "model={}, effort={:?}, service_tier={:?}",
+                    collaboration_mode.model(),
+                    collaboration_mode.reasoning_effort(),
+                    updates.service_tier
+                )
+            },
+        );
+        crate::config::locked_model_policy_lane().map_err(|err| ConstraintError::InvalidValue {
+            field_name: "inference_settings",
+            candidate,
+            allowed: err.to_string(),
+            requirement_source: codex_config::RequirementSource::Unknown,
+        })
+    }
+
+    async fn validate_model_selection_update_for_lane(
+        &self,
+        updates: &SessionSettingsUpdate,
+        lane: Option<crate::config::ModelPolicyLane>,
+    ) -> ConstraintResult<()> {
+        let Some(lane) = lane else {
+            return Ok(());
+        };
+        let is_non_root_agent = {
+            let state = self.state.lock().await;
+            state
+                .session_configuration
+                .session_source
+                .is_non_root_agent()
+        };
+        session::validate_service_tier_update_for_lane(
+            lane,
+            is_non_root_agent,
+            updates.service_tier.as_ref(),
+        )
+        .map_err(|err| ConstraintError::InvalidValue {
+            field_name: "service_tier",
+            candidate: format!("{:?}", updates.service_tier),
+            allowed: err.to_string(),
+            requirement_source: codex_config::RequirementSource::Unknown,
+        })?;
+        let Some(collaboration_mode) = updates.collaboration_mode.as_ref() else {
+            return Ok(());
+        };
+        let (changed, http_client_factory) = {
+            let state = self.state.lock().await;
+            (
+                state.session_configuration.collaboration_mode.model()
+                    != collaboration_mode.model()
+                    || state
+                        .session_configuration
+                        .collaboration_mode
+                        .reasoning_effort()
+                        != collaboration_mode.reasoning_effort(),
+                state
+                    .session_configuration
+                    .original_config_do_not_use
+                    .http_client_factory(),
+            )
+        };
+        if !changed {
+            return Ok(());
+        }
+        // Every selecting lane validates against the picker catalog; passing
+        // None here makes the catalog-backed validator fail closed, which is
+        // how the API lane's first live model switch was rejected (E2E,
+        // 2026-08-05).
+        let available_models = if lane.allows_user_model_selection() && !is_non_root_agent {
+            Some(
+                self.services
+                    .models_manager
+                    .list_models(RefreshStrategy::Offline, http_client_factory)
+                    .await,
+            )
+        } else {
+            None
+        };
+        session::validate_model_selection_update_for_lane(
+            lane,
+            is_non_root_agent,
+            collaboration_mode.model(),
+            collaboration_mode.reasoning_effort().as_ref(),
+            available_models.as_deref(),
+        )
+        .map_err(|err| ConstraintError::InvalidValue {
+            field_name: "collaboration_mode",
+            candidate: format!(
+                "model={}, effort={:?}",
+                collaboration_mode.model(),
+                collaboration_mode.reasoning_effort()
+            ),
+            allowed: err.to_string(),
+            requirement_source: codex_config::RequirementSource::Unknown,
+        })
     }
 
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
@@ -3234,43 +3495,36 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
-    async fn maybe_warn_on_server_model_mismatch(
-        self: &Arc<Self>,
-        turn_context: &Arc<TurnContext>,
-        server_model: String,
-    ) -> bool {
-        let requested_model = turn_context.model_info.slug.clone();
-        let server_model_normalized = server_model.to_ascii_lowercase();
-        let requested_model_normalized = requested_model.to_ascii_lowercase();
-        if server_model_normalized == requested_model_normalized {
+    fn enforce_server_model_match(
+        &self,
+        turn_context: &TurnContext,
+        server_model: &str,
+    ) -> CodexResult<()> {
+        let requested_model = turn_context.model_info.slug.as_str();
+        if server_model.eq_ignore_ascii_case(requested_model) {
             info!("server reported model {server_model} (matches requested model)");
-            return false;
+            return Ok(());
         }
 
-        warn!("server reported model {server_model} while requested model was {requested_model}");
-
-        let warning_message = format!(
-            "Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}"
+        let lane = crate::config::locked_model_policy_lane()
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        let policy_lane = lane.map_or("unlocked", crate::config::ModelPolicyLane::as_str);
+        let session_scope = if turn_context.session_source.is_non_root_agent() {
+            "non-root"
+        } else {
+            "root"
+        };
+        warn!(
+            policy_lane,
+            session_scope,
+            requested_model,
+            server_model,
+            "server model mismatch; refusing silently rerouted output"
         );
 
-        self.send_event(
-            turn_context,
-            EventMsg::ModelReroute(ModelRerouteEvent {
-                from_model: requested_model.clone(),
-                to_model: server_model.clone(),
-                reason: ModelRerouteReason::HighRiskCyberActivity,
-            }),
-        )
-        .await;
-
-        self.send_event(
-            turn_context,
-            EventMsg::Warning(WarningEvent {
-                message: warning_message.clone(),
-            }),
-        )
-        .await;
-        true
+        Err(CodexErr::InvalidRequest(format!(
+            "{policy_lane} {session_scope} model enforcement rejected server-reported model `{server_model}`; requested `{requested_model}`. Refusing to accept output from a silently rerouted model."
+        )))
     }
 
     pub(crate) async fn emit_model_verification(

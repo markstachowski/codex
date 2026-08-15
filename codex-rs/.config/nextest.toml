@@ -25,6 +25,9 @@ max-threads = 4
 [test-groups.core_apply_patch_cli_integration]
 max-threads = 1
 
+[test-groups.core_code_mode_mcp_matrix]
+max-threads = 1
+
 [test-groups.windows_sandbox_legacy_sessions]
 max-threads = 1
 
@@ -39,6 +42,14 @@ slow-timeout = { period = "1m", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'test(approval_matrix_covers_all_modes)'
 slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# Each of these integration tests exercises a 64-case MCP/thread/turn matrix.
+# They complete in about 37 seconds in isolation, but can exceed the global
+# 60-second ceiling under full-workspace fanout.
+filter = 'package(codex-core) & (test(/^suite::code_mode::code_mode_excludes_mcp_servers_using_their_configured_identity$/) | test(/^suite::code_mode::mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure$/))'
+test-group = 'core_code_mode_mcp_matrix'
+slow-timeout = { period = "1m", terminate-after = 2 }
 
 [[profile.default.overrides]]
 filter = 'package(codex-app-server-protocol) & (test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated) | test(generate_ts_with_experimental_api_retains_experimental_entries) | test(generated_ts_optional_nullable_fields_only_in_params) | test(generate_json_filters_experimental_fields_and_methods))'

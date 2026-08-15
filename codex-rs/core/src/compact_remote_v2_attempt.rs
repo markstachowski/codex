@@ -6,6 +6,9 @@ use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
+use crate::compact_remote_policy::remote_compaction_policy_for_lane;
+use crate::config::locked_model_policy_lane;
+use crate::config::managed_background_base_instructions_for_model;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
@@ -68,8 +71,40 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().cloned().collect());
+    let lane = locked_model_policy_lane()?;
+    let remote_policy = remote_compaction_policy_for_lane(
+        turn_context.model_info.slug.clone(),
+        turn_context.reasoning_effort.clone(),
+        turn_context.config.service_tier.clone(),
+        lane,
+    );
+    let model_info = match lane {
+        Some(_) => {
+            sess.services
+                .models_manager
+                .get_model_info(
+                    remote_policy.model(),
+                    &turn_context.config.to_models_manager_config(),
+                )
+                .await
+        }
+        None => turn_context.model_info.clone(),
+    };
+    let session_telemetry = match lane {
+        Some(_) => turn_context
+            .session_telemetry
+            .clone()
+            .with_model(model_info.slug.as_str(), model_info.slug.as_str()),
+        None => turn_context.session_telemetry.clone(),
+    };
+    let base_instructions = managed_background_base_instructions_for_model(
+        base_instructions,
+        &model_info,
+        turn_context.personality,
+        lane,
+    );
     let (mut input, prompt_input_metadata): (Vec<_>, Vec<_>) = history
-        .for_prompt_annotated(&turn_context.model_info.input_modalities)
+        .for_prompt_annotated(&model_info.input_modalities)
         .into_iter()
         .map(|envelope| (envelope.item, envelope.metadata))
         .unzip();
@@ -78,7 +113,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     let prompt = Prompt {
         input,
         tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: true,
+        parallel_tool_calls: remote_policy.parallel_tool_calls(),
         base_instructions,
         output_schema: None,
         output_schema_strict: true,
@@ -91,7 +126,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
     let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
-        "model": turn_context.model_info.slug.as_str(),
+        "model": model_info.slug.as_str(),
         "instructions": prompt.base_instructions.text.as_str(),
         "input": &prompt.input,
         "parallel_tool_calls": prompt.parallel_tool_calls,
@@ -106,6 +141,10 @@ pub(super) async fn run_remote_compact_v2_attempt(
         turn_context.as_ref(),
         client_session,
         &prompt,
+        &model_info,
+        &session_telemetry,
+        remote_policy.reasoning_effort().cloned(),
+        remote_policy.service_tier().map(str::to_owned),
         &responses_metadata,
     )
     .await;

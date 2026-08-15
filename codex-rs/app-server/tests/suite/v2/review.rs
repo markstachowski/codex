@@ -425,7 +425,9 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let started: ThreadStartedNotification =
         serde_json::from_value(notification.params.expect("params must be present"))?;
     assert_eq!(started.thread.id, review_thread_id);
-    assert_eq!(started.thread.session_id, review_thread_id);
+    assert_eq!(started.thread.session_id, thread_id);
+    assert_eq!(started.thread.parent_thread_id, Some(thread_id.clone()));
+    assert_eq!(started.thread.forked_from_id, Some(thread_id.clone()));
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -436,7 +438,10 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     let review_request = &requests[1];
-    assert_eq!(review_request.header("x-openai-subagent"), None);
+    assert_eq!(
+        review_request.header("x-openai-subagent"),
+        Some("collab_spawn".to_string())
+    );
     assert!(review_request.body_contains_text("Colliding user review skill."));
     let user_messages = review_request.message_input_texts("user");
     assert!(user_messages.iter().any(|text| text == &expected_prompt));

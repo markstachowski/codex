@@ -4728,6 +4728,26 @@ async fn wait_for_remote_installed_snapshot_request(server: &MockServer) -> Resu
     Ok(())
 }
 
+#[test]
+fn cached_remote_catalog_plugin_ids_ignores_in_progress_temp_files() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let cache_dir = codex_home.path().join("cache/remote_plugin_catalog");
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::write(cache_dir.join(".tmp-in-progress"), b"{incomplete")?;
+    std::fs::write(
+        cache_dir.join("catalog.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "plugins": [{"id": "plugins~Plugin_test"}],
+        }))?,
+    )?;
+
+    assert_eq!(
+        cached_remote_catalog_plugin_ids(codex_home.path())?,
+        vec!["plugins~Plugin_test".to_string()]
+    );
+    Ok(())
+}
+
 async fn wait_for_cached_remote_catalog_plugin_ids(
     codex_home: &std::path::Path,
     expected_plugin_ids: &[&str],
@@ -4759,6 +4779,12 @@ fn cached_remote_catalog_plugin_ids(codex_home: &std::path::Path) -> Result<Vec<
     let mut plugin_ids = Vec::new();
     for entry in std::fs::read_dir(cache_dir)? {
         let path = entry?.path();
+        // Atomic cache writes stage a temporary file in this directory before
+        // persisting the canonical JSON file. Pollers must ignore that moving,
+        // potentially incomplete entry.
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
         let cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let Some(plugins) = cached_catalog["plugins"].as_array() else {
             continue;
