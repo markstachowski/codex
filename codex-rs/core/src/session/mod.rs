@@ -808,7 +808,8 @@ impl Session {
         // Fresh children restore configured preferences before applying startup defaults.
         let inherits_token_budget = matches!(&conversation_history, InitialHistory::Forked(_))
             && config.token_budget_startup_config.is_some();
-        if !inherits_token_budget {
+        // Guardian owns compaction and must not restore parent activation or model defaults.
+        if !inherits_token_budget && !crate::guardian::is_basic_session_source(&session_source) {
             Arc::make_mut(&mut config)
                 .prepare_token_budget_for_startup()
                 .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;

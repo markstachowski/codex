@@ -80,6 +80,7 @@ impl ReviewerSessionFactory for PreparedSession {
         cancellation: CancellationToken,
     ) -> anyhow::Result<GuardianReviewSession> {
         let mut config = self.config.clone();
+        ensure_guardian_compaction_isolation(&config)?;
         if matches!(kind, GuardianReviewSessionKind::EphemeralForked) {
             config.ephemeral = true;
         }

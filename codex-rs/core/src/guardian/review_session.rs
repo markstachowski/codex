@@ -117,7 +117,6 @@ pub(super) fn guardian_service_tier_for_lane(
     }
 }
 
-
 pub(crate) struct GuardianReviewSessionParams {
     pub(crate) parent_session: Arc<Session>,
     pub(crate) parent_context: GuardianReviewContext,
@@ -865,6 +864,28 @@ async fn load_rollout_items_for_fork(
     let live_thread = session.live_thread_for_persistence("guardian review fork")?;
     let history = live_thread.load_history(/*include_archived*/ true).await?;
     Ok(Some(history.items))
+}
+
+pub(super) fn ensure_guardian_compaction_isolation(config: &Config) -> anyhow::Result<()> {
+    for feature in [Feature::GuardianReuseParentCompaction, Feature::TokenBudget] {
+        if config.features.enabled(feature) {
+            return Err(anyhow::anyhow!(
+                "guardian review session cannot isolate parent authority while `features.{}` is pinned on or re-enabled",
+                feature.key()
+            ));
+        }
+    }
+    if config.compact_prompt.is_some()
+        || config.model_auto_compact_token_limit.is_some()
+        || config.model_auto_compact_token_limit_scope != AutoCompactTokenLimitScope::Total
+        || config.token_budget.is_some()
+        || config.token_budget_startup_config.is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "guardian review session cannot isolate parent authority while parent compaction controls are reintroduced"
+        ));
+    }
+    Ok(())
 }
 
 impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {

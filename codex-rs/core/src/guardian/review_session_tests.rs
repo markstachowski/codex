@@ -8,8 +8,11 @@ use codex_guardian_reviewer::ReviewerSession;
 use codex_guardian_reviewer::ReviewerSessionFactory;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::ModelMessages;
+use codex_protocol::openai_models::ModelTokenBudgetConfig;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Submission;
@@ -334,6 +337,57 @@ async fn spawned_guardian_reuse_key_matches_inherited_instructions() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn managed_guardian_review_ignores_model_owned_token_budget_activation() {
+    let _lane_env = crate::session::tests::ModelPolicyLaneEnvGuard::unset();
+    let mut params = test_review_params().await;
+    let mut guardian_model = params.parent_context.turn().model_info().as_ref().clone();
+    guardian_model
+        .model_messages
+        .as_mut()
+        .expect("Guardian model messages")
+        .token_budget = Some(ModelTokenBudgetConfig {
+        enabled: true,
+        use_history_notes_extension: true,
+        reminder_threshold_tokens: 2_000,
+        reminder_message_template: "{n_remaining} tokens remain.".to_string(),
+        guidance_message: "Preserve state before rollover.".to_string(),
+        auto_compact_fallback_prompt: "Compact the Guardian session.".to_string(),
+        auto_compact_fallback_buffer_tokens: 4_000,
+    });
+    let auth_manager = Arc::clone(&params.parent_session.services.auth_manager);
+    Arc::get_mut(&mut params.parent_session)
+        .expect("parent session should be unique")
+        .services
+        .models_manager = Arc::new(StaticModelsManager::new(
+        Some(auth_manager),
+        ModelsResponse {
+            models: vec![guardian_model],
+        },
+    ));
+    let manager = params.parent_session.guardian_review_session();
+    prewarm_guardian_review_session(
+        params.parent_session,
+        Arc::clone(params.parent_context.turn()),
+    )
+    .await
+    .expect("spawn Guardian session");
+
+    let review_session = manager.trunk().await.expect("Guardian session");
+    let live_config = review_session.session.get_config().await;
+    let actual = (
+        live_config.features.enabled(Feature::TokenBudget),
+        live_config.token_budget.clone(),
+    );
+    manager.shutdown().await;
+    assert_eq!(
+        actual,
+        (false, None),
+        "model-owned token-budget defaults must not bypass Guardian isolation"
+    );
+}
+
+#[tokio::test]
 async fn guardian_review_session_config_change_invalidates_cached_session() {
     let parent_config = crate::config::test_config().await;
     let cached_spawn_config = build_guardian_review_session_config(
@@ -544,7 +598,7 @@ async fn guardian_prompt_cache_key_is_scoped_to_parent_thread() {
 }
 
 #[tokio::test]
-async fn guardian_review_session_compact_scope_change_invalidates_cached_session() {
+async fn guardian_review_session_parent_compaction_controls_do_not_change_cached_session() {
     let parent_config = crate::config::test_config().await;
     let cached_spawn_config = build_guardian_review_session_config(
         &parent_config,
@@ -566,6 +620,11 @@ async fn guardian_review_session_compact_scope_change_invalidates_cached_session
     let mut changed_parent_config = parent_config;
     changed_parent_config.model_auto_compact_token_limit_scope =
         AutoCompactTokenLimitScope::BodyAfterPrefix;
+    changed_parent_config
+        .features
+        .enable(Feature::TokenBudget)
+        .expect("enable token budget on parent config");
+    changed_parent_config.token_budget = Some(crate::config::TokenBudgetConfig::default());
     let next_spawn_config = build_guardian_review_session_config(
         &changed_parent_config,
         /*live_network_config*/ None,
@@ -583,7 +642,75 @@ async fn guardian_review_session_compact_scope_change_invalidates_cached_session
         GuardianContextMode::Legacy,
     );
 
-    assert_ne!(cached_reuse_key, next_reuse_key);
+    assert_eq!(cached_reuse_key, next_reuse_key);
+}
+
+#[tokio::test]
+async fn guardian_review_session_rejects_parent_compaction_reenabled_before_spawn() {
+    let mut params = test_review_params().await;
+    params
+        .spawn_config
+        .features
+        .enable(Feature::GuardianReuseParentCompaction)
+        .expect("Guardian parent-compaction reuse should be configurable after build");
+    params.deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+    let (outcome, _) =
+        run_guardian_review_session(Arc::new(GuardianReviewSessionManager::default()), params)
+            .await;
+    let GuardianReviewSessionOutcome::PromptBuildFailed(error) = outcome else {
+        panic!("Guardian spawn should fail closed, got {outcome:?}");
+    };
+    assert!(
+        error.to_string().contains(
+            "cannot isolate parent authority while `features.guardian_reuse_parent_compaction` is pinned on or re-enabled"
+        ),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn guardian_review_session_rejects_token_budget_reintroduced_before_spawn() {
+    let mut params = test_review_params().await;
+    params.spawn_config.token_budget = Some(crate::config::TokenBudgetConfig::default());
+    params.deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+    let (outcome, _) =
+        run_guardian_review_session(Arc::new(GuardianReviewSessionManager::default()), params)
+            .await;
+    let GuardianReviewSessionOutcome::PromptBuildFailed(error) = outcome else {
+        panic!("Guardian spawn should fail closed, got {outcome:?}");
+    };
+    assert!(
+        error.to_string().contains(
+            "cannot isolate parent authority while parent compaction controls are reintroduced"
+        ),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn guardian_review_session_rejects_token_budget_reenabled_before_spawn() {
+    let mut params = test_review_params().await;
+    params
+        .spawn_config
+        .features
+        .enable(Feature::TokenBudget)
+        .expect("Guardian token budget should be configurable after build");
+    params.deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+    let (outcome, _) =
+        run_guardian_review_session(Arc::new(GuardianReviewSessionManager::default()), params)
+            .await;
+    let GuardianReviewSessionOutcome::PromptBuildFailed(error) = outcome else {
+        panic!("Guardian spawn should fail closed, got {outcome:?}");
+    };
+    assert!(
+        error.to_string().contains(
+            "cannot isolate parent authority while `features.token_budget` is pinned on or re-enabled"
+        ),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[tokio::test]
