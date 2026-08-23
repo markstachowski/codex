@@ -32,6 +32,7 @@ pub(super) async fn make_test_app_with_event_receiver()
         runtime_working_directory_override: None,
         local_settings: crate::local_settings::LocalSettings::from(&config),
         config,
+        model_policy_lane: None,
         state_db: None,
         cli_kv_overrides: Vec::new(),
         harness_overrides: ConfigOverrides::default(),

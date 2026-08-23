@@ -1,4 +1,6 @@
 use super::*;
+use crate::session::step_settings::StepSettingsUpdate;
+use crate::session::turn_context::NewTurnContextOptions;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -132,40 +134,48 @@ async fn divergent_compaction_fixture(base_url: String) -> DivergentCompactionFi
     let mut request_step = StepContext::for_test(Arc::clone(&lifecycle_turn));
     let step = Arc::get_mut(&mut request_step)
         .expect("fresh divergent request Step must be uniquely owned");
-    step.model_info = Arc::new(step_model);
-    step.reasoning_effort = Some(ReasoningEffort::High);
-    step.reasoning_summary = ReasoningSummary::Detailed;
-    step.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    let step_settings = Arc::make_mut(&mut step.settings);
+    step_settings.model_info = Arc::new(step_model);
+    step_settings
+        .selected_mut()
+        .collaboration_mode
+        .settings
+        .reasoning_effort = Some(ReasoningEffort::High);
+    step_settings.reasoning_summary = ReasoningSummary::Detailed;
+    step_settings.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     step.session_telemetry = step_telemetry;
     step.tool_router = tool_router;
 
-    assert_ne!(request_step.model_info.slug, lifecycle_turn.model_info.slug);
     assert_ne!(
-        request_step.reasoning_effort,
-        lifecycle_turn.reasoning_effort
+        request_step.settings.model_info.slug,
+        lifecycle_turn.model_info().slug
     );
     assert_ne!(
-        request_step.reasoning_summary,
-        lifecycle_turn.reasoning_summary
+        request_step.settings.reasoning_effort(),
+        lifecycle_turn.reasoning_effort()
     );
     assert_ne!(
-        request_step.service_tier.as_deref(),
+        request_step.settings.reasoning_summary,
+        lifecycle_turn.reasoning_summary()
+    );
+    assert_ne!(
+        request_step.settings.service_tier.as_deref(),
         lifecycle_turn.config.service_tier.as_deref()
     );
     assert_ne!(
-        request_step.model_info.input_modalities,
-        lifecycle_turn.model_info.input_modalities
+        request_step.settings.model_info.input_modalities,
+        lifecycle_turn.model_info().input_modalities
     );
     assert_ne!(
-        request_step.model_info.truncation_policy,
-        lifecycle_turn.model_info.truncation_policy
+        request_step.settings.model_info.truncation_policy,
+        lifecycle_turn.model_info().truncation_policy
     );
     assert!(lifecycle_turn.dynamic_tools.is_empty());
     assert_eq!(request_step.tool_router.model_visible_specs().len(), 1);
     assert_eq!(
         session.get_base_instructions().await.provenance,
         Some(BaseInstructionsProvenance::Model {
-            model: lifecycle_turn.model_info.slug.clone(),
+            model: lifecycle_turn.model_info().slug.clone(),
         })
     );
 
@@ -313,7 +323,7 @@ async fn local_compaction_request_uses_divergent_step_authority() {
     .expect("unmanaged local compaction must preserve the source Step");
     assert!(Arc::ptr_eq(&attempt.request_step, &fixture.request_step));
     assert_eq!(
-        attempt.request_step.model_info.truncation_policy,
+        attempt.request_step.settings.model_info.truncation_policy,
         TruncationPolicyConfig::bytes(37)
     );
 
@@ -410,12 +420,17 @@ async fn remote_v2_fallback_request_uses_its_own_divergent_step_authority() {
     let primary_step = StepContext::for_test(Arc::clone(&fixture.lifecycle_turn));
     assert!(
         primary_step
+            .settings
             .model_info
             .resolved_context_window()
             .is_some_and(|window| window > 64)
     );
     assert_eq!(
-        fixture.request_step.model_info.resolved_context_window(),
+        fixture
+            .request_step
+            .settings
+            .model_info
+            .resolved_context_window(),
         Some(64)
     );
     let mut client_session = fixture.session.services.model_client.new_session();
@@ -493,22 +508,26 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
             None,
         ),
     };
-    let root_turn = session
+    let (root_turn, _) = session
         .new_turn_with_sub_id(
             format!("{}-priority-compact-root", lane.as_str()),
             crate::session::SessionSettingsUpdate {
-                collaboration_mode: Some(original.with_updates(
-                    Some(root_model.clone()),
-                    Some(Some(root_effort.clone())),
-                    /*developer_instructions*/ None,
-                )),
-                service_tier: root_tier.clone().map(Some),
+                step_settings: StepSettingsUpdate {
+                    collaboration_mode: Some(original.with_updates(
+                        Some(root_model.clone()),
+                        Some(Some(root_effort.clone())),
+                        /*developer_instructions*/ None,
+                    )),
+                    service_tier: root_tier.clone().map(Some),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
+            NewTurnContextOptions::default(),
         )
         .await?;
-    assert_eq!(root_turn.model_info.slug, root_model);
-    assert_eq!(root_turn.reasoning_effort, Some(root_effort));
+    assert_eq!(root_turn.model_info().slug, root_model);
+    assert_eq!(root_turn.reasoning_effort().cloned(), Some(root_effort));
     assert_eq!(root_turn.config.service_tier, root_tier);
     lane_env.restore();
     assert_eq!(locked_model_policy_lane()?, Some(lane));
@@ -522,22 +541,28 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
             .await?;
     let request_step = attempt.request_step;
     request_step.validate_managed_background(lane)?;
-    assert_eq!(request_step.model_info.slug, "gpt-5.6-sol");
-    assert_eq!(request_step.turn.model_info.slug, "gpt-5.6-sol");
+    assert_eq!(request_step.settings.model_info.slug, "gpt-5.6-sol");
+    assert_eq!(request_step.turn.model_info().slug, "gpt-5.6-sol");
     assert_eq!(
         request_step.turn.config.model.as_deref(),
         Some("gpt-5.6-sol")
     );
-    assert_eq!(request_step.reasoning_effort, Some(ReasoningEffort::Ultra));
     assert_eq!(
-        request_step.service_tier.as_deref(),
+        request_step.settings.reasoning_effort().cloned(),
+        Some(ReasoningEffort::Ultra)
+    );
+    assert_eq!(
+        request_step.settings.service_tier.as_deref(),
         Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE)
     );
 
     let base_instructions = managed_background_base_instructions_for_model(
-        session.get_base_instructions().await,
-        &request_step.model_info,
-        request_step.turn.personality,
+        session.get_prompt_base_instructions().await,
+        &request_step.settings.model_info,
+        request_step.turn.personality(),
+        /*omit_update_plan_instructions*/
+        !request_step.turn.config.update_plan_enabled
+            && request_step.turn.config.model_catalog.is_none(),
     );
     let prompt = Prompt {
         base_instructions: base_instructions.clone(),
@@ -591,7 +616,7 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
         ),
         "the materialized compaction request must follow the actual locked process lane"
     );
-    let serialized_instructions = if request_step.model_info.use_responses_lite {
+    let serialized_instructions = if request_step.settings.model_info.use_responses_lite {
         wire["input"]
             .as_array()
             .and_then(|input| {

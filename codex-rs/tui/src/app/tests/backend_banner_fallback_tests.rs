@@ -175,6 +175,82 @@ async fn backend_banner_fallback_updates_task_settings_and_keeps_notice() -> Res
 }
 
 #[tokio::test]
+async fn managed_model_selection_rate_limit_banner_keeps_operator_choice_and_action() -> Result<()>
+{
+    let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
+    let (mut server, requests, proxy) = start_fallback_thread(&mut app).await?;
+    app.model_policy_lane = Some(ModelPolicyLane::Api);
+    app.chat_widget
+        .set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+    app.chat_widget
+        .set_feature_enabled(Feature::FastMode, /*enabled*/ true);
+    app.chat_widget
+        .set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
+    while events.try_recv().is_ok() {}
+    while ops.try_recv().is_ok() {}
+    requests.lock().unwrap().clear();
+
+    let generation = app.rate_limit_hard_stop_generation;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.handle_event(
+        &mut tui,
+        &mut server,
+        AppEvent::RateLimitsLoaded {
+            request_id: 1,
+            origin: RateLimitRefreshOrigin::StatusCommand { request_id: 0 },
+            hard_stop_generation: generation,
+            result: Ok(fallback_response()),
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        (
+            app.chat_widget.current_model(),
+            app.chat_widget.current_reasoning_effort(),
+            app.chat_widget.current_service_tier(),
+        ),
+        (
+            "gpt-5.5",
+            Some(ReasoningEffortConfig::XHigh),
+            Some(ServiceTier::Fast.request_value()),
+        )
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(ops.try_recv().is_err(), "fallback must not replay a turn");
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 72);
+    assert!(rendered.contains("Selected model usage exhausted"));
+    assert!(rendered.contains("View usage"));
+    app.chat_widget.set_model("gpt-5.2");
+    assert!(
+        !render_bottom_popup(&app.chat_widget, /*width*/ 72)
+            .contains("Selected model usage exhausted")
+    );
+    app.chat_widget.set_model("gpt-5.5");
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 72);
+    assert!(rendered.contains("Selected model usage exhausted"));
+    assert!(rendered.contains("View usage"));
+    assert!(requests.lock().unwrap().is_empty());
+
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    let queued = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(queued.iter().any(|event| matches!(event, AppEvent::OpenUrlInBrowser { url } if url == "https://chatgpt.com/codex/settings/usage")));
+    assert!(!queued.iter().any(|event| {
+        match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                lines_to_single_string(&cell.display_lines(/*width*/ 80))
+                    .contains("Automatically switched")
+            }
+            _ => false,
+        }
+    }));
+    server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn backend_banner_fallback_uses_current_task_and_accepted_generation() -> Result<()> {
     let (mut app, _events, _ops) = make_test_app_with_channels().await;
     let (mut server, requests, proxy) = start_fallback_thread(&mut app).await?;

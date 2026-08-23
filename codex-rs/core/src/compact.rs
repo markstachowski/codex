@@ -312,7 +312,7 @@ async fn run_compact_task_inner_impl(
     let mut history = sess.clone_history().await;
     history.record_items(
         &[initial_input_for_turn.into()],
-        request_step.model_info.truncation_policy.into(),
+        request_step.settings.model_info.truncation_policy.into(),
     );
 
     let max_retries = request_step.turn.provider.info().stream_max_retries();
@@ -329,15 +329,18 @@ async fn run_compact_task_inner_impl(
         .await;
     let base_instructions = managed_background_base_instructions_for_model(
         sess.get_prompt_base_instructions().await,
-        &request_step.model_info,
-        request_step.turn.personality,
+        &request_step.settings.model_info,
+        request_step.turn.personality(),
+        /*omit_update_plan_instructions*/
+        !request_step.turn.config.update_plan_enabled
+            && request_step.turn.config.model_catalog.is_none(),
     );
 
     let compaction_response_id = loop {
         // Clone is required because of the loop
         let turn_input = history
             .clone()
-            .for_prompt(&request_step.model_info.input_modalities);
+            .for_prompt(&request_step.settings.model_info.input_modalities);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,

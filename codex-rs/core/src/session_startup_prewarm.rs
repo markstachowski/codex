@@ -364,6 +364,9 @@ async fn prepare_startup_prewarm(
         base_instructions,
         &step_context.settings.model_info,
         startup_turn_context.personality(),
+        /*omit_update_plan_instructions*/
+        !step_context.turn.config.update_plan_enabled
+            && step_context.turn.config.model_catalog.is_none(),
     );
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_tools",

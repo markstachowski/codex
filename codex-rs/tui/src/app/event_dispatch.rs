@@ -1510,7 +1510,12 @@ impl App {
                     let rate_limit_reset_credits = response.rate_limit_reset_credits.clone();
                     let snapshots = if accepted
                     {
-                        self.chat_widget.update_backend_banner(&response);
+                        if self.model_policy_lane.is_some() {
+                            self.chat_widget
+                                .update_backend_banner_without_automatic_fallback(&response);
+                        } else {
+                            self.chat_widget.update_backend_banner(&response);
+                        }
                         self.apply_backend_banner_fallback(app_server).await;
                         app_server_rate_limit_snapshots(response)
                     } else {

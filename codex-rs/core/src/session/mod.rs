@@ -1957,20 +1957,7 @@ impl Session {
         Ok(Some(commit))
     }
 
-    async fn apply_settings_update(
-        &self,
-        updates: &SessionSettingsUpdate,
-    ) -> ConstraintResult<(
-        SessionConfiguration,
-        bool,
-        bool,
-        Option<Config>,
-        Option<Config>,
-    )> {
-        let lane = Self::model_policy_lane_for_update(updates)?;
-        self.apply_settings_update_for_lane(updates, lane).await
-    }
-
+    #[cfg(test)]
     async fn apply_settings_update_for_lane(
         &self,
         updates: &SessionSettingsUpdate,
@@ -2057,20 +2044,26 @@ impl Session {
     fn model_policy_lane_for_update(
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<Option<crate::config::ModelPolicyLane>> {
-        if updates.collaboration_mode.is_none() && updates.service_tier.is_none() {
+        if updates.step_settings.collaboration_mode.is_none()
+            && updates.step_settings.service_tier.is_none()
+        {
             return Ok(None);
         }
-        let candidate = updates.collaboration_mode.as_ref().map_or_else(
-            || format!("service_tier={:?}", updates.service_tier),
-            |collaboration_mode| {
-                format!(
-                    "model={}, effort={:?}, service_tier={:?}",
-                    collaboration_mode.model(),
-                    collaboration_mode.reasoning_effort(),
-                    updates.service_tier
-                )
-            },
-        );
+        let candidate = updates
+            .step_settings
+            .collaboration_mode
+            .as_ref()
+            .map_or_else(
+                || format!("service_tier={:?}", updates.step_settings.service_tier),
+                |collaboration_mode| {
+                    format!(
+                        "model={}, effort={:?}, service_tier={:?}",
+                        collaboration_mode.model(),
+                        collaboration_mode.reasoning_effort(),
+                        updates.step_settings.service_tier
+                    )
+                },
+            );
         crate::config::locked_model_policy_lane().map_err(|err| ConstraintError::InvalidValue {
             field_name: "inference_settings",
             candidate,
@@ -2097,24 +2090,29 @@ impl Session {
         session::validate_service_tier_update_for_lane(
             lane,
             is_non_root_agent,
-            updates.service_tier.as_ref(),
+            updates.step_settings.service_tier.as_ref(),
         )
         .map_err(|err| ConstraintError::InvalidValue {
             field_name: "service_tier",
-            candidate: format!("{:?}", updates.service_tier),
+            candidate: format!("{:?}", updates.step_settings.service_tier),
             allowed: err.to_string(),
             requirement_source: codex_config::RequirementSource::Unknown,
         })?;
-        let Some(collaboration_mode) = updates.collaboration_mode.as_ref() else {
+        let Some(collaboration_mode) = updates.step_settings.collaboration_mode.as_ref() else {
             return Ok(());
         };
         let (changed, http_client_factory) = {
             let state = self.state.lock().await;
             (
-                state.session_configuration.collaboration_mode.model()
+                state
+                    .session_configuration
+                    .step_settings
+                    .collaboration_mode
+                    .model()
                     != collaboration_mode.model()
                     || state
                         .session_configuration
+                        .step_settings
                         .collaboration_mode
                         .reasoning_effort()
                         != collaboration_mode.reasoning_effort(),

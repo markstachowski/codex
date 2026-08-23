@@ -21,6 +21,7 @@ use crate::function_tool::FunctionCallError;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
 use crate::plugins::plugins_manager_for_config;
 use crate::session::step_context::StepContext;
+use crate::session::turn_context::NewTurnContextOptions;
 use crate::shell::default_user_shell;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::test_support::models_manager_with_provider;
@@ -5206,6 +5207,73 @@ impl Drop for ModelPolicyLaneEnvGuard {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn managed_model_policy_rejects_turn_recovery_before_sampling() {
+    let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    // SAFETY: this test is serialized and `_lane_guard` restores the prior value.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        )
+    };
+
+    let error = turn_input::handle_recovery(
+        &session,
+        ThreadSettingsOverrides::default(),
+        codex_protocol::turn_input::TurnStartOptions::default(),
+        "unissued-recovery-turn".to_string(),
+    )
+    .await
+    .expect_err("managed recovery must fail before starting a task");
+
+    assert!(matches!(
+        error.details(),
+        codex_protocol::error::CodexErrorDetails::UnsupportedOperation(_)
+    ));
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn managed_model_policy_rejects_turn_suspension_before_mutation() {
+    let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    // SAFETY: this test is serialized and `_lane_guard` restores the prior value.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        )
+    };
+
+    let error =
+        turn_suspension::suspend_turn_and_shutdown(&session, "managed-suspension".to_string())
+            .await
+            .expect_err("managed suspension must fail before changing the active turn");
+
+    assert!(matches!(
+        error.details(),
+        codex_protocol::error::CodexErrorDetails::UnsupportedOperation(_)
+    ));
+    assert!(session.active_turn.lock().await.is_some());
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn session_configuration_apply_runs_environment_validation_before_locked_inference() {
     let _lane_guard = ModelPolicyLaneEnvGuard::unset();
     let (session, _turn_context) = make_session_and_context().await;
@@ -5234,17 +5302,20 @@ async fn session_configuration_apply_runs_environment_validation_before_locked_i
         },
     );
     invalid_environment.config = EnvironmentConfigState::Ready(invalid_environment_config);
-    let invalid_collaboration_mode = configuration.collaboration_mode.with_updates(
+    let invalid_collaboration_mode = configuration.step_settings.collaboration_mode.with_updates(
         Some(crate::config::SPARK_MODEL.to_string()),
         Some(Some(ReasoningEffortConfig::High)),
         /*developer_instructions*/ None,
     );
     let updates = SessionSettingsUpdate {
+        step_settings: StepSettingsUpdate {
+            collaboration_mode: Some(invalid_collaboration_mode),
+            ..Default::default()
+        },
         environments: Some(TurnEnvironmentSelections::new(
             configuration.legacy_fallback_cwd.clone(),
             vec![invalid_environment],
         )),
-        collaboration_mode: Some(invalid_collaboration_mode),
         ..Default::default()
     };
 
@@ -5294,11 +5365,14 @@ async fn shared_settings_apply_path_rejects_unlisted_subscription_model() {
 
     let original = session.collaboration_mode().await;
     let invalid_model_update = SessionSettingsUpdate {
-        collaboration_mode: Some(original.with_updates(
-            Some("not-in-the-picker".to_string()),
-            Some(Some(ReasoningEffortConfig::High)),
-            /*developer_instructions*/ None,
-        )),
+        step_settings: StepSettingsUpdate {
+            collaboration_mode: Some(original.with_updates(
+                Some("not-in-the-picker".to_string()),
+                Some(Some(ReasoningEffortConfig::High)),
+                /*developer_instructions*/ None,
+            )),
+            ..Default::default()
+        },
         ..Default::default()
     };
     for result in [
@@ -5324,7 +5398,11 @@ async fn shared_settings_apply_path_rejects_unlisted_subscription_model() {
     }
 
     let error = session
-        .new_turn_with_sub_id("invalid-model".to_string(), invalid_model_update)
+        .new_turn_with_sub_id(
+            "invalid-model".to_string(),
+            invalid_model_update,
+            NewTurnContextOptions::default(),
+        )
         .await
         .expect_err("new_turn_with_sub_id must use the shared settings validator");
     assert!(error.to_string().contains("not present and visible"));
@@ -5346,7 +5424,10 @@ async fn managed_root_fast_settings_preview_apply_round_trip() {
 
     for service_tier in ["priority", SERVICE_TIER_DEFAULT_REQUEST_VALUE] {
         let update = SessionSettingsUpdate {
-            service_tier: Some(Some(service_tier.to_string())),
+            step_settings: StepSettingsUpdate {
+                service_tier: Some(Some(service_tier.to_string())),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let preview = subscription_session
@@ -5391,7 +5472,10 @@ async fn managed_root_fast_settings_preview_apply_round_trip() {
     };
     for service_tier in ["priority", SERVICE_TIER_DEFAULT_REQUEST_VALUE] {
         let update = SessionSettingsUpdate {
-            service_tier: Some(Some(service_tier.to_string())),
+            step_settings: StepSettingsUpdate {
+                service_tier: Some(Some(service_tier.to_string())),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let preview = api_session

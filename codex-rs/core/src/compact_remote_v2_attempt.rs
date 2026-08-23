@@ -44,6 +44,9 @@ pub(super) async fn run_remote_compact_v2_attempt(
         sess.get_prompt_base_instructions().await,
         &request_step.settings.model_info,
         request_step.turn.personality(),
+        /*omit_update_plan_instructions*/
+        !request_step.turn.config.update_plan_enabled
+            && request_step.turn.config.model_catalog.is_none(),
     );
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(

@@ -1,4 +1,6 @@
 use super::*;
+use crate::session::step_settings::StepSettingsUpdate;
+use crate::session::turn_context::NewTurnContextOptions;
 use anyhow::Result;
 use codex_api::ResponseCreateWsRequest;
 use codex_config::Constrained;
@@ -54,19 +56,23 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                 None,
             ),
         };
-        let root_turn = session
+        let (root_turn, _) = session
             .new_turn_with_sub_id(
                 format!("{}-root", lane.as_str()),
                 crate::session::SessionSettingsUpdate {
-                    collaboration_mode: Some(original.with_updates(
-                        Some(root_model.clone()),
-                        Some(Some(root_effort.clone())),
-                        /*developer_instructions*/ None,
-                    )),
-                    reasoning_summary: Some(ReasoningSummary::Detailed),
-                    service_tier: root_tier.clone().map(Some),
+                    step_settings: StepSettingsUpdate {
+                        collaboration_mode: Some(original.with_updates(
+                            Some(root_model.clone()),
+                            Some(Some(root_effort.clone())),
+                            /*developer_instructions*/ None,
+                        )),
+                        reasoning_summary: Some(ReasoningSummary::Detailed),
+                        service_tier: root_tier.clone().map(Some),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
+                NewTurnContextOptions::default(),
             )
             .await?;
         let root_metadata = session
@@ -201,12 +207,17 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                 root_derived_instructions,
                 &managed_step.settings.model_info,
                 managed_step.turn.personality(),
+                /*omit_update_plan_instructions*/
+                !managed_step.turn.config.update_plan_enabled
+                    && managed_step.turn.config.model_catalog.is_none(),
             ),
             BaseInstructions {
-                text: managed_step
-                    .settings
-                    .model_info
-                    .get_model_instructions(managed_step.turn.personality()),
+                text: crate::context::without_update_plan_instructions(
+                    &managed_step
+                        .settings
+                        .model_info
+                        .get_model_instructions(managed_step.turn.personality()),
+                ),
                 provenance: Some(BaseInstructionsProvenance::Model {
                     model: "gpt-5.6-sol".to_string(),
                 }),
@@ -221,6 +232,9 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                 custom_instructions.clone(),
                 &managed_step.settings.model_info,
                 managed_step.turn.personality(),
+                /*omit_update_plan_instructions*/
+                !managed_step.turn.config.update_plan_enabled
+                    && managed_step.turn.config.model_catalog.is_none(),
             ),
             custom_instructions
         );
@@ -357,18 +371,22 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
             None,
         ),
     };
-    let root_turn = session
+    let (root_turn, _) = session
         .new_turn_with_sub_id(
             format!("{}-priority-root", lane.as_str()),
             crate::session::SessionSettingsUpdate {
-                collaboration_mode: Some(original.with_updates(
-                    Some(root_model.clone()),
-                    Some(Some(root_effort.clone())),
-                    /*developer_instructions*/ None,
-                )),
-                service_tier: root_tier.clone().map(Some),
+                step_settings: StepSettingsUpdate {
+                    collaboration_mode: Some(original.with_updates(
+                        Some(root_model.clone()),
+                        Some(Some(root_effort.clone())),
+                        /*developer_instructions*/ None,
+                    )),
+                    service_tier: root_tier.clone().map(Some),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
+            NewTurnContextOptions::default(),
         )
         .await?;
     assert_eq!(root_turn.model_info().slug, root_model);

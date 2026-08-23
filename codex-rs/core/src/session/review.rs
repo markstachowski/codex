@@ -112,7 +112,7 @@ pub(super) async fn spawn_review_thread(
         )
     };
     per_turn_config.model_reasoning_effort = reasoning_effort.clone();
-    per_turn_config.service_tier = service_tier;
+    per_turn_config.service_tier = service_tier.clone();
 
     // Apply the locked review contract after every upstream compatibility and
     // parent-inheritance transform. The early resolution selects authoritative
@@ -146,17 +146,9 @@ pub(super) async fn spawn_review_thread(
     let model = final_model;
 
     let model_info = review_model_info.clone();
-    let session_telemetry = parent_turn_context
-        .session_telemetry
-        .clone()
-        .with_model(model.as_str(), review_model_info.slug.as_str());
     let auth_manager_for_context = auth_manager.clone();
     let provider_for_context = provider.clone();
-    let session_telemetry_for_context = session_telemetry.clone();
     let reasoning_effort = per_turn_config.model_reasoning_effort.clone();
-    let reasoning_summary = per_turn_config
-        .model_reasoning_summary
-        .unwrap_or(model_info.default_reasoning_summary);
 
     let auto_review_enabled = crate::guardian::routes_approval_policy_to_guardian(
         per_turn_config.permissions.approval_policy.value(),

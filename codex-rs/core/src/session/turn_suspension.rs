@@ -10,10 +10,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
+pub(super) fn ensure_turn_handoff_supported(operation: &str) -> CodexResult<()> {
+    let lane = crate::config::locked_model_policy_lane()
+        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+    if let Some(lane) = lane {
+        return Err(CodexErr::UnsupportedOperation(format!(
+            "{operation} is disabled in the managed {} policy lane until turn handoff has durable, single-use authority",
+            lane.as_str()
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn suspend_turn_and_shutdown(
     session: &Arc<Session>,
     submission_id: String,
 ) -> CodexResult<SuspendTurnOutcome> {
+    ensure_turn_handoff_supported("turn suspension")?;
+
     {
         let active = session.active_turn.lock().await;
         let Some(task) = active.as_ref().and_then(|turn| turn.task.as_ref()) else {

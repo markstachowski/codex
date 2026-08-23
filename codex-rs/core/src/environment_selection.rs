@@ -1006,7 +1006,10 @@ impl TurnEnvironmentSnapshot {
         let selection = match self.environments.first() {
             Some(TurnEnvironmentState::Ready(environment)) => &environment.selection,
             Some(TurnEnvironmentState::Starting(environment)) => &environment.selection,
-            None => return Vec::new(),
+            // Failed environments remain unavailable for execution. Contribute
+            // no workspace roots (fail closed) rather
+            // than widening scope from an environment that never came up.
+            Some(TurnEnvironmentState::Failed { .. }) | None => return Vec::new(),
         };
         ThreadEnvironments::primary_workspace_roots_for(std::slice::from_ref(selection))
     }

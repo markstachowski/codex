@@ -780,8 +780,13 @@ impl Session {
         per_turn_config.service_tier = session_configuration.step_settings.service_tier.clone();
         per_turn_config.personality = session_configuration.step_settings.personality;
         per_turn_config.approvals_reviewer = session_configuration.step_settings.approvals_reviewer;
-        per_turn_config.model =
-            Some(session_configuration.step_settings.collaboration_mode.model().to_string());
+        per_turn_config.model = Some(
+            session_configuration
+                .step_settings
+                .collaboration_mode
+                .model()
+                .to_string(),
+        );
         session_configuration
             .apply_permission_profile_to_permissions(&mut per_turn_config.permissions);
         let permission_profile = session_configuration.permission_profile();
@@ -1041,7 +1046,7 @@ impl Session {
         self.new_turn_context_from_configuration(
             sub_id,
             session_configuration,
-            /*final_output_json_schema*/ None,
+            NewTurnContextOptions::default(),
             TurnMultiAgentRuntime::Preview,
             GitEnrichmentPolicy::Skip,
             TurnContextConstructionPolicy::ManagedBackground,
@@ -1097,11 +1102,12 @@ impl Session {
             .as_ref()
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
-        let per_turn_config = self.build_per_turn_config(&session_configuration, cwd.clone());
-        let network_permission_profile = primary_turn_environment
-            .map(TurnEnvironment::permission_profile)
-            .cloned()
-            .unwrap_or_else(|| session_configuration.permission_profile());
+        let workspace_roots = turn_environments.primary_workspace_roots();
+        let per_turn_config = self.build_per_turn_config_with_workspace_roots(
+            &session_configuration,
+            cwd.clone(),
+            workspace_roots,
+        );
         let model_info = session_configuration
             .step_settings
             .resolve_model_info(
@@ -1186,7 +1192,7 @@ impl Session {
         );
         if construction_policy == TurnContextConstructionPolicy::ManagedBackground {
             Arc::make_mut(&mut turn_context.config).service_tier =
-                session_configuration.service_tier.clone();
+                session_configuration.step_settings.service_tier.clone();
         }
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
         turn_context.extension_data.insert(trusted_plugin_roots);
@@ -1280,7 +1286,7 @@ impl Session {
             .await;
         self.services
             .thread_extension_data
-            .insert_if(guardian_parent.model_info.as_ref().clone(), |existing| {
+            .insert_if(guardian_parent.model_info().as_ref().clone(), |existing| {
                 existing.is_none()
             });
         let Some(lane) = lane else {
@@ -1289,26 +1295,34 @@ impl Session {
                 guardian_parent,
             };
         };
-        let resolved_summary = guardian_parent.reasoning_summary;
+        let resolved_summary = guardian_parent.reasoning_summary();
         let inference = crate::config::managed_background_inference_for_lane(
-            guardian_parent.model_info.slug.clone(),
-            session_configuration.collaboration_mode.reasoning_effort(),
-            session_configuration.service_tier.clone(),
+            guardian_parent.model_info().slug.clone(),
+            session_configuration
+                .step_settings
+                .collaboration_mode
+                .reasoning_effort(),
+            session_configuration.step_settings.service_tier.clone(),
             Some(lane),
         );
-        session_configuration.collaboration_mode =
-            session_configuration.collaboration_mode.with_updates(
-                Some(inference.model),
-                Some(inference.reasoning_effort),
-                /*developer_instructions*/ None,
-            );
-        session_configuration.model_reasoning_summary = Some(resolved_summary);
-        session_configuration.service_tier = inference.service_tier;
+        Arc::make_mut(&mut session_configuration.step_settings).collaboration_mode =
+            session_configuration
+                .step_settings
+                .collaboration_mode
+                .with_updates(
+                    Some(inference.model),
+                    Some(inference.reasoning_effort),
+                    /*developer_instructions*/ None,
+                );
+        Arc::make_mut(&mut session_configuration.step_settings).reasoning_summary =
+            Some(resolved_summary);
+        Arc::make_mut(&mut session_configuration.step_settings).service_tier =
+            inference.service_tier;
         let request = self
             .new_turn_context_from_configuration(
                 sub_id,
                 session_configuration,
-                /*final_output_json_schema*/ None,
+                NewTurnContextOptions::default(),
                 TurnMultiAgentRuntime::Preview,
                 GitEnrichmentPolicy::Skip,
                 TurnContextConstructionPolicy::ManagedBackground,
@@ -1328,13 +1342,18 @@ impl Session {
     ) -> Arc<TurnContext> {
         let mut session_configuration = self.default_turn_configuration().await;
         session_configuration.provider = source.provider.clone();
-        session_configuration.collaboration_mode = source.collaboration_mode();
-        session_configuration.model_reasoning_summary = Some(source.reasoning_summary);
-        session_configuration.service_tier = source.config.service_tier.clone();
+        Arc::make_mut(&mut session_configuration.step_settings).collaboration_mode =
+            source.collaboration_mode();
+        Arc::make_mut(&mut session_configuration.step_settings).reasoning_summary =
+            Some(source.reasoning_summary());
+        Arc::make_mut(&mut session_configuration.step_settings).service_tier =
+            source.config.service_tier.clone();
         session_configuration.developer_instructions = source.developer_instructions.clone();
-        session_configuration.personality = source.personality;
-        session_configuration.approval_policy = source.config.permissions.approval_policy.clone();
-        session_configuration.approvals_reviewer = source.config.approvals_reviewer;
+        Arc::make_mut(&mut session_configuration.step_settings).personality = source.personality();
+        Arc::make_mut(&mut session_configuration.step_settings).approval_policy =
+            source.config.permissions.approval_policy.clone();
+        Arc::make_mut(&mut session_configuration.step_settings).approvals_reviewer =
+            source.config.approvals_reviewer;
         session_configuration.permission_profile_state =
             source.config.permissions.permission_profile_state().clone();
         session_configuration.allow_login_shell = source.config.permissions.allow_login_shell;
@@ -1355,18 +1374,22 @@ impl Session {
         session_configuration.dynamic_tools = source.dynamic_tools.clone();
 
         let inference = crate::config::managed_background_inference_for_lane(
-            source.model_info.slug.clone(),
-            source.reasoning_effort.clone(),
+            source.model_info().slug.clone(),
+            source.reasoning_effort().cloned(),
             source.config.service_tier.clone(),
             Some(lane),
         );
-        session_configuration.collaboration_mode =
-            session_configuration.collaboration_mode.with_updates(
-                Some(inference.model),
-                Some(inference.reasoning_effort),
-                /*developer_instructions*/ None,
-            );
-        session_configuration.service_tier = inference.service_tier;
+        Arc::make_mut(&mut session_configuration.step_settings).collaboration_mode =
+            session_configuration
+                .step_settings
+                .collaboration_mode
+                .with_updates(
+                    Some(inference.model),
+                    Some(inference.reasoning_effort),
+                    /*developer_instructions*/ None,
+                );
+        Arc::make_mut(&mut session_configuration.step_settings).service_tier =
+            inference.service_tier;
         self.new_managed_background_turn_from_configuration(
             source.sub_id.clone(),
             session_configuration,

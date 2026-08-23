@@ -524,21 +524,24 @@ impl SessionConfiguration {
             &updates.step_settings,
             &next_configuration.step_settings_constraints(next_environments),
         )?);
-        let reasoning_effort = next_configuration.collaboration_mode.reasoning_effort();
+        let reasoning_effort = next_configuration
+            .step_settings
+            .collaboration_mode
+            .reasoning_effort();
         next_configuration
             .original_config_do_not_use
             .validate_locked_session_inference_settings(
                 next_configuration.session_source.is_non_root_agent(),
-                next_configuration.collaboration_mode.model(),
+                next_configuration.step_settings.collaboration_mode.model(),
                 reasoning_effort.as_ref(),
-                next_configuration.service_tier.as_deref(),
+                next_configuration.step_settings.service_tier.as_deref(),
             )
             .map_err(|err| ConstraintError::InvalidValue {
                 field_name: "collaboration_mode",
                 candidate: format!(
                     "model={}, effort={reasoning_effort:?}, service_tier={:?}",
-                    next_configuration.collaboration_mode.model(),
-                    next_configuration.service_tier
+                    next_configuration.step_settings.collaboration_mode.model(),
+                    next_configuration.step_settings.service_tier
                 ),
                 allowed: err.to_string(),
                 requirement_source: codex_config::RequirementSource::Unknown,

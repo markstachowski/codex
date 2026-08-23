@@ -653,6 +653,7 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
         inherited,
         &model_info,
         /*personality*/ None,
+        /*omit_update_plan_instructions*/ false,
     );
     assert_eq!(
         managed.text,
@@ -682,9 +683,57 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
         },
     ] {
         assert_eq!(
-            managed_background_base_instructions_for_model(inherited.clone(), &model_info, None,),
+            managed_background_base_instructions_for_model(
+                inherited.clone(),
+                &model_info,
+                /*personality*/ None,
+                /*omit_update_plan_instructions*/ true,
+            ),
             inherited,
             "non-stale instructions must remain byte-for-byte unchanged"
+        );
+    }
+}
+
+#[test]
+fn locked_model_policy_background_switch_does_not_restore_disabled_update_plan_guidance() {
+    let mut model_info = bundled_models_response()
+        .expect("bundled models should parse")
+        .models
+        .into_iter()
+        .find(|model| model.slug == SOL_MODEL)
+        .expect("bundled catalog should contain Sol");
+    let target_instructions =
+        "Sol instructions.\n\n## `update_plan`\nUse the checklist.\n\n## Work\nProceed.\n";
+    model_info
+        .model_messages
+        .as_mut()
+        .expect("Sol should provide model messages")
+        .instructions_template = Some(target_instructions.to_string());
+
+    let inherited = BaseInstructions {
+        text: "Spark instructions with checklist guidance already removed.\n".to_string(),
+        provenance: Some(BaseInstructionsProvenance::Model {
+            model: SPARK_MODEL.to_string(),
+        }),
+    };
+    let filtered_instructions =
+        crate::context::without_update_plan_instructions(target_instructions);
+    for (update_plan_enabled, custom_model_catalog, expected) in [
+        (false, false, filtered_instructions.as_str()),
+        (true, false, target_instructions),
+        (false, true, target_instructions),
+    ] {
+        let managed = managed_background_base_instructions_for_model(
+            inherited.clone(),
+            &model_info,
+            /*personality*/ None,
+            /*omit_update_plan_instructions*/ !update_plan_enabled && !custom_model_catalog,
+        );
+
+        assert_eq!(
+            managed.text, expected,
+            "Spark-to-Sol substitution must follow update_plan_enabled={update_plan_enabled} custom_model_catalog={custom_model_catalog}"
         );
     }
 }

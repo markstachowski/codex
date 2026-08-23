@@ -717,6 +717,7 @@ See the Codex keymap documentation for supported actions and examples."
             workspace_command_runner: Some(workspace_command_runner),
             config,
             local_settings,
+            model_policy_lane: crate::legacy_core::config::locked_model_policy_lane()?,
             launch_cwd,
             runtime_working_directory_override: None,
             state_db,

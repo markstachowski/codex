@@ -140,6 +140,7 @@ fn test_model_client_with_thread_id(
 
 fn policy_test_request(model: &str, effort: ReasoningEffort) -> ResponsesApiRequest {
     ResponsesApiRequest {
+        access_programs: None,
         model: model.to_string(),
         instructions: String::new(),
         input: Vec::new(),

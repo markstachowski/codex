@@ -542,15 +542,24 @@ pub fn managed_background_inference_for_lane(
 /// Keep explicit or inherited instructions intact, but never send catalog instructions for a
 /// different model. This applies to managed background work and to unlocked previous-model or
 /// fallback compaction attempts alike.
+/// Regenerated target-model instructions obey the explicit omission flag so request prompt
+/// filtering remains intact across a model switch.
 pub(crate) fn managed_background_base_instructions_for_model(
     inherited: BaseInstructions,
     model_info: &ModelInfo,
     personality: Option<Personality>,
+    omit_update_plan_instructions: bool,
 ) -> BaseInstructions {
     match inherited.provenance.as_ref() {
         Some(BaseInstructionsProvenance::Model { model }) if model != &model_info.slug => {
+            let instructions = model_info.get_model_instructions(personality);
+            let instructions = if omit_update_plan_instructions {
+                crate::context::without_update_plan_instructions(&instructions)
+            } else {
+                instructions
+            };
             BaseInstructions {
-                text: model_info.get_model_instructions(personality),
+                text: instructions,
                 provenance: Some(BaseInstructionsProvenance::Model {
                     model: model_info.slug.clone(),
                 }),

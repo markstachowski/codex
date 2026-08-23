@@ -104,6 +104,11 @@ impl ResolvedStepSettings {
         self.selected.approvals_reviewer
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_mut(&mut self) -> &mut StepSettings {
+        Arc::make_mut(&mut self.selected)
+    }
+
     /// Retained inputs for constructing a snapshot against different model metadata.
     pub(super) fn selected(&self) -> &StepSettings {
         &self.selected

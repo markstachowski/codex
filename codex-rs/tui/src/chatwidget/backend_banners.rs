@@ -53,6 +53,7 @@ pub(super) struct BackendBannerState {
     ordinary_usage_recovered: bool,
     banner: Option<BackendBanner>,
     presented: Option<BackendBanner>,
+    automatic_fallback_enabled: bool,
     shown: bool,
     dismissed: bool,
     picker_dismissed: Arc<AtomicBool>,
@@ -80,6 +81,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn backend_banner_fallback(&mut self) -> Option<AutomaticModelSwitch> {
+        if !self.backend_banner_state.automatic_fallback_enabled {
+            return None;
+        }
         if !self.has_chatgpt_account || !self.requires_openai_auth {
             return None;
         }
@@ -309,6 +313,21 @@ impl ChatWidget {
     }
 
     pub(crate) fn update_backend_banner(&mut self, response: &GetAccountRateLimitsResponse) {
+        self.update_backend_banner_with_automatic_fallback(response, /*enabled*/ true);
+    }
+
+    pub(crate) fn update_backend_banner_without_automatic_fallback(
+        &mut self,
+        response: &GetAccountRateLimitsResponse,
+    ) {
+        self.update_backend_banner_with_automatic_fallback(response, /*enabled*/ false);
+    }
+
+    fn update_backend_banner_with_automatic_fallback(
+        &mut self,
+        response: &GetAccountRateLimitsResponse,
+        enabled: bool,
+    ) {
         self.observe_backend_banner_view();
         self.backend_banner_state.account_id = response.account_id.clone();
         // Only a full, identity-validated backend read can authorize recovery. Unknown banners
@@ -350,6 +369,7 @@ impl ChatWidget {
                         == new.blocked_model_slug.as_ref().or(new.model_slug.as_ref())
                     && old.fallback_model_slugs == new.fallback_model_slugs
             });
+        self.backend_banner_state.automatic_fallback_enabled = enabled;
         self.backend_banner_state.banner = banner;
         if !same_occurrence {
             self.backend_banner_state.shown = false;
@@ -393,7 +413,10 @@ impl ChatWidget {
             }
             // Explicit fallback payloads describe the selected replacement, not a pending switch.
             let matches_selected_model = match banner.blocked_model_slug.as_deref() {
-                Some(blocked) if !banner.fallback_model_slugs.is_empty() => {
+                Some(blocked)
+                    if self.backend_banner_state.automatic_fallback_enabled
+                        && !banner.fallback_model_slugs.is_empty() =>
+                {
                     blocked != self.current_model()
                         && banner
                             .fallback_model_slugs
