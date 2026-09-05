@@ -1229,13 +1229,25 @@ impl ThreadRequestProcessor {
                 /*inherited_service_tier*/ None,
                 Some(lane),
             );
-            model = Some(settings.model);
+            model = (app_server_client_name.as_deref() == Some("codex-tui")
+                && !settings.model.is_empty())
+            .then_some(settings.model);
             model_provider = None;
             allow_provider_model_fallback = false;
             service_tier = Some(settings.service_tier);
             sandbox = Some(SandboxMode::ReadOnly);
             permissions = None;
-            config = Some(managed_temporary_structured_config());
+            let mut restricted_config = managed_temporary_structured_config();
+            if app_server_client_name.as_deref() == Some("codex-tui") {
+                for key in ["model_reasoning_effort", "plan_mode_reasoning_effort"] {
+                    if let Some(value) = config.as_ref().and_then(|config| config.get(key))
+                        && !value.is_null()
+                    {
+                        restricted_config.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+            config = Some(restricted_config);
             environments = Some(Vec::new());
         } else if let Some(lane) = managed_background_lane {
             let settings = codex_core::config::managed_background_inference_for_lane(
@@ -1244,7 +1256,7 @@ impl ThreadRequestProcessor {
                 /*inherited_service_tier*/ None,
                 Some(lane),
             );
-            model = Some(settings.model);
+            model = None;
             model_provider = None;
             allow_provider_model_fallback = false;
             service_tier = Some(settings.service_tier);
@@ -4025,8 +4037,8 @@ impl ThreadRequestProcessor {
             )
             .await;
 
-        let clear_reasoning_effort = !has_explicit_model_resume_override
-            && matches!(restored_reasoning_effort, Some(None));
+        let clear_reasoning_effort =
+            !has_explicit_model_resume_override && matches!(restored_reasoning_effort, Some(None));
         let config_state = ResumeConfigState {
             history_cwd: history_cwd.clone(),
             workspace_roots: typesafe_overrides.workspace_roots.clone(),
@@ -5007,7 +5019,7 @@ impl ThreadRequestProcessor {
                 /*inherited_service_tier*/ None,
                 lane,
             );
-            model = Some(settings.model);
+            model = None;
             model_provider = None;
             service_tier = Some(settings.service_tier);
             sandbox = Some(SandboxMode::ReadOnly);

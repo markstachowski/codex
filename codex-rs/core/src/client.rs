@@ -211,7 +211,10 @@ pub(crate) fn reasoning_effort_for_request(
 ) -> ReasoningEffortConfig {
     if matches!(lane, Some(ModelPolicyLane::Api))
         && effort == ReasoningEffortConfig::Ultra
-        && model_info.supported_reasoning_levels.iter().any(|preset| preset.effort == ReasoningEffortConfig::Max)
+        && model_info
+            .supported_reasoning_levels
+            .iter()
+            .any(|preset| preset.effort == ReasoningEffortConfig::Max)
     {
         return ReasoningEffortConfig::Max;
     }

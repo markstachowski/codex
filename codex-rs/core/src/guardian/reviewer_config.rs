@@ -16,8 +16,8 @@ use crate::config::locked_model_policy_lane;
 
 use super::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 use super::prompt::guardian_policy_prompt_with_config_and_template;
-use super::review_session::guardian_service_tier_for_lane;
 use super::review_session::ensure_guardian_compaction_isolation;
+use super::review_session::guardian_service_tier_for_lane;
 
 /// Builds the existing read-only reviewer configuration with its policy and live network rules.
 pub fn build_guardian_review_session_config(

@@ -1102,7 +1102,7 @@ max_concurrent_threads_per_session = 6
             .account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     let user_config_home = codex_home.path().to_string_lossy().into_owned();
 
     let mut mcp = TestAppServer::builder()
@@ -1139,8 +1139,7 @@ max_concurrent_threads_per_session = 6
 }
 
 #[tokio::test]
-async fn managed_temporary_structured_thread_bootstraps_as_internal_astra_ultra_in_all_lanes()
--> Result<()> {
+async fn managed_temporary_structured_thread_preserves_inference_in_all_lanes() -> Result<()> {
     fn root_config(
         model: &str,
         effort: &str,
@@ -1222,7 +1221,7 @@ expose_spawn_agent_model_overrides = false
             codex_home.path().join("config.toml"),
             root_config(model, effort, login, reasoning_mode, multi_agent),
         )?;
-        write_models_cache(codex_home.path())?;
+        write_models_cache(codex_home.path()).await?;
         let user_config_home = codex_home.path().to_string_lossy().into_owned();
         let mut mcp = TestAppServer::builder()
             .with_codex_home(codex_home.path())
@@ -1263,14 +1262,14 @@ expose_spawn_agent_model_overrides = false
                 response.active_permission_profile,
             ),
             (
-                ASTRA_MODEL,
+                "gpt-5.6-luna",
                 "openai",
-                Some(ReasoningEffort::Ultra),
+                Some(ReasoningEffort::Low),
                 Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
                 true,
                 codex_app_server_protocol::SessionSource::Unknown,
-                Some(ASTRA_MODEL),
-                Some(ReasoningEffort::Ultra),
+                Some("gpt-5.6-luna"),
+                Some(ReasoningEffort::Low),
                 None,
             ),
             "managed temporary bootstrap contract for {lane}",

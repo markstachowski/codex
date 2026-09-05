@@ -569,20 +569,14 @@ pub(super) fn managed_background_config(
     config: Option<HashMap<String, serde_json::Value>>,
 ) -> HashMap<String, serde_json::Value> {
     let mut config = config.unwrap_or_default();
-    config.extend([
-        (
-            "model_reasoning_effort".to_string(),
-            serde_json::json!("ultra"),
-        ),
-        (
-            "plan_mode_reasoning_effort".to_string(),
-            serde_json::json!("ultra"),
-        ),
-        (
-            "service_tier".to_string(),
-            serde_json::json!(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE),
-        ),
-    ]);
+    // Signed automatic requests are not operator inference selections. Resolve
+    // model and effort from user configuration, not the app's metadata hints.
+    config.remove("model_reasoning_effort");
+    config.remove("plan_mode_reasoning_effort");
+    config.insert(
+        "service_tier".to_string(),
+        serde_json::json!(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+    );
     config
 }
 

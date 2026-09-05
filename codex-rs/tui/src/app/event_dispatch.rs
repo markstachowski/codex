@@ -1853,6 +1853,13 @@ impl App {
                 effort,
                 scope,
             } => {
+                if self
+                    .active_thread_model_setting_update_params(model.clone())
+                    .is_some_and(|params| params.permissions.is_some())
+                    && self.reject_pending_permission_change()
+                {
+                    return Ok(AppRunControl::Continue);
+                }
                 let model_changed = self.chat_widget.current_model() != model
                     || self.chat_widget.current_collaboration_mode().model() != model;
                 let desired_mode = self

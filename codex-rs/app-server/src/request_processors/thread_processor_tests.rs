@@ -805,6 +805,7 @@ mod thread_processor_behavior_tests {
                             permission_profile: PermissionProfile::read_only(),
                             active_permission_profile: None,
                             cwd: "/tmp".try_into().expect("absolute test path"),
+                            runtime_workspace_roots: None,
                             reasoning_effort: Some(reasoning_effort.clone()),
                             reasoning_summary: None,
                             personality: None,
@@ -816,6 +817,7 @@ mod thread_processor_behavior_tests {
                                     developer_instructions: None,
                                 },
                             },
+                            disabled_plugin_ids: Vec::new(),
                         },
                     },
                 ),
@@ -865,22 +867,20 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn persisted_model_restore_policy_includes_both_selectable_lanes() {
+    fn persisted_model_restore_policy_includes_all_selectable_lanes() {
         use codex_core::config::ModelPolicyLane;
 
         for lane in [
             /*lane*/ None,
             Some(ModelPolicyLane::Subscription),
             Some(ModelPolicyLane::Api),
+            Some(ModelPolicyLane::Spark),
         ] {
             assert!(
                 should_restore_persisted_model_selection(lane),
                 "lane: {lane:?}"
             );
         }
-        assert!(!should_restore_persisted_model_selection(Some(
-            ModelPolicyLane::Spark
-        )));
     }
 
     #[test]

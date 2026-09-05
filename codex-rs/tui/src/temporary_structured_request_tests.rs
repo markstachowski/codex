@@ -4,7 +4,6 @@ use super::collect_structured_response;
 use super::start_temporary_thread;
 use super::structured_request_timeout_for_lane;
 use super::temporary_inference_settings_for_lane;
-use crate::legacy_core::config::ASTRA_MODEL;
 use crate::legacy_core::config::ModelPolicyLane;
 use crate::test_support::PathBufExt;
 use codex_app_server_protocol::ItemCompletedNotification;
@@ -63,7 +62,7 @@ fn turn_completed_notification(turn_id: &str, status: TurnStatus) -> ServerNotif
 }
 
 #[test]
-fn managed_temporary_threads_use_astra_ultra() {
+fn managed_temporary_threads_preserve_model_and_effort() {
     for lane in [
         ModelPolicyLane::Subscription,
         ModelPolicyLane::Api,
@@ -76,8 +75,8 @@ fn managed_temporary_threads_use_astra_ultra() {
         );
         assert_eq!(
             (settings.model, settings.reasoning_effort),
-            (ASTRA_MODEL.to_string(), Some(ReasoningEffort::Ultra)),
-            "managed automatic inference must be pinned for {lane:?}",
+            ("gpt-5.6-luna".to_string(), Some(ReasoningEffort::Low)),
+            "managed automatic inference preserves operator choices for {lane:?}",
         );
     }
 
@@ -105,7 +104,9 @@ async fn preserves_custom_permissions_and_disables_required_mcp_servers() -> col
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
-            "default_permissions = \"title-restricted\"\n\n\
+            "model_reasoning_effort = \"low\"\n\
+             plan_mode_reasoning_effort = \"high\"\n\
+             default_permissions = \"title-restricted\"\n\n\
              [permissions.title-restricted.filesystem]\n\
              \":root\" = \"read\"\n\
              {denied_key} = \"deny\"\n\n\
@@ -136,11 +137,15 @@ async fn preserves_custom_permissions_and_disables_required_mcp_servers() -> col
             response.active_permission_profile.map(|profile| profile.id),
             response.model_provider,
             response.thread.ephemeral,
+            response.model,
+            response.reasoning_effort,
         ),
         (
             Some("title-restricted".to_string()),
             config.model_provider_id,
             true,
+            "gpt-5.2".to_string(),
+            Some(ReasoningEffort::Low),
         )
     );
 

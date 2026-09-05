@@ -44,6 +44,19 @@ fn tui_temporary_structured_classifier_requires_exact_restricted_shape() {
         Some(ModelPolicyLane::Spark)
     );
 
+    let mut inherited_effort = params.clone();
+    let config = inherited_effort.config.as_mut().expect("restricted config");
+    config.insert("model_reasoning_effort".to_string(), json!(null));
+    config.insert("plan_mode_reasoning_effort".to_string(), json!(null));
+    assert_eq!(
+        managed_temporary_structured_lane_for_policy(
+            &inherited_effort,
+            Some(CODEX_TUI_CLIENT_NAME),
+            Some(ModelPolicyLane::Subscription),
+        ),
+        Some(ModelPolicyLane::Subscription)
+    );
+
     let mut durable = params.clone();
     durable.ephemeral = Some(false);
     assert_eq!(

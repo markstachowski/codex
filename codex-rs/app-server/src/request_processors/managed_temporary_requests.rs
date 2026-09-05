@@ -148,14 +148,6 @@ pub(super) fn managed_temporary_structured_config() -> HashMap<String, serde_jso
         ("web_search".to_string(), serde_json::json!("disabled")),
         ("mcp_servers".to_string(), serde_json::json!({})),
         (
-            "model_reasoning_effort".to_string(),
-            serde_json::json!("ultra"),
-        ),
-        (
-            "plan_mode_reasoning_effort".to_string(),
-            serde_json::json!("ultra"),
-        ),
-        (
             "service_tier".to_string(),
             serde_json::json!(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE),
         ),

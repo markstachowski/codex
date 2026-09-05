@@ -813,6 +813,7 @@ fn model_settings_item(model: &str, effort: ReasoningEffortConfig) -> RolloutIte
                 permission_profile: PermissionProfile::read_only(),
                 active_permission_profile: None,
                 cwd: "/tmp".try_into().expect("absolute test path"),
+                runtime_workspace_roots: None,
                 reasoning_effort: Some(effort.clone()),
                 reasoning_summary: None,
                 personality: None,
@@ -824,6 +825,7 @@ fn model_settings_item(model: &str, effort: ReasoningEffortConfig) -> RolloutIte
                         developer_instructions: None,
                     },
                 },
+                disabled_plugin_ids: Vec::new(),
             },
         },
     ))

@@ -32,7 +32,7 @@ const ASTRA_MODEL: &str = "gpt-6-astra";
 const SOL_MODEL: &str = "gpt-5.6-sol";
 const DESKTOP_CLIENT_NAME: &str = "Codex Desktop";
 
-fn write_managed_subscription_home(codex_home: &Path) -> Result<()> {
+async fn write_managed_subscription_home(codex_home: &Path) -> Result<()> {
     std::fs::write(
         codex_home.join("config.toml"),
         format!(
@@ -70,7 +70,7 @@ expose_spawn_agent_model_overrides = false
             .account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-    write_models_cache(codex_home)?;
+    write_models_cache(codex_home).await?;
     Ok(())
 }
 
@@ -125,9 +125,9 @@ async fn assert_turn_override_is_rejected(
 }
 
 #[tokio::test]
-async fn signed_desktop_turn_inherits_astra_ultra_standard_and_rejects_overrides() -> Result<()> {
+async fn signed_desktop_turn_honors_inference_but_rejects_priority() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_managed_subscription_home(codex_home.path())?;
+    write_managed_subscription_home(codex_home.path()).await?;
     let proxy = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_uri = format!("http://{}", proxy.local_addr()?);
     let user_config_home = codex_home.path().to_string_lossy().into_owned();
@@ -171,24 +171,6 @@ async fn signed_desktop_turn_inherits_astra_ultra_standard_and_rejects_overrides
         /*expected_active_permission_profile*/ None,
     );
 
-    let mut model_override = signed_turn(&started.thread.id);
-    model_override.model = Some(SOL_MODEL.to_string());
-    assert_turn_override_is_rejected(
-        &mut server,
-        model_override,
-        "subscription model policy rejected model `gpt-5.6-sol`; required `gpt-6-astra`",
-    )
-    .await?;
-
-    let mut effort_override = signed_turn(&started.thread.id);
-    effort_override.effort = Some(ReasoningEffort::High);
-    assert_turn_override_is_rejected(
-        &mut server,
-        effort_override,
-        "subscription model policy rejected local reasoning effort Some(High); required ultra",
-    )
-    .await?;
-
     let mut tier_override = signed_turn(&started.thread.id);
     tier_override.service_tier = Some(Some("priority".to_string()));
     assert_turn_override_is_rejected(
@@ -198,9 +180,10 @@ async fn signed_desktop_turn_inherits_astra_ultra_standard_and_rejects_overrides
     )
     .await?;
 
-    let turn_id = server
-        .send_turn_start_request(signed_turn(&started.thread.id))
-        .await?;
+    let mut selected_turn = signed_turn(&started.thread.id);
+    selected_turn.model = Some(SOL_MODEL.to_string());
+    selected_turn.effort = Some(ReasoningEffort::High);
+    let turn_id = server.send_turn_start_request(selected_turn).await?;
     let TurnStartResponse { turn } =
         timeout(DEFAULT_READ_TIMEOUT, server.read_response(turn_id)).await??;
     assert_eq!(turn.status, TurnStatus::InProgress);

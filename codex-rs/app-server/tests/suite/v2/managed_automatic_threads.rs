@@ -236,7 +236,7 @@ fn desktop_metadata_fork(
     }
 }
 
-fn write_managed_subscription_home(codex_home: &Path) -> Result<()> {
+async fn write_managed_subscription_home(codex_home: &Path) -> Result<()> {
     let stdio_server = toml::Value::String(stdio_server_bin()?);
     std::fs::write(
         codex_home.join("config.toml"),
@@ -279,7 +279,7 @@ startup_timeout_sec = 5
             .account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-    write_models_cache(codex_home)?;
+    write_models_cache(codex_home).await?;
     Ok(())
 }
 
@@ -396,7 +396,7 @@ async fn assert_hidden_start_is_not_classified(
     Ok(())
 }
 
-async fn assert_background_rejects_root_choices(
+async fn assert_background_accepts_inference_but_rejects_priority(
     server: &mut TestAppServer,
     thread_id: &str,
 ) -> Result<()> {
@@ -407,18 +407,9 @@ async fn assert_background_rejects_root_choices(
             ..Default::default()
         })
         .await?;
-    let model_error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        server.read_stream_until_error_message(RequestId::Integer(model_update_id)),
-    )
-    .await??;
-    assert!(
-        model_error.error.message.contains(
-            "subscription model policy rejected model `gpt-5.6-sol`; required `gpt-6-astra`",
-        ),
-        "unexpected model override error: {}",
-        model_error.error.message,
-    );
+    let model_response: Value =
+        timeout(DEFAULT_READ_TIMEOUT, server.read_response(model_update_id)).await??;
+    assert_eq!(model_response, json!({}));
 
     let effort_update_id = server
         .send_thread_settings_update_request(ThreadSettingsUpdateParams {
@@ -427,18 +418,9 @@ async fn assert_background_rejects_root_choices(
             ..Default::default()
         })
         .await?;
-    let effort_error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        server.read_stream_until_error_message(RequestId::Integer(effort_update_id)),
-    )
-    .await??;
-    assert!(
-        effort_error.error.message.contains(
-            "subscription model policy rejected local reasoning effort Some(High); required ultra",
-        ),
-        "unexpected effort override error: {}",
-        effort_error.error.message,
-    );
+    let effort_response: Value =
+        timeout(DEFAULT_READ_TIMEOUT, server.read_response(effort_update_id)).await??;
+    assert_eq!(effort_response, json!({}));
 
     let tier_update_id = server
         .send_thread_settings_update_request(ThreadSettingsUpdateParams {
@@ -464,9 +446,54 @@ async fn assert_background_rejects_root_choices(
 }
 
 #[tokio::test]
+async fn signed_desktop_background_inherits_operator_model_and_effort() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_managed_subscription_home(codex_home.path()).await?;
+    let config_path = codex_home.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    config["model"] = SOL_MODEL.into();
+    config["model_reasoning_effort"] = "high".into();
+    config["plan_mode_reasoning_effort"] = "high".into();
+    std::fs::write(config_path, toml::to_string(&config)?)?;
+    let (mut server, _proxy) = managed_desktop_server(codex_home.path()).await?;
+    let request_id = server
+        .send_thread_start_request(desktop_common_start(
+            "thread_summary",
+            LUNA_MODEL,
+            metadata_config(/*allow_start_statsig_feature*/ true),
+            Some(codex_home.path()),
+        ))
+        .await?;
+    let response: ThreadStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, server.read_response(request_id)).await??;
+    assert_eq!(
+        (
+            response.model.as_str(),
+            response.reasoning_effort,
+            response.service_tier.as_deref(),
+            response.sandbox,
+        ),
+        (
+            SOL_MODEL,
+            Some(ReasoningEffort::High),
+            Some(STANDARD_SERVICE_TIER),
+            SandboxPolicy::ReadOnly {
+                network_access: false
+            },
+        ),
+    );
+    assert!(
+        timeout(DEFAULT_READ_TIMEOUT, server.shutdown_gracefully())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn signed_desktop_no_tool_starts_normalize_to_astra_ultra_standard() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_managed_subscription_home(codex_home.path())?;
+    write_managed_subscription_home(codex_home.path()).await?;
     let (mut server, _proxy) = managed_desktop_server(codex_home.path()).await?;
 
     for include_start_statsig_feature in [true, false] {
@@ -509,7 +536,11 @@ async fn signed_desktop_no_tool_starts_normalize_to_astra_ultra_standard() -> Re
             assert_managed_start(
                 &response, source, /*expected_active_permission_profile*/ None,
             );
-            assert_background_rejects_root_choices(&mut server, &response.thread.id).await?;
+            assert_background_accepts_inference_but_rejects_priority(
+                &mut server,
+                &response.thread.id,
+            )
+            .await?;
         }
     }
 
@@ -547,7 +578,7 @@ async fn signed_desktop_no_tool_starts_normalize_to_astra_ultra_standard() -> Re
 #[tokio::test]
 async fn signed_desktop_metadata_fork_normalizes_to_no_tool_background_policy() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_managed_subscription_home(codex_home.path())?;
+    write_managed_subscription_home(codex_home.path()).await?;
     let source_thread_id = create_fake_rollout(
         codex_home.path(),
         "2026-09-04T12-00-00",
@@ -629,7 +660,8 @@ async fn signed_desktop_metadata_fork_normalizes_to_no_tool_background_policy() 
             true,
         ),
     );
-    assert_background_rejects_root_choices(&mut server, &response.thread.id).await?;
+    assert_background_accepts_inference_but_rejects_priority(&mut server, &response.thread.id)
+        .await?;
 
     assert!(
         timeout(DEFAULT_READ_TIMEOUT, server.shutdown_gracefully())
@@ -642,7 +674,7 @@ async fn signed_desktop_metadata_fork_normalizes_to_no_tool_background_policy() 
 #[tokio::test]
 async fn signed_desktop_ambient_keeps_read_only_tools_but_not_root_choices() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_managed_subscription_home(codex_home.path())?;
+    write_managed_subscription_home(codex_home.path()).await?;
     let (mut server, _proxy) = managed_desktop_server(codex_home.path()).await?;
 
     for include_start_statsig_feature in [true, false] {
@@ -686,7 +718,11 @@ async fn signed_desktop_ambient_keeps_read_only_tools_but_not_root_choices() -> 
                     Some(&json!({ "readOnlyHint": true })),
                 ),
             );
-            assert_background_rejects_root_choices(&mut server, &response.thread.id).await?;
+            assert_background_accepts_inference_but_rejects_priority(
+                &mut server,
+                &response.thread.id,
+            )
+            .await?;
         }
     }
 
@@ -701,7 +737,7 @@ async fn signed_desktop_ambient_keeps_read_only_tools_but_not_root_choices() -> 
 #[tokio::test]
 async fn visible_root_keeps_picker_choice_while_explicit_fallback_stays_rejected() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_managed_subscription_home(codex_home.path())?;
+    write_managed_subscription_home(codex_home.path()).await?;
     let (mut desktop, _proxy) = managed_desktop_server(codex_home.path()).await?;
 
     let request_id = desktop

@@ -400,7 +400,7 @@ max_concurrent_threads_per_session = 6
             .account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     let proxy = RejectingHttpsProxy::start().await?;
     let user_config_home = codex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()

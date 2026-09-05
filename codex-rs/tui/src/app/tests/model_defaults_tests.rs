@@ -76,9 +76,9 @@ async fn model_default_saves_report_server_outcomes_and_target_server_profile() 
             AppEvent::PersistServiceTierSelection {
                 service_tier: Some(ServiceTier::Fast.request_value().into()),
             },
-            AppEvent::ApplyAdvancedReasoning {
+            AppEvent::PersistModelSelection {
                 model: "gpt-5.5".into(),
-                effort: ReasoningEffortConfig::Ultra,
+                effort: Some(ReasoningEffortConfig::Medium),
             },
         ] {
             Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;

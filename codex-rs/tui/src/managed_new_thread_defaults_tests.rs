@@ -168,7 +168,7 @@ async fn explicit_launch_overrides_take_precedence() {
 }
 
 #[tokio::test]
-async fn spark_lane_resets_new_threads_to_required_defaults() {
+async fn spark_lane_honors_new_thread_model_defaults() {
     for lane in [ModelPolicyLane::Spark] {
         let mut actual = test_config().await;
         actual.model = Some("previous-conversation-model".to_string());
@@ -176,9 +176,8 @@ async fn spark_lane_resets_new_threads_to_required_defaults() {
         actual.plan_mode_reasoning_effort = Some(ReasoningEffort::Low);
         actual.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         let mut expected = actual.clone();
-        expected.model = Some(lane.required_model().to_string());
-        expected.model_reasoning_effort = Some(lane.required_local_effort());
-        expected.plan_mode_reasoning_effort = Some(lane.required_local_effort());
+        expected.model = defaults().model;
+        expected.model_reasoning_effort = defaults().model_reasoning_effort;
         expected.service_tier = Some(lane.required_root_service_tier().to_string());
 
         apply_managed_new_thread_defaults_for_lane(
@@ -296,6 +295,48 @@ async fn selectable_lanes_reset_tier_without_desktop_defaults() {
 }
 
 #[tokio::test]
+async fn selectable_lanes_preserve_selected_profile_inference() {
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        home.path().join("work.config.toml"),
+        "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"high\"\nservice_tier = \"flex\"\n",
+    )
+    .expect("profile");
+    let profile_config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            user_config_path: Some(home.path().join("work.config.toml").abs()),
+            user_config_profile: Some("work".parse().expect("profile name")),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await
+        .expect("config");
+
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        let mut actual = profile_config.clone();
+        let mut expected = profile_config.clone();
+        expected.service_tier = Some(lane.required_root_service_tier().to_string());
+        apply_managed_new_thread_defaults_for_lane(
+            &mut actual,
+            Some(&NewThreadModelDefaults {
+                model: Some("gpt-5.5".to_string()),
+                model_reasoning_effort: Some(ReasoningEffort::Ultra),
+                service_tier: Some("fast".to_string()),
+            }),
+            &[],
+            &ConfigOverrides::default(),
+            Some(lane),
+        );
+        assert_eq!(actual, expected, "lane: {}", lane.as_str());
+    }
+}
+
+#[tokio::test]
 async fn selected_custom_provider_and_service_tier_preserve_the_profile_model() {
     let home = tempfile::tempdir().expect("tempdir");
     std::fs::write(home.path().join("config.toml"), "model = \"base-model\"\n")
@@ -325,7 +366,8 @@ async fn selected_custom_provider_and_service_tier_preserve_the_profile_model() 
         Some(&defaults()),
         &[],
         &ConfigOverrides::default(),
-    );
+    )
+    .expect("apply managed defaults");
 
     assert_eq!(actual, expected);
 }
@@ -385,7 +427,8 @@ async fn managed_defaults_win_when_a_project_setting_shadows_the_selected_profil
         Some(&defaults()),
         &[],
         &ConfigOverrides::default(),
-    );
+    )
+    .expect("apply managed defaults");
 
     assert_eq!(actual, expected);
 }

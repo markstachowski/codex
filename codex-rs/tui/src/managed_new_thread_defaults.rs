@@ -62,13 +62,8 @@ fn apply_managed_new_thread_defaults_for_lane(
     harness_overrides: &ConfigOverrides,
     lane: Option<ModelPolicyLane>,
 ) {
-    // The dedicated Spark launcher keeps exact root inference settings.
-    // Selectable subscription and API roots use the same config/CLI/app-server
-    // precedence as upstream, then return to Standard for each conversation.
-    if let Some(lane @ ModelPolicyLane::Spark) = lane {
-        apply_lane_new_root_defaults(config, lane);
-        return;
-    }
+    // Every lane preserves operator config/CLI/app-server inference choices,
+    // then returns to Standard for each new conversation.
     if let Some(lane) = lane {
         config.service_tier = Some(lane.required_root_service_tier().to_string());
     }

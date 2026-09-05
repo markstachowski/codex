@@ -90,14 +90,17 @@ pub(crate) async fn start_temporary_thread(
         .map(|key| ((*key).to_string(), false.into()))
         .collect::<std::collections::HashMap<_, _>>();
     config.insert("web_search".to_string(), "disabled".into());
-    if let Some(reasoning_effort) = settings.reasoning_effort {
+    if lane.is_some() {
+        // The managed classifier requires these keys and strips null values
+        // before loading config so they inherit the operator's preferences.
+        // Ordinary config overrides reject null, so unmanaged requests omit them.
         config.insert(
             "model_reasoning_effort".to_string(),
-            serde_json::to_value(reasoning_effort.clone())?,
+            serde_json::to_value(settings.reasoning_effort.clone())?,
         );
         config.insert(
             "plan_mode_reasoning_effort".to_string(),
-            serde_json::to_value(reasoning_effort)?,
+            serde_json::to_value(settings.reasoning_effort)?,
         );
     }
     if let Some(service_tier) = settings.service_tier {

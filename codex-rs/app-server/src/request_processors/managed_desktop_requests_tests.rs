@@ -412,10 +412,6 @@ fn desktop_ambient_background_preserves_only_bounded_disable_config() {
             normalized.get("plan_mode_reasoning_effort"),
             normalized.get("service_tier"),
         ),
-        (
-            Some(&json!("ultra")),
-            Some(&json!("ultra")),
-            Some(&json!("default")),
-        )
+        (None, None, Some(&json!("default")))
     );
 }
