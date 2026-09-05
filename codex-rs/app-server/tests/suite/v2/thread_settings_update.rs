@@ -1,9 +1,11 @@
 use anyhow::Context;
 use anyhow::Result;
+use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::RequestId;
@@ -22,6 +24,8 @@ use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::config::MODEL_POLICY_LANE_ENV;
 use codex_core::test_support::all_model_presets;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -36,6 +40,8 @@ use serde_json::json;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
+
+use super::managed_automatic_test_support::RejectingHttpsProxy;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -350,6 +356,144 @@ async fn thread_settings_update_null_service_tier_uses_default() -> Result<()> {
                     .is_some_and(|object| !object.contains_key("service_tier"))
         }),
         "future turn did not clear service tier: {request_bodies:#?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_sparse_model_updates_validate_the_complete_picker_pair() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"
+model = "gpt-6-astra"
+review_model = "gpt-6-astra"
+model_provider = "openai"
+forced_login_method = "chatgpt"
+chatgpt_base_url = "https://chatgpt.com/backend-api"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+
+[agents]
+enabled = true
+
+[features]
+fast_mode = true
+multi_agent = true
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = false
+tool_namespace = "agents"
+expose_spawn_agent_model_overrides = false
+max_concurrent_threads_per_session = 6
+"#,
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .plan_type("plus")
+            .chatgpt_account_id("account-123")
+            .account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    write_models_cache(codex_home.path())?;
+    let proxy = RejectingHttpsProxy::start().await?;
+    let user_config_home = codex_home.path().to_string_lossy().into_owned();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            (MODEL_POLICY_LANE_ENV, Some("subscription")),
+            ("CDX_USER_CONFIG_HOMES", Some(user_config_home.as_str())),
+            ("OPENAI_API_KEY", None),
+            ("CODEX_API_KEY", None),
+            ("HTTPS_PROXY", Some(proxy.uri())),
+            ("https_proxy", Some(proxy.uri())),
+            ("NO_PROXY", Some("")),
+            ("no_proxy", Some("")),
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(start_id)).await??;
+
+    let request_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            model: Some("not-in-the-picker".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        error.error.message.contains("not present and visible"),
+        "unexpected unknown-model error: {}",
+        error.error.message
+    );
+
+    send_thread_settings_update(
+        &mut mcp,
+        ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let updated = read_thread_settings_updated(&mut mcp).await?;
+    assert_eq!(
+        (
+            updated.thread_settings.model.as_str(),
+            updated.thread_settings.effort,
+        ),
+        ("gpt-6-astra", Some(ReasoningEffort::High))
+    );
+
+    send_thread_settings_update(
+        &mut mcp,
+        ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let updated = read_thread_settings_updated(&mut mcp).await?;
+    assert_eq!(
+        (
+            updated.thread_settings.model.as_str(),
+            updated.thread_settings.effort,
+        ),
+        ("gpt-5.5", Some(ReasoningEffort::High))
+    );
+
+    let request_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread.id,
+            effort: Some(ReasoningEffort::Ultra),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        error.error.message.contains("does not advertise"),
+        "unexpected effort-only error: {}",
+        error.error.message
     );
     Ok(())
 }

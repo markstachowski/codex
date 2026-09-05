@@ -136,9 +136,12 @@ impl Session {
         {
             return None;
         }
-        let effort = settings
-            .model_info
-            .resolve_reasoning_effort(settings.effective_reasoning_effort()?);
+        let lane = crate::config::locked_model_policy_lane().ok()?;
+        let effort = crate::client::reasoning_effort_for_request(
+            lane,
+            &settings.model_info,
+            settings.effective_reasoning_effort()?,
+        );
         // Persistent normalizes to "disabled". Keep unknown custom values out of
         // durable updates so injected items stay bounded to known backend modes.
         if matches!(&effort, ReasoningEffort::Custom(value) if value != "disabled") {

@@ -15,7 +15,7 @@ fn subscription_review_replaces_alternate_root_model_and_effort() {
     assert_eq!(
         settings,
         ReviewInferenceSettings {
-            model: "gpt-5.6-sol".to_string(),
+            model: "gpt-6-astra".to_string(),
             reasoning_effort: Some(ReasoningEffort::Ultra),
             reasoning_mode: None,
             service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),

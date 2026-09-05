@@ -497,8 +497,13 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
         .await;
     let original = session.collaboration_mode().await;
     let (root_model, root_effort, root_tier) = match lane {
-        ModelPolicyLane::Api | ModelPolicyLane::Subscription => (
+        ModelPolicyLane::Subscription => (
             "gpt-5.5".to_string(),
+            ReasoningEffort::High,
+            Some(ServiceTier::Fast.request_value().to_string()),
+        ),
+        ModelPolicyLane::Api => (
+            "gpt-5.6-terra".to_string(),
             ReasoningEffort::High,
             Some(ServiceTier::Fast.request_value().to_string()),
         ),
@@ -541,11 +546,11 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
             .await?;
     let request_step = attempt.request_step;
     request_step.validate_managed_background(lane)?;
-    assert_eq!(request_step.settings.model_info.slug, "gpt-5.6-sol");
-    assert_eq!(request_step.turn.model_info().slug, "gpt-5.6-sol");
+    assert_eq!(request_step.settings.model_info.slug, "gpt-6-astra");
+    assert_eq!(request_step.turn.model_info().slug, "gpt-6-astra");
     assert_eq!(
         request_step.turn.config.model.as_deref(),
-        Some("gpt-5.6-sol")
+        Some("gpt-6-astra")
     );
     assert_eq!(
         request_step.settings.reasoning_effort().cloned(),
@@ -601,6 +606,10 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
         ModelPolicyLane::Api => Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
         ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
     };
+    let expected_effort = match lane {
+        ModelPolicyLane::Api => "max",
+        ModelPolicyLane::Subscription | ModelPolicyLane::Spark => "xhigh",
+    };
     assert_eq!(
         (
             wire["model"].as_str(),
@@ -609,9 +618,9 @@ async fn locked_model_policy_managed_local_compaction_materializes_actual_lane_w
             wire.get("service_tier").and_then(Value::as_str),
         ),
         (
-            Some("gpt-5.6-sol"),
+            Some("gpt-6-astra"),
             expected_mode,
-            Some("max"),
+            Some(expected_effort),
             expected_tier
         ),
         "the materialized compaction request must follow the actual locked process lane"

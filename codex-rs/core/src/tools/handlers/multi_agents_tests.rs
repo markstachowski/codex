@@ -4575,7 +4575,7 @@ async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
     let (session, turn) = make_session_and_context().await;
     let mut turn = turn
         .with_model(
-            crate::config::SOL_MODEL.to_string(),
+            crate::config::ASTRA_MODEL.to_string(),
             &session.services.models_manager,
         )
         .await;
@@ -4589,7 +4589,7 @@ async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
         crate::config::ModelPolicyLane::Subscription,
     )
     .expect("subscription children should be repinned");
-    assert_eq!(config.model.as_deref(), Some(crate::config::SOL_MODEL));
+    assert_eq!(config.model.as_deref(), Some(crate::config::ASTRA_MODEL));
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Ultra));
     assert_eq!(
         config.service_tier.as_deref(),

@@ -41,7 +41,7 @@ const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
 #[test]
-fn model_policy_picker_contract_keeps_subscription_catalog() {
+fn model_policy_picker_contract_distinguishes_selectable_and_exact_lanes() {
     assert_eq!(
         picker_contract_for_lane(/*lane*/ None),
         PickerContract::Upstream
@@ -50,13 +50,7 @@ fn model_policy_picker_contract_keeps_subscription_catalog() {
         picker_contract_for_lane(Some("subscription")),
         PickerContract::Subscription
     );
-    // The API lane opened root model selection on 2026-08-05: its locked
-    // catalog file is the model boundary, so it shares the filtered-catalog
-    // contract instead of a single-model pin.
-    assert_eq!(
-        picker_contract_for_lane(Some("api")),
-        PickerContract::Subscription
-    );
+    assert_eq!(picker_contract_for_lane(Some("api")), PickerContract::Api);
     assert_eq!(
         picker_contract_for_lane(Some("spark")),
         PickerContract::Exact {
@@ -71,34 +65,89 @@ fn model_policy_picker_contract_keeps_subscription_catalog() {
 }
 
 #[test]
+fn selectable_lanes_expose_bundled_astra_for_offline_fallback() {
+    let manager = static_manager_for_tests(ModelsResponse { models: Vec::new() });
+    let bundled = load_remote_models_from_file().expect("bundled models should parse");
+    assert_eq!(
+        bundled
+            .iter()
+            .find(|model| model.slug == ASTRA_MODEL)
+            .map(|model| model.visibility),
+        Some(ModelVisibility::List),
+        "the bundled fallback must expose the managed default"
+    );
+
+    for contract in [PickerContract::Subscription, PickerContract::Api] {
+        let available =
+            build_available_models_with_contract(&manager, bundled.clone(), contract.clone());
+        let astra = available
+            .iter()
+            .find(|preset| preset.model == ASTRA_MODEL)
+            .expect("selectable managed catalogs must retain Astra");
+        assert!(astra.show_in_picker, "contract: {contract:?}");
+        assert!(astra.is_default, "contract: {contract:?}");
+    }
+
+    let hidden_remote = vec![remote_model_with_visibility(
+        ASTRA_MODEL,
+        "Astra",
+        /*priority*/ 0,
+        "hide",
+    )];
+    for contract in [PickerContract::Subscription, PickerContract::Api] {
+        assert!(
+            !build_available_models_with_contract(
+                &manager,
+                hidden_remote.clone(),
+                contract.clone()
+            )
+            .iter()
+            .find(|preset| preset.model == ASTRA_MODEL)
+            .expect("selectable managed catalogs must retain Astra metadata")
+            .show_in_picker,
+            "a live catalog hide remains authoritative for {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn model_policy_picker_contract_filters_the_actual_catalog_path() {
-    let mut sol = remote_model(SOL_MODEL, "Sol", /*priority*/ 0);
+    let mut astra = remote_model("gpt-6-astra", "Astra", /*priority*/ 0);
+    astra.default_reasoning_level = Some(ReasoningEffort::Ultra);
+    astra.supported_reasoning_levels = vec![ReasoningEffortPreset {
+        effort: ReasoningEffort::Ultra,
+        description: "ultra".to_string(),
+    }];
+    let mut sol = remote_model(SOL_MODEL, "Sol", /*priority*/ 1);
     sol.default_reasoning_level = Some(ReasoningEffort::Ultra);
     sol.supported_reasoning_levels = vec![ReasoningEffortPreset {
         effort: ReasoningEffort::Ultra,
         description: "ultra".to_string(),
     }];
-    let terra = remote_model("gpt-5.6-terra", "Terra", /*priority*/ 1);
-    let mut spark = remote_model(SPARK_MODEL, "Spark", /*priority*/ 2);
+    let terra = remote_model("gpt-5.6-terra", "Terra", /*priority*/ 2);
+    let legacy = remote_model("gpt-5.4", "Legacy", /*priority*/ 3);
+    let mut spark = remote_model(SPARK_MODEL, "Spark", /*priority*/ 4);
     spark.default_reasoning_level = Some(ReasoningEffort::XHigh);
     spark.supported_reasoning_levels = vec![ReasoningEffortPreset {
         effort: ReasoningEffort::XHigh,
         description: "xhigh".to_string(),
     }];
-    let automatic = remote_model("codex-auto-balanced", "Automatic", /*priority*/ 3);
+    let automatic = remote_model("codex-auto-balanced", "Automatic", /*priority*/ 5);
     let namespaced_automatic = remote_model(
         "openai/codex-auto-balanced",
         "Namespaced automatic",
-        /*priority*/ 4,
+        /*priority*/ 6,
     );
     let uppercase_automatic = remote_model(
         "CODEX-AUTO-BALANCED",
         "Uppercase automatic",
-        /*priority*/ 5,
+        /*priority*/ 7,
     );
     let catalog = vec![
+        astra,
         sol,
         terra,
+        legacy,
         spark,
         automatic,
         namespaced_automatic,
@@ -118,9 +167,17 @@ fn model_policy_picker_contract_filters_the_actual_catalog_path() {
             .iter()
             .map(|preset| preset.model.as_str())
             .collect::<Vec<_>>(),
-        vec![SOL_MODEL, "gpt-5.6-terra"]
+        vec!["gpt-6-astra", SOL_MODEL, "gpt-5.6-terra", "gpt-5.4"]
     );
-    assert_eq!(subscription[1].supported_reasoning_efforts.len(), 2);
+    assert_eq!(subscription[2].supported_reasoning_efforts.len(), 2);
+
+    let api = build_available_models_with_contract(&manager, catalog.clone(), PickerContract::Api);
+    assert_eq!(
+        api.iter()
+            .map(|preset| preset.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gpt-6-astra", SOL_MODEL, "gpt-5.6-terra"]
+    );
 
     for (contract, expected_model, expected_effort) in [
         (

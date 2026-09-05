@@ -1519,7 +1519,7 @@ impl ThreadManager {
             .state
             .effective_multi_agent_version_for_spawn(
                 &history,
-                /*session_source*/ None,
+                options.session_source.as_ref(),
                 /*parent_thread_id*/ None,
                 source_thread_id,
                 &options.config,
@@ -1614,7 +1614,13 @@ impl ThreadManagerState {
     pub(crate) async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
         let threads = self.threads.read().await;
         match threads.get(&thread_id) {
-            Some(thread) if !thread.session_source.is_internal() => Ok(thread.clone()),
+            Some(thread)
+                if !thread.session_source.is_internal()
+                    || thread.session_source.is_temporary_structured()
+                    || thread.session_source.is_managed_background() =>
+            {
+                Ok(thread.clone())
+            }
             Some(_) | None => Err(CodexErr::ThreadNotFound(thread_id)),
         }
     }

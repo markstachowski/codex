@@ -5411,6 +5411,89 @@ async fn shared_settings_apply_path_rejects_unlisted_subscription_model() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn sparse_legacy_model_updates_validate_the_materialized_picker_pair() {
+    let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+    let (session, _turn_context) = make_session_and_context().await;
+    // SAFETY: this test is serialized and `_lane_guard` restores the prior value.
+    unsafe {
+        std::env::set_var(
+            crate::config::MODEL_POLICY_LANE_ENV,
+            crate::config::ModelPolicyLane::Subscription.as_str(),
+        )
+    };
+
+    // `make_session_and_context` constructs its low-level fixture without the
+    // normal Session::new default-effort resolution. Establish the same valid
+    // current pair a production session has before exercising partial updates.
+    session
+        .update_settings(SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                effort: Some(Some(ReasoningEffortConfig::Medium)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("the current picker model should accept its default effort");
+    let original = session.collaboration_mode().await;
+    let unknown_model = SessionSettingsUpdate {
+        step_settings: StepSettingsUpdate {
+            model: Some("not-in-the-picker".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let error = session
+        .preview_settings(&unknown_model)
+        .await
+        .expect_err("a sparse unknown-model update must fail closed");
+    assert!(error.to_string().contains("not present and visible"));
+
+    let unsupported_effort = SessionSettingsUpdate {
+        step_settings: StepSettingsUpdate {
+            effort: Some(Some(ReasoningEffortConfig::Ultra)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let error = session
+        .preview_settings(&unsupported_effort)
+        .await
+        .expect_err("a sparse unsupported-effort update must fail closed");
+    assert!(error.to_string().contains("does not advertise"));
+
+    let compatible_model = SessionSettingsUpdate {
+        step_settings: StepSettingsUpdate {
+            model: Some("gpt-5.6-luna".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let preview = session
+        .preview_settings(&compatible_model)
+        .await
+        .expect("a visible model with the preserved compatible effort should succeed");
+    assert_eq!(preview.model, "gpt-5.6-luna");
+    assert_eq!(preview.reasoning_effort, original.reasoning_effort());
+
+    let compatible_effort = SessionSettingsUpdate {
+        step_settings: StepSettingsUpdate {
+            effort: Some(Some(ReasoningEffortConfig::XHigh)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let preview = session
+        .preview_settings(&compatible_effort)
+        .await
+        .expect("a compatible effort for the current visible model should succeed");
+    assert_eq!(preview.model, original.model());
+    assert_eq!(preview.reasoning_effort, Some(ReasoningEffortConfig::XHigh));
+    assert_eq!(session.collaboration_mode().await, original);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn managed_root_fast_settings_preview_apply_round_trip() {
     let _lane_guard = ModelPolicyLaneEnvGuard::unset();
     let (subscription_session, _turn_context) = make_session_and_context().await;
@@ -5452,7 +5535,7 @@ async fn managed_root_fast_settings_preview_apply_round_trip() {
         CodexAuth::from_api_key("Test API Key"),
         Vec::new(),
         |config| {
-            config.model = Some(crate::config::SOL_MODEL.to_string());
+            config.model = Some(crate::config::ASTRA_MODEL.to_string());
             config.model_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
             config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::Ultra);
             config.model_reasoning_mode = Some(codex_protocol::config_types::ReasoningMode::Pro);
@@ -5494,29 +5577,52 @@ async fn managed_root_fast_settings_preview_apply_round_trip() {
 }
 
 #[tokio::test]
-async fn locked_new_root_defaults_are_lane_specific() {
+async fn locked_new_root_defaults_preserve_selectable_lanes_and_pin_spark() {
     let histories = [
         InitialHistory::New,
         InitialHistory::Cleared,
         InitialHistory::Forked(Vec::new()),
     ];
 
+    let lane = crate::config::ModelPolicyLane::Spark;
+    for history in &histories {
+        let mut config = crate::config::test_config().await;
+        config.model = Some("gpt-5.4".to_string());
+        config.model_reasoning_effort = Some(ReasoningEffortConfig::Max);
+        config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::High);
+        config.service_tier = Some("priority".to_string());
+        apply_locked_new_root_inference_defaults_for_lane(
+            &mut config,
+            history,
+            &SessionSource::Cli,
+            Some(lane),
+        );
+        assert_eq!(
+            (
+                config.model.as_deref(),
+                config.model_reasoning_effort.as_ref(),
+                config.plan_mode_reasoning_effort.as_ref(),
+                config.service_tier.as_deref(),
+            ),
+            (
+                Some(lane.required_model()),
+                Some(&lane.required_local_effort()),
+                Some(&lane.required_local_effort()),
+                Some(lane.required_root_service_tier()),
+            ),
+            "history: {history:?}"
+        );
+    }
+
     for lane in [
         crate::config::ModelPolicyLane::Subscription,
         crate::config::ModelPolicyLane::Api,
-        crate::config::ModelPolicyLane::Spark,
     ] {
         for history in &histories {
-            assert_eq!(
-                locked_new_root_inference_defaults_for_lane(
-                    history,
-                    &SessionSource::Cli,
-                    Some(lane),
-                ),
-                Some((lane.required_model(), lane.required_local_effort()))
-            );
-
             let mut config = crate::config::test_config().await;
+            config.model = Some("gpt-5.6-terra".to_string());
+            config.model_reasoning_effort = Some(ReasoningEffortConfig::High);
+            config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::XHigh);
             config.service_tier = Some("priority".to_string());
             apply_locked_new_root_inference_defaults_for_lane(
                 &mut config,
@@ -5525,42 +5631,40 @@ async fn locked_new_root_defaults_are_lane_specific() {
                 Some(lane),
             );
             assert_eq!(
-                config.service_tier.as_deref(),
-                Some(lane.required_root_service_tier()),
+                (
+                    config.model.as_deref(),
+                    config.model_reasoning_effort,
+                    config.plan_mode_reasoning_effort,
+                    config.service_tier.as_deref(),
+                ),
+                (
+                    Some("gpt-5.6-terra"),
+                    Some(ReasoningEffortConfig::High),
+                    Some(ReasoningEffortConfig::XHigh),
+                    Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+                ),
                 "lane: {}, history: {history:?}",
                 lane.as_str()
             );
         }
     }
 
-    assert_eq!(
-        locked_new_root_inference_defaults_for_lane(
-            &InitialHistory::Resumed(ResumedHistory {
-                conversation_id: ThreadId::new(),
-                history: Arc::new(Vec::new()),
-                rollout_path: None,
-            }),
-            &SessionSource::Cli,
-            Some(crate::config::ModelPolicyLane::Subscription),
-        ),
-        None
+    let mut resumed = crate::config::test_config().await;
+    resumed.model = Some("gpt-5.5".to_string());
+    resumed.model_reasoning_effort = Some(ReasoningEffortConfig::High);
+    resumed.service_tier = Some("priority".to_string());
+    let expected = resumed.clone();
+    apply_locked_new_root_inference_defaults_for_lane(
+        &mut resumed,
+        &InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::new(),
+            history: Arc::new(Vec::new()),
+            rollout_path: None,
+        }),
+        &SessionSource::Cli,
+        Some(crate::config::ModelPolicyLane::Subscription),
     );
-    assert_eq!(
-        locked_new_root_inference_defaults_for_lane(
-            &InitialHistory::New,
-            &SessionSource::SubAgent(SubAgentSource::Review),
-            Some(crate::config::ModelPolicyLane::Subscription),
-        ),
-        None
-    );
-    assert_eq!(
-        locked_new_root_inference_defaults_for_lane(
-            &InitialHistory::New,
-            &SessionSource::Cli,
-            /*lane*/ None,
-        ),
-        None
-    );
+    assert_eq!(resumed, expected);
 }
 
 #[test]

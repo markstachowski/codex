@@ -165,8 +165,8 @@ fn create_locked_subscription_config(codex_home: &Path) -> std::io::Result<()> {
     std::fs::write(
         codex_home.join("config.toml"),
         r#"
-model = "gpt-5.6-sol"
-review_model = "gpt-5.6-sol"
+model = "gpt-6-astra"
+review_model = "gpt-6-astra"
 model_provider = "openai"
 forced_login_method = "chatgpt"
 model_reasoning_effort = "ultra"

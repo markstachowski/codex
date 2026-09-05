@@ -12,7 +12,7 @@ use toml::Value as TomlValue;
 
 pub(crate) fn apply_managed_new_root_model_defaults(config: &mut Config) -> std::io::Result<()> {
     if let Some(lane) = locked_model_policy_lane()? {
-        apply_lane_model_defaults(config, lane);
+        apply_lane_new_root_defaults(config, lane);
     }
     Ok(())
 }
@@ -30,11 +30,13 @@ pub(crate) fn apply_managed_new_thread_defaults_for_selection(
     Ok(())
 }
 
-fn apply_lane_model_defaults(config: &mut Config, lane: ModelPolicyLane) {
-    config.model = Some(lane.required_model().to_string());
-    config.model_reasoning_effort = Some(lane.required_local_effort());
-    config.plan_mode_reasoning_effort = Some(lane.required_local_effort());
+fn apply_lane_new_root_defaults(config: &mut Config, lane: ModelPolicyLane) {
     config.service_tier = Some(lane.required_root_service_tier().to_string());
+    if !lane.allows_user_model_selection() {
+        config.model = Some(lane.required_model().to_string());
+        config.model_reasoning_effort = Some(lane.required_local_effort());
+        config.plan_mode_reasoning_effort = Some(lane.required_local_effort());
+    }
 }
 
 pub(crate) fn apply_managed_new_thread_defaults(
@@ -60,12 +62,15 @@ fn apply_managed_new_thread_defaults_for_lane(
     harness_overrides: &ConfigOverrides,
     lane: Option<ModelPolicyLane>,
 ) {
-    // Interactive subscription model changes belong only to the active conversation. Every new,
-    // cleared, forked, or side root starts from the lane's managed pair; app-server defaults must
-    // not carry the prior conversation selection into a new root.
-    if let Some(lane) = lane {
-        apply_lane_model_defaults(config, lane);
+    // The dedicated Spark launcher keeps exact root inference settings.
+    // Selectable subscription and API roots use the same config/CLI/app-server
+    // precedence as upstream, then return to Standard for each conversation.
+    if let Some(lane @ ModelPolicyLane::Spark) = lane {
+        apply_lane_new_root_defaults(config, lane);
         return;
+    }
+    if let Some(lane) = lane {
+        config.service_tier = Some(lane.required_root_service_tier().to_string());
     }
     let Some(defaults) = defaults else {
         return;
@@ -90,7 +95,8 @@ fn apply_managed_new_thread_defaults_for_lane(
     {
         config.model_reasoning_effort = Some(reasoning_effort.clone());
     }
-    if harness_overrides.service_tier.is_none()
+    if lane.is_none()
+        && harness_overrides.service_tier.is_none()
         && !has_launch_setting(config, cli_kv_overrides, "service_tier")
         && let Some(service_tier) = defaults.service_tier.as_ref()
     {

@@ -8,6 +8,7 @@ use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -38,7 +39,10 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::loader::project_trust_key;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::config::ASTRA_MODEL;
+use codex_core::config::MANAGED_TEMPORARY_STRUCTURED_DISABLED_BOOL_OVERRIDES;
 use codex_core::config::MODEL_POLICY_LANE_ENV;
+use codex_core::config::SPARK_MODEL;
 use codex_core::config::set_project_trust_level;
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::resolve_root_git_project_for_trust;
@@ -1063,8 +1067,8 @@ async fn locked_subscription_thread_start_accepts_explicit_standard_tier() -> Re
     std::fs::write(
         codex_home.path().join("config.toml"),
         r#"
-model = "gpt-5.6-sol"
-review_model = "gpt-5.6-sol"
+model = "gpt-6-astra"
+review_model = "gpt-6-astra"
 model_provider = "openai"
 forced_login_method = "chatgpt"
 # Keep TestAppServer from replacing the managed endpoint with its attribution mock.
@@ -1131,6 +1135,156 @@ max_concurrent_threads_per_session = 6
         service_tier,
         Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_temporary_structured_thread_bootstraps_as_internal_astra_ultra_in_all_lanes()
+-> Result<()> {
+    fn root_config(
+        model: &str,
+        effort: &str,
+        login: &str,
+        reasoning_mode: &str,
+        multi_agent: bool,
+    ) -> String {
+        format!(
+            r#"model = "{model}"
+review_model = "{ASTRA_MODEL}"
+model_provider = "openai"
+chatgpt_base_url = "https://chatgpt.com/backend-api"
+model_reasoning_effort = "{effort}"
+plan_mode_reasoning_effort = "{effort}"
+{reasoning_mode}forced_login_method = "{login}"
+approval_policy = "never"
+approvals_reviewer = "user"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+
+[agents]
+enabled = {multi_agent}
+
+[features]
+fast_mode = {multi_agent}
+multi_agent = {multi_agent}
+memories = false
+
+[features.multi_agent_v2]
+enabled = {multi_agent}
+expose_spawn_agent_model_overrides = false
+"#
+        )
+    }
+
+    fn temporary_start_params(cwd: &Path) -> ThreadStartParams {
+        let mut config = MANAGED_TEMPORARY_STRUCTURED_DISABLED_BOOL_OVERRIDES
+            .iter()
+            .map(|key| ((*key).to_string(), json!(false)))
+            .collect::<std::collections::HashMap<_, _>>();
+        config.extend([
+            ("web_search".to_string(), json!("disabled")),
+            ("mcp_servers".to_string(), json!({})),
+            ("model_reasoning_effort".to_string(), json!("low")),
+            ("plan_mode_reasoning_effort".to_string(), json!("low")),
+            ("service_tier".to_string(), json!("priority")),
+        ]);
+        ThreadStartParams {
+            model: Some("gpt-5.6-luna".to_string()),
+            model_provider: Some("caller-provider".to_string()),
+            cwd: Some(cwd.display().to_string()),
+            runtime_workspace_roots: Some(Vec::new()),
+            approval_policy: Some(AskForApproval::Never),
+            sandbox: Some(SandboxMode::ReadOnly),
+            config: Some(config),
+            ephemeral: Some(true),
+            thread_source: Some(ThreadSource::Feature("system".to_string())),
+            environments: Some(Vec::new()),
+            dynamic_tools: Some(Vec::new()),
+            selected_capability_roots: Some(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    for (lane, model, effort, login, reasoning_mode, multi_agent) in [
+        ("subscription", ASTRA_MODEL, "ultra", "chatgpt", "", true),
+        (
+            "api",
+            ASTRA_MODEL,
+            "ultra",
+            "api",
+            "model_reasoning_mode = \"pro\"\n",
+            true,
+        ),
+        ("spark", SPARK_MODEL, "xhigh", "chatgpt", "", false),
+    ] {
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            root_config(model, effort, login, reasoning_mode, multi_agent),
+        )?;
+        write_models_cache(codex_home.path())?;
+        let user_config_home = codex_home.path().to_string_lossy().into_owned();
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .with_env_overrides(&[
+                (MODEL_POLICY_LANE_ENV, Some(lane)),
+                ("CDX_USER_CONFIG_HOMES", Some(user_config_home.as_str())),
+                ("OPENAI_API_KEY", None),
+                ("CODEX_API_KEY", None),
+            ])
+            .build()
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.initialize_with_client_info(ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.1.0".to_string(),
+            }),
+        )
+        .await??;
+
+        let request_id = mcp
+            .send_thread_start_request(temporary_start_params(codex_home.path()))
+            .await?;
+        let response: ThreadStartResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+        assert_eq!(
+            (
+                response.model.as_str(),
+                response.model_provider.as_str(),
+                response.reasoning_effort,
+                response.service_tier.as_deref(),
+                response.thread.ephemeral,
+                response.thread.source,
+                response.thread.model.as_deref(),
+                response.thread.reasoning_effort,
+                response.active_permission_profile,
+            ),
+            (
+                ASTRA_MODEL,
+                "openai",
+                Some(ReasoningEffort::Ultra),
+                Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+                true,
+                codex_app_server_protocol::SessionSource::Unknown,
+                Some(ASTRA_MODEL),
+                Some(ReasoningEffort::Ultra),
+                None,
+            ),
+            "managed temporary bootstrap contract for {lane}",
+        );
+        assert!(matches!(
+            response.sandbox,
+            codex_app_server_protocol::SandboxPolicy::ReadOnly { .. }
+        ));
+        assert!(
+            timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully())
+                .await??
+                .success()
+        );
+    }
     Ok(())
 }
 

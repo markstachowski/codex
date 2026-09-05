@@ -133,6 +133,16 @@ pub(crate) fn build_tool_router(
     step_store: &ExtensionData,
     tool_suggest_candidates: Option<&crate::tools::router::ToolSuggestCandidates>,
 ) -> CodexResult<ToolRouter> {
+    if turn_context.session_source.is_temporary_structured() {
+        return Ok(ToolRouter::from_parts(
+            ToolRegistry::default(),
+            Vec::new(),
+            ToolMode::Direct,
+            BTreeMap::new(),
+            /*tool_namespaces_info*/ None,
+            /*child_management_tools*/ &[],
+        ));
+    }
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let wait_for_environment_tool_config = session
@@ -278,6 +288,9 @@ pub(crate) fn build_core_tool_registry(
     tool_suggest_candidates: Option<&crate::tools::router::ToolSuggestCandidates>,
     wait_for_environment_tool_config: Option<&Arc<crate::WaitForEnvironmentToolConfig>>,
 ) -> ToolRegistry {
+    if turn_context.session_source.is_temporary_structured() {
+        return ToolRegistry::default();
+    }
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let context = CoreToolPlanContext {
@@ -308,7 +321,9 @@ pub(crate) fn append_source_tools(
     >,
     dynamic_tools: &[DynamicToolSpec],
 ) -> Vec<ToolSpec> {
-    if crate::guardian::is_basic_session_source(&turn_context.session_source) {
+    if crate::guardian::is_basic_session_source(&turn_context.session_source)
+        || turn_context.session_source.is_temporary_structured()
+    {
         return Vec::new();
     }
 
@@ -646,6 +661,9 @@ fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
 }
 
 fn collab_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
+    if turn_context.session_source.is_managed_background() {
+        return false;
+    }
     match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !exceeds_thread_spawn_depth_limit(
@@ -1158,7 +1176,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         );
     }
 
-    if turn_context.config.experimental_request_user_input_enabled {
+    if !turn_context.session_source.is_managed_background()
+        && turn_context.config.experimental_request_user_input_enabled
+    {
         registry.add_with_exposure(
             RequestUserInputHandler {
                 available_modes: request_user_input_available_modes(features),
@@ -1202,7 +1222,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         registry.add_with_exposure(SendMessageToUserAsyncHandler, ToolExposure::DirectModelOnly);
     }
 
-    if environment_mode.has_environment() && features.enabled(Feature::RequestPermissionsTool) {
+    if !turn_context.session_source.is_managed_background()
+        && environment_mode.has_environment()
+        && features.enabled(Feature::RequestPermissionsTool)
+    {
         registry.add(RequestPermissionsHandler);
     }
 

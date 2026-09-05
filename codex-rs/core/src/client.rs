@@ -181,6 +181,43 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedRequestSessionClass {
+    Root,
+    FixedNonRoot,
+    TemporaryStructured,
+    ManagedBackground,
+}
+
+impl ManagedRequestSessionClass {
+    fn from_session_source(session_source: &SessionSource) -> Self {
+        match session_source {
+            SessionSource::Internal(InternalSessionSource::TemporaryStructured) => {
+                Self::TemporaryStructured
+            }
+            SessionSource::Internal(InternalSessionSource::ManagedBackground) => {
+                Self::ManagedBackground
+            }
+            session_source if session_source.is_non_root_agent() => Self::FixedNonRoot,
+            _ => Self::Root,
+        }
+    }
+}
+
+pub(crate) fn reasoning_effort_for_request(
+    lane: Option<ModelPolicyLane>,
+    model_info: &ModelInfo,
+    effort: ReasoningEffortConfig,
+) -> ReasoningEffortConfig {
+    if matches!(lane, Some(ModelPolicyLane::Api))
+        && effort == ReasoningEffortConfig::Ultra
+        && model_info.supported_reasoning_levels.iter().any(|preset| preset.effort == ReasoningEffortConfig::Max)
+    {
+        return ReasoningEffortConfig::Max;
+    }
+    model_info.resolve_reasoning_effort(effort)
+}
+
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -565,18 +602,6 @@ impl ModelClient {
         locked_model_policy_lane().map_err(|err| CodexErr::InvalidRequest(err.to_string()))
     }
 
-    /// Reasoning mode for an outbound request.
-    ///
-    /// A managed lane derives this from the model actually being sent, so the
-    /// configured value can never drift from what the model accepts. Unmanaged
-    /// sessions keep stock behaviour and use the configured mode.
-    fn locked_reasoning_mode_for(&self, model: &str) -> Result<Option<ReasoningModeConfig>> {
-        match self.locked_policy_lane()? {
-            Some(lane) => Ok(lane.required_reasoning_mode_for_model(model)),
-            None => Ok(self.model_reasoning_mode),
-        }
-    }
-
     /// Resolve the service tier that reaches a Responses request body.
     ///
     /// `default` remains an internal sentinel for stock, subscription, and
@@ -645,7 +670,7 @@ impl ModelClient {
         };
         Self::validate_locked_responses_request_for_request_kind(
             lane,
-            self.state.session_source.is_non_root_agent(),
+            ManagedRequestSessionClass::from_session_source(&self.state.session_source),
             responses_metadata.request_kind,
             request,
         )
@@ -659,7 +684,11 @@ impl ModelClient {
     ) -> Result<()> {
         Self::validate_locked_responses_request_for_request_kind(
             lane,
-            is_non_root_agent,
+            if is_non_root_agent {
+                ManagedRequestSessionClass::FixedNonRoot
+            } else {
+                ManagedRequestSessionClass::Root
+            },
             Some(CodexResponsesRequestKind::Turn),
             request,
         )
@@ -667,7 +696,7 @@ impl ModelClient {
 
     fn validate_locked_responses_request_for_request_kind(
         lane: ModelPolicyLane,
-        is_non_root_agent: bool,
+        session_class: ManagedRequestSessionClass,
         request_kind: Option<CodexResponsesRequestKind>,
         request: &ResponsesApiRequest,
     ) -> Result<()> {
@@ -677,22 +706,30 @@ impl ModelClient {
                 lane.as_str()
             )));
         };
-        let managed_background = match request_kind {
+        let managed_background = matches!(
+            session_class,
+            ManagedRequestSessionClass::TemporaryStructured
+                | ManagedRequestSessionClass::ManagedBackground
+        ) || match request_kind {
             CodexResponsesRequestKind::Turn => false,
             CodexResponsesRequestKind::Prewarm => true,
             CodexResponsesRequestKind::Compaction(_) => true,
             CodexResponsesRequestKind::Memory => true,
         };
-        if is_non_root_agent && !lane.allows_non_root_sessions() {
+        if matches!(session_class, ManagedRequestSessionClass::FixedNonRoot)
+            && !managed_background
+            && !lane.allows_non_root_sessions()
+        {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejects non-root requests",
                 lane.as_str()
             )));
         }
         // Only an ordinary root turn may select its own model. Root-owned
-        // background work is Sol/Ultra even when the interactive root is
+        // background work is Astra/Ultra even when the interactive root is
         // Spark; children and other non-root work retain their existing pin.
-        let root_turn = !is_non_root_agent && !managed_background;
+        let root_turn =
+            matches!(session_class, ManagedRequestSessionClass::Root) && !managed_background;
         let user_selecting = lane.allows_user_model_selection() && root_turn;
         let required_model = if managed_background {
             lane.required_background_model()
@@ -946,12 +983,16 @@ impl ModelClient {
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
 
-        let memory_reasoning_mode = self.locked_reasoning_mode_for(&model_info.slug)?;
+        let lane = self.locked_policy_lane()?;
+        let memory_reasoning_mode = match lane {
+            Some(lane) => lane.required_reasoning_mode_for_model(&model_info.slug),
+            None => self.model_reasoning_mode,
+        };
         let payload = ApiMemorySummarizeInput {
             model: model_info.slug.clone(),
             raw_memories,
             reasoning: effort
-                .map(|effort| model_info.resolve_reasoning_effort(effort))
+                .map(|effort| reasoning_effort_for_request(lane, model_info, effort))
                 .map(|effort| Reasoning {
                     mode: memory_reasoning_mode,
                     effort: Some(effort),
@@ -1064,7 +1105,7 @@ impl ModelClient {
             },
             effort: effort
                 .or_else(|| model_info.default_reasoning_level.clone())
-                .map(|effort| model_info.resolve_reasoning_effort(effort)),
+                .map(|effort| reasoning_effort_for_request(lane, model_info, effort)),
             summary: (model_info.supports_reasoning_summary_parameter
                 && summary != ReasoningSummaryConfig::None)
                 .then_some(summary),

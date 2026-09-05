@@ -76,16 +76,16 @@ pub fn is_auto_routing_model_family(model: &str) -> bool {
 /// Returns whether a model slug accepts the typed `reasoning.mode` field.
 ///
 /// The Responses API advertises no capability for this — a model either accepts
-/// `reasoning.mode` or rejects the whole request. Verified live on 2026-08-05:
-/// the gpt-5.6 family (sol, terra, luna) accepts `pro` at every supported
-/// effort, while gpt-5.4-mini answers 400 `reasoning.mode is not supported with
-/// this model`. An unrecognised slug is treated as incapable on purpose, so a
-/// new model silently loses Pro instead of failing every request.
+/// `reasoning.mode` or rejects the whole request. GPT-6 Astra and the gpt-5.6
+/// family (sol, terra, luna) accept `pro`, while gpt-5.4-mini rejects it. An
+/// unrecognised slug is treated as incapable on purpose. Unmanaged callers omit
+/// Pro for unknown models; the managed API lane rejects them during selection
+/// rather than silently weakening its Pro contract.
 pub fn is_pro_capable_model(model: &str) -> bool {
     let slug = unqualified_model_slug(model).to_ascii_lowercase();
     matches!(
         slug.as_str(),
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+        "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
     )
 }
 

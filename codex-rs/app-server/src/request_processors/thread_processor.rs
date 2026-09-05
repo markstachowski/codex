@@ -1,6 +1,11 @@
 #[path = "daemon_snapshot.rs"]
 mod daemon_snapshot;
 
+use super::managed_desktop_requests::managed_background_config;
+use super::managed_desktop_requests::managed_desktop_background_lane;
+use super::managed_desktop_requests::managed_desktop_temporary_structured_fork;
+use super::managed_temporary_requests::managed_temporary_structured_config;
+use super::managed_temporary_requests::managed_temporary_structured_lane;
 use super::persisted_resume_settings::PersistedResumeSettings;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
@@ -89,6 +94,8 @@ struct ResumeConfigState {
     history_cwd: Option<PathBuf>,
     workspace_roots: Option<Vec<AbsolutePathBuf>>,
     persisted_metadata: Option<ThreadMetadata>,
+    restored_model: Option<String>,
+    restored_reasoning_effort: Option<Option<codex_protocol::openai_models::ReasoningEffort>>,
     persisted_settings: Option<PersistedResumeSettings>,
 }
 
@@ -242,6 +249,39 @@ fn merge_persisted_resume_metadata(
             serde_json::Value::String(reasoning_effort.to_string()),
         );
     }
+}
+
+/// Restores the strongest available thread-owned inference selection. SQLite
+/// metadata is authoritative when it has a model; legacy rollout history is a
+/// fallback for missing/unavailable rows and deliberately does not infer a
+/// provider.
+fn apply_persisted_or_history_model_selection(
+    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+    persisted_metadata: Option<&ThreadMetadata>,
+    thread_history: &InitialHistory,
+) -> Option<Option<codex_protocol::openai_models::ReasoningEffort>> {
+    if let Some(persisted_metadata) = persisted_metadata
+        && persisted_metadata.model.is_some()
+    {
+        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, persisted_metadata);
+        return Some(persisted_metadata.reasoning_effort.clone());
+    }
+    let (model, reasoning_effort) = thread_history.get_resumed_model_selection()?;
+    typesafe_overrides.model = Some(model);
+    if let Some(reasoning_effort) = reasoning_effort.as_ref() {
+        request_overrides.get_or_insert_with(HashMap::new).insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(reasoning_effort.to_string()),
+        );
+    }
+    Some(reasoning_effort)
+}
+
+fn should_restore_persisted_model_selection(
+    lane: Option<codex_core::config::ModelPolicyLane>,
+) -> bool {
+    lane.is_none_or(codex_core::config::ModelPolicyLane::allows_user_model_selection)
 }
 
 fn normalize_thread_list_cwd_filters(
@@ -1150,18 +1190,22 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
+        let managed_temporary_lane =
+            managed_temporary_structured_lane(&params, app_server_client_name.as_deref())?;
+        let managed_background_lane =
+            managed_desktop_background_lane(&params, app_server_client_name.as_deref())?;
         let ThreadStartParams {
-            model,
-            model_provider,
-            allow_provider_model_fallback,
-            service_tier,
+            mut model,
+            mut model_provider,
+            mut allow_provider_model_fallback,
+            mut service_tier,
             cwd,
             runtime_workspace_roots,
             approval_policy,
             approvals_reviewer,
-            sandbox,
-            permissions,
-            config,
+            mut sandbox,
+            mut permissions,
+            mut config,
             service_name,
             base_instructions,
             developer_instructions,
@@ -1176,8 +1220,36 @@ impl ThreadRequestProcessor {
             session_start_source,
             thread_source,
             project_id,
-            environments,
+            mut environments,
         } = params;
+        if let Some(lane) = managed_temporary_lane {
+            let settings = codex_core::config::managed_background_inference_for_lane(
+                model.take().unwrap_or_default(),
+                /*inherited_reasoning_effort*/ None,
+                /*inherited_service_tier*/ None,
+                Some(lane),
+            );
+            model = Some(settings.model);
+            model_provider = None;
+            allow_provider_model_fallback = false;
+            service_tier = Some(settings.service_tier);
+            sandbox = Some(SandboxMode::ReadOnly);
+            permissions = None;
+            config = Some(managed_temporary_structured_config());
+            environments = Some(Vec::new());
+        } else if let Some(lane) = managed_background_lane {
+            let settings = codex_core::config::managed_background_inference_for_lane(
+                model.take().unwrap_or_default(),
+                /*inherited_reasoning_effort*/ None,
+                /*inherited_service_tier*/ None,
+                Some(lane),
+            );
+            model = Some(settings.model);
+            model_provider = None;
+            allow_provider_model_fallback = false;
+            service_tier = Some(settings.service_tier);
+            config = Some(managed_background_config(config));
+        }
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
@@ -1228,6 +1300,16 @@ impl ThreadRequestProcessor {
             personality,
         );
         typesafe_overrides.ephemeral = ephemeral;
+        let managed_session_kind = managed_temporary_lane
+            .map(|_| codex_core::config::ManagedSessionKind::TemporaryStructured);
+        typesafe_overrides.managed_session_kind = managed_session_kind;
+        let managed_internal_source = if managed_temporary_lane.is_some() {
+            Some(codex_protocol::protocol::InternalSessionSource::TemporaryStructured)
+        } else if managed_background_lane.is_some() {
+            Some(codex_protocol::protocol::InternalSessionSource::ManagedBackground)
+        } else {
+            None
+        };
         let listener_task_context = ListenerTaskContext {
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
@@ -1262,6 +1344,7 @@ impl ThreadRequestProcessor {
                 selected_capability_roots.unwrap_or_default(),
                 history_mode.map(Into::into),
                 session_start_source,
+                managed_internal_source,
                 thread_source.map(Into::into),
                 project_id,
                 environments,
@@ -1343,6 +1426,7 @@ impl ThreadRequestProcessor {
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+        managed_internal_source: Option<codex_protocol::protocol::InternalSessionSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         project_id: Option<String>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
@@ -1505,6 +1589,8 @@ impl ThreadRequestProcessor {
                     codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
                 },
                 history_mode,
+                session_source: managed_internal_source
+                    .map(codex_protocol::protocol::SessionSource::Internal),
                 thread_source,
                 dynamic_tools,
                 metrics_service_name: service_name,
@@ -3931,7 +4017,7 @@ impl ThreadRequestProcessor {
         }
         let has_explicit_model_resume_override =
             has_model_resume_override(request_overrides.as_ref(), &typesafe_overrides);
-        let persisted_metadata = self
+        let (persisted_metadata, restored_reasoning_effort) = self
             .load_and_apply_persisted_resume_metadata(
                 &thread_history,
                 &mut request_overrides,
@@ -3940,13 +4026,13 @@ impl ThreadRequestProcessor {
             .await;
 
         let clear_reasoning_effort = !has_explicit_model_resume_override
-            && persisted_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.reasoning_effort.is_none());
+            && matches!(restored_reasoning_effort, Some(None));
         let config_state = ResumeConfigState {
             history_cwd: history_cwd.clone(),
             workspace_roots: typesafe_overrides.workspace_roots.clone(),
             persisted_metadata,
+            restored_model: typesafe_overrides.model.clone(),
+            restored_reasoning_effort,
             persisted_settings: match &thread_history {
                 InitialHistory::Resumed(resumed) => {
                     latest_persisted_resume_settings(&resumed.history)
@@ -4236,9 +4322,12 @@ impl ThreadRequestProcessor {
         thread_history: &InitialHistory,
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
-    ) -> Option<ThreadMetadata> {
+    ) -> (
+        Option<ThreadMetadata>,
+        Option<Option<codex_protocol::openai_models::ReasoningEffort>>,
+    ) {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
-            return None;
+            return (None, None);
         };
         if let Some(persisted_settings) = latest_persisted_resume_settings(&resumed_history.history)
         {
@@ -4258,23 +4347,30 @@ impl ThreadRequestProcessor {
                     .map(|profile| profile.id);
             }
         }
-        let state_db_ctx = self.state_db.clone()?;
-        let persisted_metadata = state_db_ctx
-            .get_thread(resumed_history.conversation_id)
-            .await
-            .ok()
-            .flatten()?;
-        let managed_lane = codex_core::config::locked_model_policy_lane()
-            .map(|lane| lane.is_some())
-            .unwrap_or(true);
-        if !managed_lane {
-            merge_persisted_resume_metadata(
-                request_overrides,
-                typesafe_overrides,
-                &persisted_metadata,
-            );
+        let restore_persisted_model = codex_core::config::locked_model_policy_lane()
+            .map(should_restore_persisted_model_selection)
+            .unwrap_or(false);
+        if !restore_persisted_model
+            || has_model_resume_override(request_overrides.as_ref(), typesafe_overrides)
+        {
+            return (None, None);
         }
-        Some(persisted_metadata)
+        let persisted_metadata = if let Some(state_db_ctx) = self.state_db.as_ref() {
+            state_db_ctx
+                .get_thread(resumed_history.conversation_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let restored_reasoning_effort = apply_persisted_or_history_model_selection(
+            request_overrides,
+            typesafe_overrides,
+            persisted_metadata.as_ref(),
+            thread_history,
+        );
+        (persisted_metadata, restored_reasoning_effort)
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -4875,21 +4971,28 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<(), JSONRPCErrorError> {
+        let lane = codex_core::config::locked_model_policy_lane()
+            .map_err(|error| invalid_request(error.to_string()))?;
+        let managed_temporary_structured = managed_desktop_temporary_structured_fork(
+            &params,
+            app_server_client_name.as_deref(),
+            lane,
+        );
         let ThreadForkParams {
             thread_id,
             last_turn_id,
             before_turn_id,
             path,
-            model,
-            model_provider,
-            service_tier,
+            mut model,
+            mut model_provider,
+            mut service_tier,
             cwd,
             runtime_workspace_roots,
             approval_policy,
             approvals_reviewer,
-            sandbox,
-            permissions,
-            config: cli_overrides,
+            mut sandbox,
+            mut permissions,
+            config: mut cli_overrides,
             base_instructions,
             developer_instructions,
             ephemeral,
@@ -4897,6 +5000,20 @@ impl ThreadRequestProcessor {
             exclude_turns,
             defer_goal_continuation,
         } = params;
+        if managed_temporary_structured {
+            let settings = codex_core::config::managed_background_inference_for_lane(
+                model.take().unwrap_or_default(),
+                /*inherited_reasoning_effort*/ None,
+                /*inherited_service_tier*/ None,
+                lane,
+            );
+            model = Some(settings.model);
+            model_provider = None;
+            service_tier = Some(settings.service_tier);
+            sandbox = Some(SandboxMode::ReadOnly);
+            permissions = None;
+            cli_overrides = Some(managed_temporary_structured_config());
+        }
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
@@ -5032,6 +5149,9 @@ impl ThreadRequestProcessor {
             /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
+        let managed_session_kind = managed_temporary_structured
+            .then_some(codex_core::config::ManagedSessionKind::TemporaryStructured);
+        typesafe_overrides.managed_session_kind = managed_session_kind;
         let restore_approval_policy = typesafe_overrides.approval_policy.is_none();
         let restore_approvals_reviewer = typesafe_overrides.approvals_reviewer.is_none()
             && !request_overrides
@@ -5188,6 +5308,11 @@ impl ThreadRequestProcessor {
         };
 
         let fork_options = StartThreadOptions {
+            session_source: managed_session_kind.map(|_| {
+                codex_protocol::protocol::SessionSource::Internal(
+                    codex_protocol::protocol::InternalSessionSource::TemporaryStructured,
+                )
+            }),
             thread_source,
             parent_trace,
             client_mcp_extensions,

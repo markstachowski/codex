@@ -549,6 +549,8 @@ mod feedback_thread_index;
 mod fs_processor;
 mod git_processor;
 mod initialize_processor;
+mod managed_desktop_requests;
+mod managed_temporary_requests;
 mod marketplace_processor;
 mod mcp_event_stream;
 mod mcp_processor;

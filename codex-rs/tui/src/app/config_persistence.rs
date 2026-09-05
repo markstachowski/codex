@@ -31,22 +31,11 @@ async fn build_config_on_runtime_worker(
 pub(super) fn resume_model_settings_for_overrides(
     config: &Config,
     harness_overrides: &ConfigOverrides,
+    model_policy_lane: Option<ModelPolicyLane>,
 ) -> crate::app_server_session::ResumeModelSettings {
-    let has_layer_override = config.config_layer_stack.layers_high_to_low().any(|layer| {
-        matches!(
-            &layer.name,
-            ConfigLayerSource::SessionFlags
-                | ConfigLayerSource::User {
-                    profile: Some(_),
-                    ..
-                }
-        ) && ["model", "model_provider", "model_reasoning_effort"]
-            .iter()
-            .any(|key| layer.config.get(*key).is_some())
-    });
-    if harness_overrides.model.is_some()
-        || harness_overrides.model_provider.is_some()
-        || has_layer_override
+    if config
+        .invocation_inference_overrides(harness_overrides)
+        .selects_root_model(model_policy_lane)
     {
         crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
     } else {
@@ -1115,7 +1104,11 @@ impl App {
     }
 
     pub(super) fn resume_model_settings(&self) -> crate::app_server_session::ResumeModelSettings {
-        resume_model_settings_for_overrides(&self.config, &self.harness_overrides)
+        resume_model_settings_for_overrides(
+            &self.config,
+            &self.harness_overrides,
+            self.model_policy_lane,
+        )
     }
 
     pub(super) fn reject_remote_resume_permission_override(&mut self, config: &Config) -> bool {
@@ -1598,7 +1591,7 @@ mod tests {
             },
         ];
         let mut ultra_preset = non_ultra_preset.clone();
-        ultra_preset.model = "gpt-5.6-sol".to_string();
+        ultra_preset.model = "gpt-6-astra".to_string();
         ultra_preset.default_reasoning_effort = ReasoningEffortConfig::Ultra;
         ultra_preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
             effort: ReasoningEffortConfig::Ultra,
@@ -1619,7 +1612,7 @@ mod tests {
         assert_eq!(
             app.config.plan_mode_reasoning_effort,
             Some(ReasoningEffortConfig::Ultra),
-            "the managed Sol/Ultra default must not be rewritten"
+            "the managed Astra/Ultra default must not be rewritten"
         );
         assert_eq!(
             app.compatible_plan_reasoning_effort_for_model(
@@ -1632,12 +1625,12 @@ mod tests {
         );
         assert_eq!(
             app.compatible_plan_reasoning_effort_for_model(
-                "gpt-5.6-sol",
+                "gpt-6-astra",
                 Some(ReasoningEffortConfig::High),
                 /*preserve_current_override*/ false,
             ),
             Some(ReasoningEffortConfig::Ultra),
-            "switching back to Sol must restore the managed Ultra Plan default"
+            "switching back to Astra must restore the managed Ultra Plan default"
         );
 
         let mut empty_supported = app
@@ -1839,6 +1832,61 @@ mod tests {
         );
 
         app.harness_overrides.model_provider = Some("custom-provider".to_string());
+        assert_eq!(
+            app.resume_model_settings(),
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_only_session_flag_restores_thread_model_selection() {
+        let mut app = make_test_app().await;
+        app.config.config_layer_stack = ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::SessionFlags,
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    "model_provider".to_string(),
+                    TomlValue::String("openai".to_string()),
+                )])),
+            )],
+            Default::default(),
+            Default::default(),
+        )
+        .expect("provider-only session flags layer stack");
+
+        for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
+            app.model_policy_lane = Some(lane);
+            assert_eq!(
+                app.resume_model_settings(),
+                crate::app_server_session::ResumeModelSettings::RestoreFromThread
+            );
+        }
+
+        app.model_policy_lane = None;
+        assert_eq!(
+            app.resume_model_settings(),
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+        );
+
+        app.model_policy_lane = Some(ModelPolicyLane::Subscription);
+        app.config.config_layer_stack = ConfigLayerStack::new(
+            vec![ConfigLayerEntry::new(
+                ConfigLayerSource::SessionFlags,
+                TomlValue::Table(toml::map::Map::from_iter([
+                    (
+                        "model_provider".to_string(),
+                        TomlValue::String("openai".to_string()),
+                    ),
+                    (
+                        "model_reasoning_effort".to_string(),
+                        TomlValue::String("high".to_string()),
+                    ),
+                ])),
+            )],
+            Default::default(),
+            Default::default(),
+        )
+        .expect("explicit effort session flags layer stack");
         assert_eq!(
             app.resume_model_settings(),
             crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig

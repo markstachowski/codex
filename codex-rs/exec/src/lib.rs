@@ -228,6 +228,7 @@ struct ExecRunArgs {
     oss: bool,
     output_schema_path: Option<PathBuf>,
     prompt: Option<String>,
+    resume_model_selection_overridden: bool,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
     thread_source: ThreadSource,
@@ -573,6 +574,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         persisted_permission_profile_id: None,
         cwd: resolved_cwd,
         workspace_roots: None,
+        managed_session_kind: None,
         model_provider: model_provider.clone(),
         service_tier: None,
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
@@ -600,12 +602,16 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .cloud_config_bundle(cloud_config_bundle.clone())
             .build()
     };
+    let invocation_harness_overrides = overrides.clone();
     let config = build_exec_config(
         overrides,
         dangerously_bypass_approvals_and_sandbox,
         build_config,
     )
     .await?;
+    let resume_model_selection_overridden = config
+        .invocation_inference_overrides(&invocation_harness_overrides)
+        .selects_root_model(codex_core::config::locked_model_policy_lane()?);
     let resume_approvals_reviewer_override = cli_kv_overrides
         .iter()
         .any(|(key, _)| key == "approvals_reviewer")
@@ -734,6 +740,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         oss,
         output_schema_path,
         prompt,
+        resume_model_selection_overridden,
         skip_git_repo_check,
         stderr_with_ansi,
         thread_source: thread_source.map(Into::into).unwrap_or(ThreadSource::User),
@@ -834,6 +841,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         oss,
         output_schema_path,
         prompt,
+        resume_model_selection_overridden,
         skip_git_repo_check,
         stderr_with_ansi,
         thread_source,
@@ -866,8 +874,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_effort = config.model_reasoning_effort.clone();
-
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
         (Some(ExecCommand::Review(review_cli)), _, _) => {
             let review_request = build_review_request(review_cli)?;
@@ -991,6 +997,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         &config,
                         thread_id,
                         resume_approvals_reviewer_override,
+                        resume_model_selection_overridden,
                     ),
                 },
                 "thread/resume",
@@ -1156,7 +1163,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         model: None,
                         service_tier: None,
                         service_tier_for_turn: None,
-                        effort: default_effort,
+                        effort: session_configured.reasoning_effort.clone(),
                         summary: None,
                         personality: None,
                         output_schema,
@@ -1373,6 +1380,7 @@ fn thread_resume_params_from_config(
     config: &Config,
     thread_id: String,
     approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
+    model_selection_overridden: bool,
 ) -> ThreadResumeParams {
     let permissions = permissions_selection_from_config(config);
     let sandbox = permissions.is_none().then(|| {
@@ -1383,8 +1391,10 @@ fn thread_resume_params_from_config(
     });
     ThreadResumeParams {
         thread_id,
-        model: config.model.clone(),
-        model_provider: Some(config.model_provider_id.clone()),
+        model: model_selection_overridden
+            .then(|| config.model.clone())
+            .flatten(),
+        model_provider: model_selection_overridden.then(|| config.model_provider_id.clone()),
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),

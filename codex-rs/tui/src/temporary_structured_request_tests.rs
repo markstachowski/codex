@@ -2,6 +2,10 @@ use super::STRUCTURED_RESPONSE_MAX_BYTES;
 use super::TemporaryStructuredThreadOptions;
 use super::collect_structured_response;
 use super::start_temporary_thread;
+use super::structured_request_timeout_for_lane;
+use super::temporary_inference_settings_for_lane;
+use crate::legacy_core::config::ASTRA_MODEL;
+use crate::legacy_core::config::ModelPolicyLane;
 use crate::test_support::PathBufExt;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ServerNotification;
@@ -9,9 +13,22 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 use tokio::sync::mpsc::unbounded_channel;
+
+#[test]
+fn managed_temporary_requests_receive_an_ultra_compatible_timeout() {
+    assert_eq!(
+        structured_request_timeout_for_lane(Some(ModelPolicyLane::Subscription)),
+        std::time::Duration::from_secs(120)
+    );
+    assert_eq!(
+        structured_request_timeout_for_lane(/*lane*/ None),
+        std::time::Duration::from_secs(30)
+    );
+}
 
 fn agent_message_notification(turn_id: &str, text: &str) -> ServerNotification {
     ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -43,6 +60,37 @@ fn turn_completed_notification(turn_id: &str, status: TurnStatus) -> ServerNotif
             duration_ms: None,
         },
     })
+}
+
+#[test]
+fn managed_temporary_threads_use_astra_ultra() {
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        let settings = temporary_inference_settings_for_lane(
+            "gpt-5.6-luna".to_string(),
+            Some(ReasoningEffort::Low),
+            Some(lane),
+        );
+        assert_eq!(
+            (settings.model, settings.reasoning_effort),
+            (ASTRA_MODEL.to_string(), Some(ReasoningEffort::Ultra)),
+            "managed automatic inference must be pinned for {lane:?}",
+        );
+    }
+
+    let settings = temporary_inference_settings_for_lane(
+        "gpt-5.6-luna".to_string(),
+        Some(ReasoningEffort::Low),
+        /*lane*/ None,
+    );
+    assert_eq!(
+        (settings.model, settings.reasoning_effort),
+        ("gpt-5.6-luna".to_string(), Some(ReasoningEffort::Low)),
+        "unmanaged temporary inference must preserve upstream behavior",
+    );
 }
 
 #[tokio::test]

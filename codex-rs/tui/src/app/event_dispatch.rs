@@ -21,15 +21,24 @@ use crate::session_resume::cwds_differ;
 use codex_app_server_protocol::ThreadGoalStatus;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
+use codex_protocol::openai_models::ReasoningEffort;
 
 pub(super) const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 
-fn should_persist_model_selection_for_lane(
+#[derive(Clone, Copy)]
+enum PersistedSelection {
+    Inference,
+    ServiceTier,
+}
+
+fn should_persist_selection_for_lane(
     lane: Option<&str>,
     release_default_is_managed: bool,
+    selection: PersistedSelection,
 ) -> std::result::Result<bool, String> {
     match lane {
-        Some("subscription" | "api" | "spark") => Ok(false),
+        Some("subscription" | "api") => Ok(matches!(selection, PersistedSelection::Inference)),
+        Some("spark") => Ok(false),
         Some(unknown) => Err(format!(
             "invalid model policy lane: unsupported CDX_MODEL_POLICY_LANE value `{unknown}`; expected subscription, api, or spark"
         )),
@@ -37,20 +46,48 @@ fn should_persist_model_selection_for_lane(
     }
 }
 
-fn should_persist_model_selection() -> std::result::Result<bool, String> {
+fn should_persist_selection(selection: PersistedSelection) -> std::result::Result<bool, String> {
     match std::env::var("CDX_MODEL_POLICY_LANE") {
-        Ok(value) => should_persist_model_selection_for_lane(
+        Ok(value) => should_persist_selection_for_lane(
             Some(value.trim()),
             /*release_default_is_managed*/ !cfg!(debug_assertions),
+            selection,
         ),
-        Err(std::env::VarError::NotPresent) => should_persist_model_selection_for_lane(
+        Err(std::env::VarError::NotPresent) => should_persist_selection_for_lane(
             /*lane*/ None,
             /*release_default_is_managed*/ !cfg!(debug_assertions),
+            selection,
         ),
         Err(std::env::VarError::NotUnicode(_)) => {
             Err("invalid model policy lane: CDX_MODEL_POLICY_LANE must be valid UTF-8".to_string())
         }
     }
+}
+
+fn model_selection_persistence_events(
+    model: String,
+    effort: Option<ReasoningEffort>,
+    scope: crate::app_event::ModelSelectionScope,
+) -> Vec<AppEvent> {
+    let mut events = Vec::with_capacity(2);
+    if matches!(
+        scope,
+        crate::app_event::ModelSelectionScope::Conversation
+            | crate::app_event::ModelSelectionScope::ConversationAndPlan
+    ) {
+        events.push(AppEvent::PersistModelSelection {
+            model,
+            effort: effort.clone(),
+        });
+    }
+    if matches!(
+        scope,
+        crate::app_event::ModelSelectionScope::PlanOnly
+            | crate::app_event::ModelSelectionScope::ConversationAndPlan
+    ) {
+        events.push(AppEvent::PersistPlanModeReasoningEffort(effort));
+    }
+    events
 }
 
 impl App {
@@ -1873,13 +1910,22 @@ impl App {
                                 }
                                 self.sync_active_thread_service_tier_to_cached_session()
                                     .await;
-                                self.chat_widget.add_info_message(
-                                    format!(
-                                        "Model changed to {model} {} for this conversation",
-                                        Self::reasoning_label(effort.as_ref())
-                                    ),
-                                    /*hint*/ None,
-                                );
+                                for event in model_selection_persistence_events(
+                                    model.clone(),
+                                    effort.clone(),
+                                    scope,
+                                ) {
+                                    self.app_event_tx.send(event);
+                                }
+                                if scope == crate::app_event::ModelSelectionScope::PlanOnly {
+                                    self.chat_widget.add_info_message(
+                                        format!(
+                                            "Model changed to {model} {} for this conversation",
+                                            Self::reasoning_label(effort.as_ref())
+                                        ),
+                                        /*hint*/ None,
+                                    );
+                                }
                             }
                             Err(err) => self.chat_widget.add_error_message(format!(
                                 "Model selection was not applied: {err}"
@@ -1914,23 +1960,8 @@ impl App {
                             params.collaboration_mode = Some(desired_mode);
                             self.send_thread_settings_update(app_server, params).await;
                         }
-                        if matches!(
-                            scope,
-                            crate::app_event::ModelSelectionScope::Conversation
-                                | crate::app_event::ModelSelectionScope::ConversationAndPlan
-                        ) {
-                            self.app_event_tx.send(AppEvent::PersistModelSelection {
-                                model: model.clone(),
-                                effort: effort.clone(),
-                            });
-                        }
-                        if matches!(
-                            scope,
-                            crate::app_event::ModelSelectionScope::PlanOnly
-                                | crate::app_event::ModelSelectionScope::ConversationAndPlan
-                        ) {
-                            self.app_event_tx
-                                .send(AppEvent::PersistPlanModeReasoningEffort(effort));
+                        for event in model_selection_persistence_events(model, effort, scope) {
+                            self.app_event_tx.send(event);
                         }
                     }
                 }
@@ -2491,7 +2522,7 @@ impl App {
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
-                match should_persist_model_selection() {
+                match should_persist_selection(PersistedSelection::Inference) {
                     Err(error) => {
                         tracing::error!(error = %error, "invalid model policy lane");
                         self.chat_widget.add_error_message(error);
@@ -2621,7 +2652,7 @@ impl App {
             }
             AppEvent::PersistServiceTierSelection { service_tier } => {
                 self.refresh_status_line();
-                match should_persist_model_selection() {
+                match should_persist_selection(PersistedSelection::ServiceTier) {
                     Err(error) => {
                         tracing::error!(error = %error, "invalid model policy lane");
                         self.chat_widget.add_error_message(error);
@@ -2870,7 +2901,7 @@ impl App {
                 }
             }
             AppEvent::PersistPlanModeReasoningEffort(effort) => {
-                match should_persist_model_selection() {
+                match should_persist_selection(PersistedSelection::Inference) {
                     Err(error) => {
                         tracing::error!(error = %error, "invalid model policy lane");
                         self.chat_widget.add_error_message(error);
@@ -3811,35 +3842,87 @@ impl App {
 
 #[cfg(test)]
 mod model_policy_tests {
-    use super::should_persist_model_selection_for_lane;
+    use super::PersistedSelection;
+    use super::model_selection_persistence_events;
+    use super::should_persist_selection_for_lane;
+    use crate::app_event::AppEvent;
+    use crate::app_event::ModelSelectionScope;
+    use codex_protocol::openai_models::ReasoningEffort;
 
     #[test]
-    fn managed_model_selection_does_not_persist_as_default() {
-        for lane in ["subscription", "api", "spark"] {
+    fn model_selection_persistence_events_follow_selection_scope() {
+        for (scope, expected_model, expected_plan) in [
+            (ModelSelectionScope::Conversation, true, false),
+            (ModelSelectionScope::PlanOnly, false, true),
+            (ModelSelectionScope::ConversationAndPlan, true, true),
+        ] {
+            let events = model_selection_persistence_events(
+                "gpt-6-astra".to_string(),
+                Some(ReasoningEffort::Ultra),
+                scope,
+            );
             assert_eq!(
-                should_persist_model_selection_for_lane(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AppEvent::PersistModelSelection { .. }))
+                    .count(),
+                usize::from(expected_model),
+                "scope: {scope:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, AppEvent::PersistPlanModeReasoningEffort(_))
+                    })
+                    .count(),
+                usize::from(expected_plan),
+                "scope: {scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selectable_lane_inference_selection_persists_as_default() {
+        for lane in ["subscription", "api"] {
+            assert_eq!(
+                should_persist_selection_for_lane(
                     Some(lane),
                     /*release_default_is_managed*/ false,
+                    PersistedSelection::Inference,
                 ),
-                Ok(false)
+                Ok(true)
             );
         }
         assert_eq!(
-            should_persist_model_selection_for_lane(
-                /*lane*/ None, /*release_default_is_managed*/ false,
+            should_persist_selection_for_lane(
+                Some("spark"),
+                /*release_default_is_managed*/ false,
+                PersistedSelection::Inference,
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            should_persist_selection_for_lane(
+                /*lane*/ None,
+                /*release_default_is_managed*/ false,
+                PersistedSelection::Inference,
             ),
             Ok(true)
         );
         assert_eq!(
-            should_persist_model_selection_for_lane(
-                /*lane*/ None, /*release_default_is_managed*/ true,
+            should_persist_selection_for_lane(
+                /*lane*/ None,
+                /*release_default_is_managed*/ true,
+                PersistedSelection::Inference,
             ),
             Ok(false)
         );
         assert!(
-            should_persist_model_selection_for_lane(
+            should_persist_selection_for_lane(
                 Some("invalid"),
                 /*release_default_is_managed*/ false,
+                PersistedSelection::Inference,
             )
             .is_err()
         );
@@ -3849,12 +3932,29 @@ mod model_policy_tests {
     fn managed_service_tier_selection_does_not_persist_as_default() {
         for lane in ["subscription", "api", "spark"] {
             assert_eq!(
-                should_persist_model_selection_for_lane(
+                should_persist_selection_for_lane(
                     Some(lane),
                     /*release_default_is_managed*/ false,
+                    PersistedSelection::ServiceTier,
                 ),
                 Ok(false)
             );
         }
+        assert_eq!(
+            should_persist_selection_for_lane(
+                /*lane*/ None,
+                /*release_default_is_managed*/ false,
+                PersistedSelection::ServiceTier,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            should_persist_selection_for_lane(
+                /*lane*/ None,
+                /*release_default_is_managed*/ true,
+                PersistedSelection::ServiceTier,
+            ),
+            Ok(false)
+        );
     }
 }

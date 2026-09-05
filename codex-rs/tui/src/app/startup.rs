@@ -477,6 +477,7 @@ impl App {
                 let model_settings = config_persistence::resume_model_settings_for_overrides(
                     &config,
                     &harness_overrides,
+                    crate::legacy_core::config::locked_model_policy_lane()?,
                 );
                 let resumed = match startup_draft
                     .run_until(

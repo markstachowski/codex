@@ -534,7 +534,7 @@ mod tests {
     fn locked_model_policy_accepts_exact_configured_subagent_defaults() {
         validate_locked_requested_spawn_overrides(
             ModelPolicyLane::Api,
-            Some("gpt-5.6-sol"),
+            Some("gpt-6-astra"),
             Some(&ReasoningEffort::Ultra),
         )
         .expect("exact configured subagent defaults must remain valid");
@@ -549,14 +549,14 @@ mod tests {
         )
         .expect_err("a configured child model must not escape the API lane");
 
-        assert!(error.to_string().contains("required gpt-5.6-sol"));
+        assert!(error.to_string().contains("required gpt-6-astra"));
     }
 
     #[test]
     fn locked_model_policy_rejects_configured_subagent_effort_drift() {
         let error = validate_locked_requested_spawn_overrides(
             ModelPolicyLane::Api,
-            Some("gpt-5.6-sol"),
+            Some("gpt-6-astra"),
             Some(&ReasoningEffort::High),
         )
         .expect_err("a configured child effort must not escape the API lane");

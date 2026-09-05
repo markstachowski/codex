@@ -1,5 +1,10 @@
 //! Run isolated structured requests through existing app-server methods.
 
+use crate::legacy_core::config::MANAGED_TEMPORARY_STRUCTURED_DISABLED_BOOL_OVERRIDES;
+use crate::legacy_core::config::ManagedBackgroundInferenceSettings;
+use crate::legacy_core::config::ModelPolicyLane;
+use crate::legacy_core::config::locked_model_policy_lane;
+use crate::legacy_core::config::managed_background_inference_for_lane;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AskForApproval;
@@ -27,7 +32,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::Uuid;
 
-const STRUCTURED_TURN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+const STRUCTURED_REQUEST_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+const MANAGED_STRUCTURED_REQUEST_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 120);
 const STRUCTURED_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 
 /// Preserve the visible thread's provider, permissions, and external-tool isolation.
@@ -37,6 +43,22 @@ pub(crate) struct TemporaryStructuredThreadOptions {
     pub(crate) cwd: String,
     pub(crate) active_permission_profile: Option<String>,
     pub(crate) mcp_server_names: Vec<String>,
+}
+
+fn temporary_inference_settings_for_lane(
+    model: String,
+    effort: Option<ReasoningEffort>,
+    lane: Option<ModelPolicyLane>,
+) -> ManagedBackgroundInferenceSettings {
+    managed_background_inference_for_lane(model, effort, None, lane)
+}
+
+fn structured_request_timeout_for_lane(lane: Option<ModelPolicyLane>) -> Duration {
+    if lane.is_some() {
+        MANAGED_STRUCTURED_REQUEST_TIMEOUT
+    } else {
+        STRUCTURED_REQUEST_TIMEOUT
+    }
 }
 
 /// Start an ephemeral thread without widening permissions or exposing tools and environment access.
@@ -54,48 +76,34 @@ pub(crate) async fn start_temporary_thread(
         active_permission_profile,
         mcp_server_names,
     } = options;
-    let custom_permission_profile =
-        active_permission_profile.filter(|profile| !profile.starts_with(':'));
-    let mut config = std::collections::HashMap::from([
-        ("features.apps".to_string(), false.into()),
-        ("features.code_mode".to_string(), false.into()),
-        ("features.code_mode_only".to_string(), false.into()),
-        ("features.context_management".to_string(), false.into()),
-        ("features.current_time_reminder".to_string(), false.into()),
-        ("features.deferred_executor".to_string(), false.into()),
-        ("features.enable_fanout".to_string(), false.into()),
-        ("features.goals".to_string(), false.into()),
-        ("features.hooks".to_string(), false.into()),
-        ("features.image_generation".to_string(), false.into()),
-        ("features.memories".to_string(), false.into()),
-        ("features.multi_agent".to_string(), false.into()),
-        ("features.multi_agent_v2".to_string(), false.into()),
-        ("features.plugins".to_string(), false.into()),
-        (
-            "features.request_permissions_tool".to_string(),
-            false.into(),
-        ),
-        ("features.shell_snapshot".to_string(), false.into()),
-        ("features.shell_tool".to_string(), false.into()),
-        ("features.standalone_web_search".to_string(), false.into()),
-        ("features.token_budget".to_string(), false.into()),
-        ("features.tool_suggest".to_string(), false.into()),
-        ("features.unified_exec".to_string(), false.into()),
-        ("features.view_image".to_string(), false.into()),
-        ("orchestrator.skills.enabled".to_string(), false.into()),
-        ("skills.include_instructions".to_string(), false.into()),
-        (
-            "token_budget.use_history_notes_extension".to_string(),
-            false.into(),
-        ),
-        (
-            "tools.experimental_request_user_input.enabled".to_string(),
-            false.into(),
-        ),
-        ("tools.update_plan.enabled".to_string(), false.into()),
-        ("web_search".to_string(), "disabled".into()),
-    ]);
-    let response: ThreadStartResponse = tokio::time::timeout(STRUCTURED_TURN_TIMEOUT, async {
+    let lane = locked_model_policy_lane()?;
+    let request_timeout = structured_request_timeout_for_lane(lane);
+    let settings = temporary_inference_settings_for_lane(model, /*effort*/ None, lane);
+    let model = settings.model;
+    let custom_permission_profile = lane
+        .is_none()
+        .then_some(active_permission_profile)
+        .flatten()
+        .filter(|profile| !profile.starts_with(':'));
+    let mut config = MANAGED_TEMPORARY_STRUCTURED_DISABLED_BOOL_OVERRIDES
+        .iter()
+        .map(|key| ((*key).to_string(), false.into()))
+        .collect::<std::collections::HashMap<_, _>>();
+    config.insert("web_search".to_string(), "disabled".into());
+    if let Some(reasoning_effort) = settings.reasoning_effort {
+        config.insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::to_value(reasoning_effort.clone())?,
+        );
+        config.insert(
+            "plan_mode_reasoning_effort".to_string(),
+            serde_json::to_value(reasoning_effort)?,
+        );
+    }
+    if let Some(service_tier) = settings.service_tier {
+        config.insert("service_tier".to_string(), service_tier.into());
+    }
+    let response: ThreadStartResponse = tokio::time::timeout(request_timeout, async {
         // Fail closed if the remote-effective MCP configuration cannot be read.
         let effective_config: ConfigReadResponse = request_handle
             .request_typed(ClientRequest::ConfigRead {
@@ -244,7 +252,7 @@ pub(crate) async fn unsubscribe_temporary_thread(
     thread_id: String,
 ) {
     match tokio::time::timeout(
-        STRUCTURED_TURN_TIMEOUT,
+        STRUCTURED_REQUEST_TIMEOUT,
         request_handle.request_typed::<ThreadUnsubscribeResponse>(
             ClientRequest::ThreadUnsubscribe {
                 request_id: RequestId::String(format!(
@@ -276,7 +284,11 @@ pub(crate) async fn run_temporary_structured_turn(
     effort: Option<ReasoningEffort>,
     notifications: UnboundedReceiver<ServerNotification>,
 ) -> color_eyre::Result<String> {
-    let result = tokio::time::timeout(STRUCTURED_TURN_TIMEOUT, async {
+    let lane = locked_model_policy_lane()?;
+    let request_timeout = structured_request_timeout_for_lane(lane);
+    let effort =
+        temporary_inference_settings_for_lane(String::new(), effort, lane).reasoning_effort;
+    let result = tokio::time::timeout(request_timeout, async {
         let turn = start_structured_turn(
             &request_handle,
             thread_id.clone(),

@@ -18,7 +18,8 @@ use codex_protocol::protocol::AskForApproval;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_lane() -> Result<()> {
+async fn managed_startup_prewarm_captures_one_coherent_astra_snapshot_for_every_lane() -> Result<()>
+{
     for lane in [
         ModelPolicyLane::Api,
         ModelPolicyLane::Subscription,
@@ -45,8 +46,13 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
             .await;
         let original = session.collaboration_mode().await;
         let (root_model, root_effort, root_tier) = match lane {
-            ModelPolicyLane::Api | ModelPolicyLane::Subscription => (
+            ModelPolicyLane::Subscription => (
                 "gpt-5.5".to_string(),
+                ReasoningEffort::High,
+                Some(ServiceTier::Fast.request_value().to_string()),
+            ),
+            ModelPolicyLane::Api => (
+                "gpt-5.6-terra".to_string(),
                 ReasoningEffort::High,
                 Some(ServiceTier::Fast.request_value().to_string()),
             ),
@@ -103,7 +109,7 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
         assert_eq!(
             guardian_parent_turn.model_info().slug.as_str(),
             root_model.as_str(),
-            "Guardian must retain the interactive root turn while managed prewarm uses Sol"
+            "Guardian must retain the interactive root turn while managed prewarm uses Astra"
         );
         assert_eq!(guardian_parent_turn.reasoning_effort(), Some(&root_effort));
         assert_eq!(guardian_parent_turn.config.service_tier, root_tier);
@@ -115,13 +121,13 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
             .expect("startup prewarm must be captured from one coherent managed turn");
         assert!(
             !managed_step.tool_router.model_visible_specs().is_empty(),
-            "{} managed startup prewarm must construct model-visible tools from the Sol turn",
+            "{} managed startup prewarm must construct model-visible tools from the Astra turn",
             lane.as_str()
         );
         assert_eq!(
             managed_step.turn.multi_agent_version,
             lane.required_multi_agent_version(),
-            "managed Sol prewarm must retain the lane's reviewed agent capability boundary"
+            "managed Astra prewarm must retain the lane's reviewed agent capability boundary"
         );
 
         assert_eq!(
@@ -130,7 +136,7 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                 managed_step.turn.model_info().slug.as_str(),
                 managed_step.turn.config.model.as_deref(),
             ),
-            ("gpt-5.6-sol", "gpt-5.6-sol", Some("gpt-5.6-sol"),),
+            ("gpt-6-astra", "gpt-6-astra", Some("gpt-6-astra"),),
             "{} must not retain any root-model authority in the managed snapshot",
             lane.as_str()
         );
@@ -219,7 +225,7 @@ async fn managed_startup_prewarm_captures_one_coherent_sol_snapshot_for_every_la
                         .get_model_instructions(managed_step.turn.personality()),
                 ),
                 provenance: Some(BaseInstructionsProvenance::Model {
-                    model: "gpt-5.6-sol".to_string(),
+                    model: "gpt-6-astra".to_string(),
                 }),
             }
         );
@@ -269,7 +275,7 @@ async fn managed_startup_prewarm_seeds_missing_root_metadata_and_preserves_resol
         .await
         .request;
 
-    assert_eq!(managed_turn.model_info().slug, "gpt-5.6-sol");
+    assert_eq!(managed_turn.model_info().slug, "gpt-6-astra");
     assert_eq!(managed_turn.reasoning_summary(), ReasoningSummary::Auto);
     assert_eq!(
         managed_turn.config.model_reasoning_summary,
@@ -278,7 +284,7 @@ async fn managed_startup_prewarm_seeds_missing_root_metadata_and_preserves_resol
     assert_eq!(
         managed_turn.model_info().default_reasoning_summary,
         ReasoningSummary::None,
-        "the preserved Auto value must come from the root snapshot, not Sol defaults"
+        "the preserved Auto value must come from the root snapshot, not Astra defaults"
     );
     let root_metadata = session
         .services
@@ -360,8 +366,13 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         .await;
     let original = session.collaboration_mode().await;
     let (root_model, root_effort, root_tier) = match lane {
-        ModelPolicyLane::Api | ModelPolicyLane::Subscription => (
+        ModelPolicyLane::Subscription => (
             "gpt-5.5".to_string(),
+            ReasoningEffort::High,
+            Some(ServiceTier::Fast.request_value().to_string()),
+        ),
+        ModelPolicyLane::Api => (
+            "gpt-5.6-terra".to_string(),
             ReasoningEffort::High,
             Some(ServiceTier::Fast.request_value().to_string()),
         ),
@@ -395,7 +406,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
     lane_env.restore();
     assert_eq!(locked_model_policy_lane()?, Some(lane));
 
-    let sol_model_info = session
+    let astra_model_info = session
         .services
         .models_manager
         .get_model_info(
@@ -403,7 +414,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
             &root_turn.config.to_models_manager_config(),
         )
         .await;
-    let expected_instructions = sol_model_info.get_model_instructions(root_turn.personality());
+    let expected_instructions = astra_model_info.get_model_instructions(root_turn.personality());
     let base_instructions = BaseInstructions {
         text: root_turn
             .model_info()
@@ -439,7 +450,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         BaseInstructions {
             text: expected_instructions.clone(),
             provenance: Some(BaseInstructionsProvenance::Model {
-                model: "gpt-5.6-sol".to_string(),
+                model: "gpt-6-astra".to_string(),
             }),
         }
     );
@@ -450,7 +461,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
     );
     assert!(
         !prepared.prompt.tools.is_empty(),
-        "managed prewarm must serialize the Sol tool snapshot"
+        "managed prewarm must serialize the Astra tool snapshot"
     );
 
     // This helper materializes only the body. It intentionally does not call current_client_setup,
@@ -478,6 +489,10 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         ModelPolicyLane::Api => Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
         ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
     };
+    let expected_effort = match lane {
+        ModelPolicyLane::Api => "max",
+        ModelPolicyLane::Subscription | ModelPolicyLane::Spark => "xhigh",
+    };
     for (transport, wire) in [("HTTP", &http_wire), ("WebSocket", &websocket_wire)] {
         assert_eq!(
             (
@@ -488,15 +503,15 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
                 wire["parallel_tool_calls"].as_bool(),
             ),
             (
-                Some("gpt-5.6-sol"),
+                Some("gpt-6-astra"),
                 expected_mode,
-                Some("max"),
+                Some(expected_effort),
                 expected_tier,
-                Some(!sol_model_info.use_responses_lite),
+                Some(!astra_model_info.use_responses_lite),
             ),
             "{transport} must carry the actual locked lane's managed prewarm contract"
         );
-        let serialized_instructions = if sol_model_info.use_responses_lite {
+        let serialized_instructions = if astra_model_info.use_responses_lite {
             wire["input"]
                 .as_array()
                 .and_then(|input| {
@@ -511,7 +526,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         assert_eq!(
             serialized_instructions,
             Some(expected_instructions.as_str()),
-            "{transport} must serialize the Sol-derived base instructions"
+            "{transport} must serialize the Astra-derived base instructions"
         );
     }
     assert_eq!(http_wire.get("generate"), None);

@@ -129,6 +129,8 @@ mod thread_processor_behavior_tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
+    use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+    use codex_protocol::protocol::ThreadSettingsSnapshot;
     use codex_protocol::protocol::TurnEnvironmentSelections;
     use codex_state::ThreadMetadataBuilder;
     use codex_thread_store::StoredThread;
@@ -780,6 +782,105 @@ mod thread_processor_behavior_tests {
             )]))
         );
         Ok(())
+    }
+
+    fn resumed_history_with_model_selection(
+        model: &str,
+        reasoning_effort: ReasoningEffort,
+    ) -> InitialHistory {
+        let thread_id = ThreadId::new();
+        InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history: Arc::new(vec![RolloutItem::EventMsg(
+                codex_protocol::protocol::EventMsg::ThreadSettingsApplied(
+                    ThreadSettingsAppliedEvent {
+                        thread_id: Some(thread_id),
+                        thread_settings: ThreadSettingsSnapshot {
+                            model: model.to_string(),
+                            model_provider_id: "openai".to_string(),
+                            service_tier: None,
+                            approval_policy: AskForApproval::Never,
+                            approvals_reviewer:
+                                codex_protocol::config_types::ApprovalsReviewer::User,
+                            permission_profile: PermissionProfile::read_only(),
+                            active_permission_profile: None,
+                            cwd: "/tmp".try_into().expect("absolute test path"),
+                            reasoning_effort: Some(reasoning_effort.clone()),
+                            reasoning_summary: None,
+                            personality: None,
+                            collaboration_mode: CollaborationMode {
+                                mode: ModeKind::Default,
+                                settings: Settings {
+                                    model: model.to_string(),
+                                    reasoning_effort: Some(reasoning_effort),
+                                    developer_instructions: None,
+                                },
+                            },
+                        },
+                    },
+                ),
+            )]),
+            rollout_path: None,
+        })
+    }
+
+    #[test]
+    fn resume_model_selection_uses_db_then_legacy_history_fallback() -> Result<()> {
+        let history = resumed_history_with_model_selection("gpt-5.5", ReasoningEffort::High);
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides::default();
+
+        let restored = apply_persisted_or_history_model_selection(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            /*persisted_metadata*/ None,
+            &history,
+        );
+        assert_eq!(restored, Some(Some(ReasoningEffort::High)));
+        assert_eq!(typesafe_overrides.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(typesafe_overrides.model_provider, None);
+        assert_eq!(
+            request_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get("model_reasoning_effort")),
+            Some(&json!("high"))
+        );
+
+        let persisted = test_thread_metadata(Some("gpt-5.6-luna"), Some(ReasoningEffort::Medium))?;
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let restored = apply_persisted_or_history_model_selection(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            Some(&persisted),
+            &history,
+        );
+        assert_eq!(restored, Some(Some(ReasoningEffort::Medium)));
+        assert_eq!(typesafe_overrides.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(
+            typesafe_overrides.model_provider.as_deref(),
+            Some("mock_provider")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_model_restore_policy_includes_both_selectable_lanes() {
+        use codex_core::config::ModelPolicyLane;
+
+        for lane in [
+            /*lane*/ None,
+            Some(ModelPolicyLane::Subscription),
+            Some(ModelPolicyLane::Api),
+        ] {
+            assert!(
+                should_restore_persisted_model_selection(lane),
+                "lane: {lane:?}"
+            );
+        }
+        assert!(!should_restore_persisted_model_selection(Some(
+            ModelPolicyLane::Spark
+        )));
     }
 
     #[test]

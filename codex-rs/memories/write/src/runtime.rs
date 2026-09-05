@@ -438,7 +438,7 @@ mod managed_service_tier_tests {
     use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 
     #[test]
-    fn locked_model_policy_managed_memory_uses_sol_ultra_standard() {
+    fn locked_model_policy_managed_memory_uses_astra_ultra_standard() {
         for lane in [
             codex_core::config::ModelPolicyLane::Subscription,
             codex_core::config::ModelPolicyLane::Api,
@@ -450,7 +450,7 @@ mod managed_service_tier_tests {
                 Some("priority".to_string()),
                 Some(lane),
             );
-            assert_eq!(managed.model, codex_core::config::SOL_MODEL);
+            assert_eq!(managed.model, codex_core::config::ASTRA_MODEL);
             assert_eq!(managed.reasoning_effort, Some(ReasoningEffort::Ultra));
             assert_eq!(
                 managed.service_tier.as_deref(),

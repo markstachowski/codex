@@ -317,7 +317,16 @@ async fn schedule_startup_prewarm_inner(
             &prompt,
             &step_context.settings.model_info,
             &step_context.session_telemetry,
-            step_context.settings.reasoning_effort().cloned(),
+            if lane.is_some() {
+                step_context.settings.reasoning_effort().cloned()
+            } else {
+                session
+                    .reasoning_effort_for_request(
+                        &step_context.settings,
+                        RequestEffortUsage::Sampling,
+                    )
+                    .await
+            },
             step_context.settings.reasoning_summary,
             step_context.settings.service_tier.clone(),
             &responses_metadata,

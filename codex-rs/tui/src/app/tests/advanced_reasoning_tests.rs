@@ -6,11 +6,13 @@ use pretty_assertions::assert_eq;
 #[tokio::test]
 async fn fork_current_session_uses_fresh_root_model_settings() -> Result<()> {
     let mut app = make_test_app().await;
-    let expected_model = app.config.model.clone().expect("configured test model");
-    let expected_reasoning_effort = app.config.model_reasoning_effort.clone();
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"high\"\n",
+    )?;
     let source_thread_id = ThreadId::from_string(
         &create_fake_rollout(
             codex_home.path(),
@@ -39,10 +41,10 @@ async fn fork_current_session_uses_fresh_root_model_settings() -> Result<()> {
 
     assert!(matches!(control, AppRunControl::Continue));
     assert_ne!(app.chat_widget.thread_id(), Some(source_thread_id));
-    assert_eq!(app.chat_widget.current_model(), expected_model);
+    assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
     assert_eq!(
         app.chat_widget.current_reasoning_effort(),
-        expected_reasoning_effort
+        Some(ReasoningEffortConfig::High)
     );
     app_server.shutdown().await?;
     Ok(())

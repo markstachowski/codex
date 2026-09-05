@@ -1134,7 +1134,7 @@ async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
 }
 
 #[tokio::test]
-async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
+async fn start_thread_keeps_private_internal_threads_hidden_but_allows_managed_automatic_lookup() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1147,19 +1147,29 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
-    let thread = manager
-        .start_thread(StartThreadOptions {
-            session_source: Some(SessionSource::Internal(
-                InternalSessionSource::MemoryConsolidation,
-            )),
-            environments: Some(Vec::new()),
-            ..StartThreadOptions::new(config)
-        })
-        .await
-        .expect("internal thread should start");
+    let mut threads = Vec::new();
+    for (source, directly_retrievable) in [
+        (InternalSessionSource::MemoryConsolidation, false),
+        (InternalSessionSource::Guardian, false),
+        (InternalSessionSource::TemporaryStructured, true),
+        (InternalSessionSource::ManagedBackground, true),
+    ] {
+        let thread = manager
+            .start_thread(StartThreadOptions {
+                session_source: Some(SessionSource::Internal(source)),
+                environments: Some(Vec::new()),
+                ..StartThreadOptions::new(config.clone())
+            })
+            .await
+            .expect("internal thread should start");
+        assert_eq!(
+            manager.get_thread(thread.thread_id).await.is_ok(),
+            directly_retrievable,
+        );
+        threads.push(thread.thread_id);
+    }
 
     assert_eq!(manager.list_thread_ids().await, Vec::new());
-    assert!(manager.get_thread(thread.thread_id).await.is_err());
     assert!(
         codex_diagnostics::snapshot()
             .gauges
@@ -1170,7 +1180,12 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
     let report = manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
-    assert_eq!(report.completed, vec![thread.thread_id]);
+    assert_eq!(report.completed.len(), threads.len());
+    assert!(
+        threads
+            .iter()
+            .all(|thread_id| report.completed.contains(thread_id))
+    );
     assert!(report.submit_failed.is_empty());
     assert!(report.timed_out.is_empty());
     assert!(manager.list_thread_ids().await.is_empty());

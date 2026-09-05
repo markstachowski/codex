@@ -498,31 +498,19 @@ fn apply_locked_new_root_inference_defaults_for_lane(
     let Some(lane) = lane else {
         return;
     };
-    let Some((model, effort)) = locked_new_root_inference_defaults_for_lane(
-        conversation_history,
-        session_source,
-        Some(lane),
-    ) else {
-        return;
-    };
-
-    config.model = Some(model.to_string());
-    config.model_reasoning_effort = Some(effort.clone());
-    config.plan_mode_reasoning_effort = Some(effort);
-    config.service_tier = Some(lane.required_root_service_tier().to_string());
-}
-
-fn locked_new_root_inference_defaults_for_lane(
-    conversation_history: &InitialHistory,
-    session_source: &SessionSource,
-    lane: Option<crate::config::ModelPolicyLane>,
-) -> Option<(&'static str, ReasoningEffortConfig)> {
     if session_source.is_non_root_agent()
         || matches!(conversation_history, InitialHistory::Resumed(_))
     {
-        return None;
+        return;
     }
-    lane.map(|lane| (lane.required_model(), lane.required_local_effort()))
+
+    config.service_tier = Some(lane.required_root_service_tier().to_string());
+    if !lane.allows_user_model_selection() {
+        let effort = lane.required_local_effort();
+        config.model = Some(lane.required_model().to_string());
+        config.model_reasoning_effort = Some(effort.clone());
+        config.plan_mode_reasoning_effort = Some(effort);
+    }
 }
 
 fn apply_locked_new_root_inference_defaults(
@@ -702,19 +690,20 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
-        // Resume restores the root's own prior selection on any lane that
-        // permits selection; fresh roots still reset to the lane defaults.
+        // Every selectable root is validated against the current picker
+        // catalog. Config loading resolves explicit resume overrides versus
+        // persisted settings before the session is created.
         let locked_lane = crate::config::locked_model_policy_lane()
             .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
-        let restored_model_selection = if !session_source.is_non_root_agent()
+        let mut root_model_selection = if !session_source.is_non_root_agent()
             && locked_lane.is_some_and(super::config::ModelPolicyLane::allows_user_model_selection)
         {
-            conversation_history.get_resumed_model_selection()
+            Some((model.clone(), config.model_reasoning_effort.clone()))
         } else {
             None
         };
-        if let (Some((restored_model, restored_effort)), Some(lane)) =
-            (restored_model_selection.as_ref(), locked_lane)
+        if let (Some(lane), Some((selected_model, selected_effort))) =
+            (locked_lane, root_model_selection.as_mut())
         {
             let available_models = match available_models_snapshot.as_ref() {
                 Some(available_models) => available_models.clone(),
@@ -727,26 +716,68 @@ impl Session {
                         .await
                 }
             };
+            if selected_effort.is_none()
+                && let Some(default_effort) = available_models
+                    .iter()
+                    .find(|preset| preset.show_in_picker && preset.model == selected_model.as_str())
+                    .map(|preset| preset.default_reasoning_effort.clone())
+            {
+                *selected_effort = Some(default_effort.clone());
+                Arc::make_mut(&mut config).model_reasoning_effort = Some(default_effort);
+            }
             session::validate_root_model_selection_for_lane(
                 lane,
-                restored_model,
-                restored_effort.as_ref(),
+                selected_model.as_str(),
+                selected_effort.as_ref(),
                 &available_models,
             )
             .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            if config.plan_mode_reasoning_effort.is_none() {
+                Arc::make_mut(&mut config).plan_mode_reasoning_effort = selected_effort.clone();
+            } else if let Some(plan_effort) = config.plan_mode_reasoning_effort.as_ref() {
+                let plan_effort_validation = session::validate_root_model_selection_for_lane(
+                    lane,
+                    selected_model.as_str(),
+                    Some(plan_effort),
+                    &available_models,
+                );
+                if let Err(err) = plan_effort_validation {
+                    let plan_effort_was_explicit =
+                        config.config_layer_stack.layers_high_to_low().any(|layer| {
+                            matches!(
+                                &layer.name,
+                                ConfigLayerSource::SessionFlags
+                                    | ConfigLayerSource::User {
+                                        profile: Some(_),
+                                        ..
+                                    }
+                            ) && layer.config.get("plan_mode_reasoning_effort").is_some()
+                        });
+                    if plan_effort_was_explicit {
+                        return Err(CodexErr::InvalidRequest(format!(
+                            "plan_mode_reasoning_effort is incompatible with the selected root model: {err}"
+                        )));
+                    }
+                    // The Plan default is not thread-owned. When a selected
+                    // model changes underneath an inherited global default,
+                    // retain the already validated ordinary effort rather than
+                    // emitting an unsupported pair later in Plan mode.
+                    Arc::make_mut(&mut config).plan_mode_reasoning_effort = selected_effort.clone();
+                }
+            }
         }
         config
             .validate_locked_session_inference_settings(
-                session_source.is_non_root_agent(),
+                &session_source,
                 model.as_str(),
                 config.model_reasoning_effort.as_ref(),
                 config.service_tier.as_deref(),
             )
             .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
-        let effective_model = restored_model_selection
+        let effective_model = root_model_selection
             .as_ref()
             .map_or_else(|| model.clone(), |(model, _)| model.clone());
-        let effective_reasoning_effort = restored_model_selection.as_ref().map_or_else(
+        let effective_reasoning_effort = root_model_selection.as_ref().map_or_else(
             || config.model_reasoning_effort.clone(),
             |(_, effort)| effort.clone(),
         );
@@ -873,7 +904,14 @@ impl Session {
             &model_info,
         );
         let service_tier =
-            get_service_tier(config.service_tier.clone(), fast_mode_enabled, &model_info);
+            if session_source.is_temporary_structured() || session_source.is_managed_background() {
+                // Internal background sessions always materialize the explicit
+                // Standard sentinel, including on Spark where Fast Mode itself is
+                // disabled. Bootstrap validation already pinned this value.
+                config.service_tier.clone()
+            } else {
+                get_service_tier(config.service_tier.clone(), fast_mode_enabled, &model_info)
+            };
         let session_configuration = SessionConfiguration {
             provider: create_model_provider(
                 config.model_provider.clone(),
@@ -1876,7 +1914,8 @@ impl Session {
         should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
     ) -> ConstraintResult<Option<SessionSettingsCommit>> {
         let lane = Self::model_policy_lane_for_update(&updates)?;
-        self.validate_model_selection_update_for_lane(&updates, lane)
+        let updates = self
+            .validate_model_selection_update_for_lane(updates, lane)
             .await?;
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let (commit, previous_config, new_config, permission_profile_changed, mcp_inputs_changed) = {
@@ -1969,11 +2008,12 @@ impl Session {
         Option<Config>,
         Option<Config>,
     )> {
-        self.validate_model_selection_update_for_lane(updates, lane)
+        let updates = self
+            .validate_model_selection_update_for_lane(updates.clone(), lane)
             .await?;
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let mut state = self.state.lock().await;
-        let updated = match self.apply_session_settings(&state.session_configuration, updates) {
+        let updated = match self.apply_session_settings(&state.session_configuration, &updates) {
             Ok(updated) => updated,
             Err(err) => {
                 warn!("rejected session settings update: {err}");
@@ -1987,7 +2027,7 @@ impl Session {
         let updated_permission_profile = updated.permission_profile();
         let permission_profile_changed = previous_permission_profile != updated_permission_profile;
         let mcp_inputs_changed =
-            self.mcp_inputs_differ(&state.session_configuration, &updated, updates);
+            self.mcp_inputs_differ(&state.session_configuration, &updated, &updates);
         // Environment configs refresh whenever they changed, not only when
         // selections were explicitly updated. This is the shared body every
         // settings-update path funnels through.
@@ -2030,10 +2070,11 @@ impl Session {
         updates: &SessionSettingsUpdate,
         lane: Option<crate::config::ModelPolicyLane>,
     ) -> ConstraintResult<ThreadConfigSnapshot> {
-        self.validate_model_selection_update_for_lane(updates, lane)
+        let updates = self
+            .validate_model_selection_update_for_lane(updates.clone(), lane)
             .await?;
         let state = self.state.lock().await;
-        let configuration = self.apply_session_settings(&state.session_configuration, updates)?;
+        let configuration = self.apply_session_settings(&state.session_configuration, &updates)?;
         let environments = updates.environments.as_ref().map_or_else(
             || self.services.turn_environments.selections(),
             |environments| environments.environments.clone(),
@@ -2045,6 +2086,8 @@ impl Session {
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<Option<crate::config::ModelPolicyLane>> {
         if updates.step_settings.collaboration_mode.is_none()
+            && updates.step_settings.model.is_none()
+            && updates.step_settings.effort.is_none()
             && updates.step_settings.service_tier.is_none()
         {
             return Ok(None);
@@ -2054,7 +2097,14 @@ impl Session {
             .collaboration_mode
             .as_ref()
             .map_or_else(
-                || format!("service_tier={:?}", updates.step_settings.service_tier),
+                || {
+                    format!(
+                        "model={:?}, effort={:?}, service_tier={:?}",
+                        updates.step_settings.model,
+                        updates.step_settings.effort,
+                        updates.step_settings.service_tier
+                    )
+                },
                 |collaboration_mode| {
                     format!(
                         "model={}, effort={:?}, service_tier={:?}",
@@ -2074,19 +2124,40 @@ impl Session {
 
     async fn validate_model_selection_update_for_lane(
         &self,
-        updates: &SessionSettingsUpdate,
+        mut updates: SessionSettingsUpdate,
         lane: Option<crate::config::ModelPolicyLane>,
-    ) -> ConstraintResult<()> {
+    ) -> ConstraintResult<SessionSettingsUpdate> {
         let Some(lane) = lane else {
-            return Ok(());
+            return Ok(updates);
         };
-        let is_non_root_agent = {
+        let (current_collaboration_mode, is_non_root_agent, http_client_factory) = {
             let state = self.state.lock().await;
-            state
-                .session_configuration
-                .session_source
-                .is_non_root_agent()
+            (
+                state
+                    .session_configuration
+                    .step_settings
+                    .collaboration_mode
+                    .clone(),
+                state
+                    .session_configuration
+                    .session_source
+                    .is_non_root_agent(),
+                state
+                    .session_configuration
+                    .original_config_do_not_use
+                    .http_client_factory(),
+            )
         };
+        if updates.step_settings.collaboration_mode.is_none()
+            && (updates.step_settings.model.is_some() || updates.step_settings.effort.is_some())
+        {
+            updates.step_settings.collaboration_mode =
+                Some(current_collaboration_mode.with_updates(
+                    updates.step_settings.model.take(),
+                    updates.step_settings.effort.take(),
+                    /*developer_instructions*/ None,
+                ));
+        }
         session::validate_service_tier_update_for_lane(
             lane,
             is_non_root_agent,
@@ -2099,31 +2170,13 @@ impl Session {
             requirement_source: codex_config::RequirementSource::Unknown,
         })?;
         let Some(collaboration_mode) = updates.step_settings.collaboration_mode.as_ref() else {
-            return Ok(());
+            return Ok(updates);
         };
-        let (changed, http_client_factory) = {
-            let state = self.state.lock().await;
-            (
-                state
-                    .session_configuration
-                    .step_settings
-                    .collaboration_mode
-                    .model()
-                    != collaboration_mode.model()
-                    || state
-                        .session_configuration
-                        .step_settings
-                        .collaboration_mode
-                        .reasoning_effort()
-                        != collaboration_mode.reasoning_effort(),
-                state
-                    .session_configuration
-                    .original_config_do_not_use
-                    .http_client_factory(),
-            )
-        };
+        let changed = current_collaboration_mode.model() != collaboration_mode.model()
+            || current_collaboration_mode.reasoning_effort()
+                != collaboration_mode.reasoning_effort();
         if !changed {
-            return Ok(());
+            return Ok(updates);
         }
         // Every selecting lane validates against the picker catalog; passing
         // None here makes the catalog-backed validator fail closed, which is
@@ -2155,7 +2208,8 @@ impl Session {
             ),
             allowed: err.to_string(),
             requirement_source: codex_config::RequirementSource::Unknown,
-        })
+        })?;
+        Ok(updates)
     }
 
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {

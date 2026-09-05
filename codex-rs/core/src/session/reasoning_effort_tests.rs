@@ -93,3 +93,74 @@ async fn compaction_effort_lookup_preserves_pin_for_fallback_models() {
         Some(ReasoningEffort::Low)
     );
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn locked_model_policy_reasoning_override_preserves_wire_effort_and_selection() {
+    use crate::config::ModelPolicyLane;
+    use crate::session::tests::ModelPolicyLaneEnvGuard;
+    use codex_protocol::openai_models::ReasoningEffortPreset;
+
+    for (lane, selected, expected) in [
+        (None, ReasoningEffort::Ultra, ReasoningEffort::XHigh),
+        (
+            Some(ModelPolicyLane::Subscription),
+            ReasoningEffort::Ultra,
+            ReasoningEffort::XHigh,
+        ),
+        (
+            Some(ModelPolicyLane::Api),
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Max,
+        ),
+        (
+            Some(ModelPolicyLane::Api),
+            ReasoningEffort::High,
+            ReasoningEffort::High,
+        ),
+        (
+            Some(ModelPolicyLane::Spark),
+            ReasoningEffort::High,
+            ReasoningEffort::High,
+        ),
+    ] {
+        let _lane_guard = ModelPolicyLaneEnvGuard::unset();
+        let (mut session, turn_context) = make_session_and_context().await;
+        session
+            .features
+            .enable(Feature::ReasoningEffortOverride)
+            .unwrap();
+        let mut settings = (*turn_context.initial_settings).clone();
+        settings
+            .selected_mut()
+            .collaboration_mode
+            .settings
+            .reasoning_effort = Some(selected.clone());
+        let model = Arc::make_mut(&mut settings.model_info);
+        model.slug = "gpt-6-astra".to_string();
+        model.use_responses_lite = true;
+        model.multi_agent_reasoning_effort = Some(ReasoningEffort::XHigh);
+        model.supported_reasoning_levels = [
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ]
+        .into_iter()
+        .map(|effort| ReasoningEffortPreset {
+            description: effort.to_string(),
+            effort,
+        })
+        .collect();
+        if let Some(lane) = lane {
+            // SAFETY: serialized, process-isolated test; the guard restores the environment.
+            unsafe { std::env::set_var(crate::config::MODEL_POLICY_LANE_ENV, lane.as_str()) };
+        }
+        assert_eq!(
+            session.effort_for_configuration_update(&settings).await,
+            Some(expected.clone()),
+            "lane={lane:?}"
+        );
+        assert_eq!(settings.reasoning_effort(), Some(&selected));
+    }
+}

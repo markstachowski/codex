@@ -257,6 +257,101 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
     probe_with(configure_turn, ToolPlanInputs::default()).await
 }
 
+#[tokio::test]
+async fn temporary_structured_sessions_expose_no_tools() {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.session_source = SessionSource::Internal(InternalSessionSource::TemporaryStructured);
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = super::build_tool_router(
+        &session,
+        step_context.turn.as_ref(),
+        step_context.turn.model_info(),
+        step_context.settings.model_info.model_messages.as_ref(),
+        &step_context.environments,
+        &step_context.mcp,
+        /*apps_enabled*/ true,
+        &turn.extension_data,
+        /*tool_suggest_candidates*/ None,
+    )
+    .expect("build temporary structured tool router");
+    assert!(router.model_visible_specs().is_empty());
+    assert!(router.registered_tool_names_for_test().is_empty());
+
+    let plan = probe_with(
+        |turn| {
+            turn.session_source =
+                SessionSource::Internal(InternalSessionSource::TemporaryStructured);
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![mcp_runtime(
+                "server",
+                "server",
+                "lookup",
+                ToolExposure::Direct,
+            )],
+            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
+                namespace: "extension",
+                tool_name: "lookup",
+            })],
+            dynamic_tools: vec![dynamic_tool(
+                Some("dynamic"),
+                "lookup",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    assert!(plan.visible_names.is_empty(), "{:?}", plan.visible_names);
+    assert!(
+        plan.registered_names.is_empty(),
+        "{:?}",
+        plan.registered_names
+    );
+    assert!(!plan.can_manage_children);
+}
+
+#[tokio::test]
+async fn managed_background_preserves_read_tools_without_agent_recursion() {
+    let plan = probe_with(
+        |turn| {
+            turn.session_source = SessionSource::Internal(InternalSessionSource::ManagedBackground);
+            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+            set_feature(turn, Feature::RequestPermissionsTool, /*enabled*/ true);
+            Arc::make_mut(&mut turn.config).experimental_request_user_input_enabled = true;
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![mcp_runtime(
+                "server",
+                "server",
+                "lookup",
+                ToolExposure::Direct,
+            )],
+            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
+                namespace: "extension",
+                tool_name: "lookup",
+            })],
+            dynamic_tools: vec![dynamic_tool(
+                Some("dynamic"),
+                "lookup",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["server", "extension", "dynamic"]);
+    assert!(!plan.can_manage_children);
+    plan.assert_visible_lacks(&[
+        MULTI_AGENT_V2_NAMESPACE,
+        "request_user_input",
+        "request_permissions",
+    ]);
+}
+
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
     let mut config = (*turn.config).clone();
     if enabled {

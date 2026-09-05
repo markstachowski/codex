@@ -531,7 +531,7 @@ impl SessionConfiguration {
         next_configuration
             .original_config_do_not_use
             .validate_locked_session_inference_settings(
-                next_configuration.session_source.is_non_root_agent(),
+                &next_configuration.session_source,
                 next_configuration.step_settings.collaboration_mode.model(),
                 reasoning_effort.as_ref(),
                 next_configuration.step_settings.service_tier.as_deref(),

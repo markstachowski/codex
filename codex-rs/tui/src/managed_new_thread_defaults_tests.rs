@@ -168,12 +168,8 @@ async fn explicit_launch_overrides_take_precedence() {
 }
 
 #[tokio::test]
-async fn managed_lanes_reset_new_threads_to_required_defaults() {
-    for lane in [
-        ModelPolicyLane::Subscription,
-        ModelPolicyLane::Api,
-        ModelPolicyLane::Spark,
-    ] {
+async fn spark_lane_resets_new_threads_to_required_defaults() {
+    for lane in [ModelPolicyLane::Spark] {
         let mut actual = test_config().await;
         actual.model = Some("previous-conversation-model".to_string());
         actual.model_reasoning_effort = Some(ReasoningEffort::Low);
@@ -206,7 +202,7 @@ async fn api_fast_toggle_is_conversation_local_and_fresh_roots_return_to_standar
 
     apply_managed_new_thread_defaults_for_lane(
         &mut config,
-        Some(&defaults()),
+        /*defaults*/ None,
         &[],
         &ConfigOverrides::default(),
         Some(ModelPolicyLane::Api),
@@ -219,28 +215,84 @@ async fn api_fast_toggle_is_conversation_local_and_fresh_roots_return_to_standar
 }
 
 #[tokio::test]
-async fn subscription_lane_does_not_inherit_conversation_model_selection() {
-    let mut actual = test_config().await;
-    actual.model = Some("gpt-5.5".to_string());
-    actual.model_reasoning_effort = Some(ReasoningEffort::High);
-    actual.plan_mode_reasoning_effort = Some(ReasoningEffort::High);
-    actual.service_tier = Some(ServiceTier::Fast.request_value().to_string());
-    let mut expected = actual.clone();
-    expected.model = Some(ModelPolicyLane::Subscription.required_model().to_string());
-    expected.model_reasoning_effort = Some(ModelPolicyLane::Subscription.required_local_effort());
-    expected.plan_mode_reasoning_effort =
-        Some(ModelPolicyLane::Subscription.required_local_effort());
-    expected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+async fn selectable_lanes_preserve_selected_root_inference_settings() {
+    for (lane, model) in [
+        (ModelPolicyLane::Subscription, "gpt-5.5"),
+        (ModelPolicyLane::Api, "gpt-5.6-terra"),
+    ] {
+        let mut actual = test_config().await;
+        actual.model = Some(model.to_string());
+        actual.model_reasoning_effort = Some(ReasoningEffort::High);
+        actual.plan_mode_reasoning_effort = Some(ReasoningEffort::XHigh);
+        actual.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+        let mut expected = actual.clone();
+        expected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
 
-    apply_managed_new_thread_defaults_for_lane(
-        &mut actual,
-        Some(&defaults()),
-        &[],
-        &ConfigOverrides::default(),
-        Some(ModelPolicyLane::Subscription),
-    );
+        apply_managed_new_thread_defaults_for_lane(
+            &mut actual,
+            /*defaults*/ None,
+            &[],
+            &ConfigOverrides::default(),
+            Some(lane),
+        );
 
-    assert_eq!(actual, expected);
+        assert_eq!(actual, expected, "lane: {}", lane.as_str());
+    }
+}
+
+#[tokio::test]
+async fn selectable_lanes_apply_desktop_model_defaults_without_losing_valid_plan_effort() {
+    for (lane, selected_model) in [
+        (ModelPolicyLane::Subscription, "gpt-5.5"),
+        (ModelPolicyLane::Api, "gpt-5.6-terra"),
+    ] {
+        let mut actual = test_config().await;
+        actual.model = Some("gpt-6-astra".to_string());
+        actual.model_reasoning_effort = Some(ReasoningEffort::Low);
+        actual.plan_mode_reasoning_effort = Some(ReasoningEffort::Ultra);
+        actual.service_tier = Some("flex".to_string());
+        let mut expected = actual.clone();
+        expected.model = Some(selected_model.to_string());
+        expected.model_reasoning_effort = Some(ReasoningEffort::High);
+        expected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+        let selected_defaults = NewThreadModelDefaults {
+            model: Some(selected_model.to_string()),
+            model_reasoning_effort: Some(ReasoningEffort::High),
+            service_tier: Some("fast".to_string()),
+        };
+
+        apply_managed_new_thread_defaults_for_lane(
+            &mut actual,
+            Some(&selected_defaults),
+            &[],
+            &ConfigOverrides::default(),
+            Some(lane),
+        );
+
+        assert_eq!(actual, expected, "lane: {}", lane.as_str());
+    }
+}
+
+#[tokio::test]
+async fn selectable_lanes_reset_tier_without_desktop_defaults() {
+    for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
+        let mut actual = test_config().await;
+        actual.model = Some("gpt-6-astra".to_string());
+        actual.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+        actual.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+        let mut expected = actual.clone();
+        expected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+
+        apply_managed_new_thread_defaults_for_lane(
+            &mut actual,
+            /*defaults*/ None,
+            &[],
+            &ConfigOverrides::default(),
+            Some(lane),
+        );
+
+        assert_eq!(actual, expected, "lane: {}", lane.as_str());
+    }
 }
 
 #[tokio::test]

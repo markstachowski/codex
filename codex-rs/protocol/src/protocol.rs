@@ -2838,6 +2838,8 @@ impl FromStr for ThreadSource {
 pub enum InternalSessionSource {
     MemoryConsolidation,
     Guardian,
+    TemporaryStructured,
+    ManagedBackground,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2895,6 +2897,20 @@ impl SessionSource {
 
     pub fn is_internal(&self) -> bool {
         matches!(self, SessionSource::Internal(_))
+    }
+
+    pub fn is_temporary_structured(&self) -> bool {
+        matches!(
+            self,
+            SessionSource::Internal(InternalSessionSource::TemporaryStructured)
+        )
+    }
+
+    pub fn is_managed_background(&self) -> bool {
+        matches!(
+            self,
+            SessionSource::Internal(InternalSessionSource::ManagedBackground)
+        )
     }
 
     pub fn is_non_root_agent(&self) -> bool {
@@ -3011,6 +3027,8 @@ impl fmt::Display for InternalSessionSource {
         match self {
             InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
             InternalSessionSource::Guardian => f.write_str("guardian"),
+            InternalSessionSource::TemporaryStructured => f.write_str("temporary_structured"),
+            InternalSessionSource::ManagedBackground => f.write_str("managed_background"),
         }
     }
 }

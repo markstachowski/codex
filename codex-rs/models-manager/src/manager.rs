@@ -16,6 +16,7 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::is_auto_routing_model_family;
+use codex_protocol::openai_models::is_pro_capable_model;
 use codex_protocol::openai_models::is_spark_model_family;
 use std::fmt;
 use std::future::Future;
@@ -34,6 +35,8 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODEL_POLICY_LANE_ENV: &str = "CDX_MODEL_POLICY_LANE";
+#[cfg(test)]
+const ASTRA_MODEL: &str = "gpt-6-astra";
 // Test-only since the API lane moved to the filtered-catalog contract; the
 // Exact contract machinery it exercises remains live for Spark.
 #[cfg(test)]
@@ -44,6 +47,7 @@ const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 enum PickerContract {
     Upstream,
     Subscription,
+    Api,
     Exact {
         model: &'static str,
         effort: ReasoningEffort,
@@ -55,10 +59,9 @@ fn picker_contract_for_lane(lane: Option<&str>) -> PickerContract {
     match lane {
         None => PickerContract::Upstream,
         Some("subscription") => PickerContract::Subscription,
-        // The API lane's catalog file IS the locked model list (gpt-5.6
-        // sol/terra/luna), so the filtered-catalog contract offers exactly the
-        // reviewed set while still excluding reserved families.
-        Some("api") => PickerContract::Subscription,
+        // The API lane filters the curated catalog supplied by its isolated
+        // physical config to Pro-capable, non-reserved models.
+        Some("api") => PickerContract::Api,
         Some("spark") => PickerContract::Exact {
             model: SPARK_MODEL,
             effort: ReasoningEffort::XHigh,
@@ -82,6 +85,13 @@ fn apply_picker_contract(presets: &mut Vec<ModelPreset>, contract: PickerContrac
         PickerContract::Subscription => {
             presets.retain(|preset| {
                 !is_spark_model_family(&preset.model)
+                    && !is_auto_routing_model_family(&preset.model)
+            });
+        }
+        PickerContract::Api => {
+            presets.retain(|preset| {
+                is_pro_capable_model(&preset.model)
+                    && !is_spark_model_family(&preset.model)
                     && !is_auto_routing_model_family(&preset.model)
             });
         }

@@ -488,12 +488,12 @@ mod review_tests {
     use crate::config::ModelPolicyLane;
 
     #[test]
-    fn managed_guardian_inference_settings_reject_spark_and_use_sol_ultra() {
+    fn managed_guardian_inference_settings_reject_spark_and_use_astra_ultra() {
         for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
             assert_eq!(
                 managed_guardian_inference_settings(lane)
                     .expect("managed Guardian review settings"),
-                (crate::config::SOL_MODEL, ReasoningEffort::Ultra)
+                (crate::config::ASTRA_MODEL, ReasoningEffort::Ultra)
             );
         }
 

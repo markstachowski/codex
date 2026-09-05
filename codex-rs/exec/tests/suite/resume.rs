@@ -752,7 +752,7 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
-    let _response_mock = mount_exec_responses(&server, /*count*/ 2).await;
+    let response_mock = mount_exec_responses(&server, /*count*/ 2).await;
     let repo_root = exec_repo_root()?;
 
     let marker = format!("resume-config-{}", Uuid::new_v4());
@@ -784,6 +784,8 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
         .arg("workspace-write")
         .arg("--model")
         .arg("gpt-5.1-high")
+        .arg("-c")
+        .arg("model_reasoning_effort=\"high\"")
         .arg("-C")
         .arg(&repo_root)
         .arg(&prompt2)
@@ -818,6 +820,56 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
     let content = std::fs::read_to_string(&resumed_path)?;
     assert!(content.contains(&marker));
     assert!(content.contains(&marker2));
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.1-high");
+    assert_eq!(requests[1].body_json()["reasoning"]["effort"], "high");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_resume_restores_thread_model_and_effort_over_changed_defaults() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+    let response_mock = mount_exec_responses(&server, /*count*/ 2).await;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("resume-model-restore-{}", Uuid::new_v4());
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("--model")
+        .arg("gpt-5.1")
+        .arg("-c")
+        .arg("model_reasoning_effort=\"high\"")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(format!("echo {marker}"))
+        .assert()
+        .success();
+
+    std::fs::write(
+        test.home_path().join("config.toml"),
+        "model = \"gpt-5.2\"\nmodel_reasoning_effort = \"low\"\n",
+    )?;
+
+    let resumed_marker = format!("resume-model-restored-{}", Uuid::new_v4());
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("resume")
+        .arg("--last")
+        .arg(format!("echo {resumed_marker}"))
+        .assert()
+        .success();
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.1");
+    assert_eq!(requests[1].body_json()["reasoning"]["effort"], "high");
     Ok(())
 }
 

@@ -435,6 +435,12 @@ pub(crate) async fn run_turn_stop_hooks(
             StopHookTarget::MemoryConsolidation,
             sess.hook_transcript_path().await,
         ),
+        SessionSource::Internal(InternalSessionSource::TemporaryStructured) => {
+            return StopOutcome::default();
+        }
+        SessionSource::Internal(InternalSessionSource::ManagedBackground) => {
+            return StopOutcome::default();
+        }
         _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
     let request_metadata = build_request_metadata(Some(step_context), turn_context);

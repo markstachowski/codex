@@ -3975,7 +3975,7 @@ async fn managed_guardian_review_session_uses_forced_model_limits() {
 
     assert_eq!(
         guardian_config.model.as_deref(),
-        Some(crate::config::SOL_MODEL)
+        Some(crate::config::ASTRA_MODEL)
     );
     assert_eq!(
         guardian_config.model_reasoning_effort,

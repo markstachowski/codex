@@ -311,9 +311,9 @@ fn locked_model_policy_lane_contracts_are_exact() {
     let cases = [
         (
             ModelPolicyLane::Subscription,
-            SOL_MODEL,
+            ASTRA_MODEL,
             ReasoningEffort::Ultra,
-            ReasoningEffort::Max,
+            ReasoningEffort::XHigh,
             None,
             ForcedLoginMethod::Chatgpt,
             true,
@@ -324,15 +324,14 @@ fn locked_model_policy_lane_contracts_are_exact() {
         ),
         (
             ModelPolicyLane::Api,
-            SOL_MODEL,
+            ASTRA_MODEL,
             ReasoningEffort::Ultra,
             ReasoningEffort::Max,
             Some(ReasoningMode::Pro),
             ForcedLoginMethod::Api,
             true,
             MultiAgentVersion::V2,
-            // Root model selection opened 2026-08-05; the locked catalog file
-            // (gpt-5.6 sol/terra/luna) is the model boundary.
+            // Root model selection is bounded by the reviewed picker catalog.
             true,
             true,
             true,
@@ -367,7 +366,7 @@ fn locked_model_policy_lane_contracts_are_exact() {
     ) in cases
     {
         assert_eq!(lane.required_model(), model);
-        assert_eq!(lane.required_review_model(), SOL_MODEL);
+        assert_eq!(lane.required_review_model(), ASTRA_MODEL);
         assert_eq!(lane.required_local_effort(), local_effort);
         assert_eq!(lane.required_wire_effort(), wire_effort);
         assert_eq!(lane.required_reasoning_mode(), mode);
@@ -439,6 +438,61 @@ async fn locked_model_policy_config_for_lane(lane: ModelPolicyLane) -> Config {
         }
     }
     config
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn managed_temporary_background_session_requires_explicit_standard_tier() {
+    for lane in [
+        ModelPolicyLane::Subscription,
+        ModelPolicyLane::Api,
+        ModelPolicyLane::Spark,
+    ] {
+        let config = locked_model_policy_config_for_lane(lane).await;
+        let _lane_guard = ConfigModelPolicyLaneEnvGuard::set(lane);
+        config
+            .validate_locked_background_session_inference_settings(
+                ASTRA_MODEL,
+                Some(&ReasoningEffort::Ultra),
+                Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
+            )
+            .expect("temporary background sessions must accept the exact managed tier");
+        let error = config
+            .validate_locked_background_session_inference_settings(
+                ASTRA_MODEL,
+                Some(&ReasoningEffort::Ultra),
+                /*service_tier*/ None,
+            )
+            .expect_err("temporary background sessions must not clear their Standard tier");
+        assert!(error.to_string().contains("required default"));
+    }
+}
+
+struct ConfigModelPolicyLaneEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ConfigModelPolicyLaneEnvGuard {
+    fn set(lane: ModelPolicyLane) -> Self {
+        let previous = std::env::var_os(MODEL_POLICY_LANE_ENV);
+        // SAFETY: callers are serialized tests and this guard restores the
+        // exact prior process environment on drop.
+        unsafe { std::env::set_var(MODEL_POLICY_LANE_ENV, lane.as_str()) };
+        Self { previous }
+    }
+}
+
+impl Drop for ConfigModelPolicyLaneEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: callers are serialized tests and this restores the exact
+        // value captured before the test changed the process environment.
+        unsafe {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(MODEL_POLICY_LANE_ENV, value),
+                None => std::env::remove_var(MODEL_POLICY_LANE_ENV),
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -594,7 +648,7 @@ fn locked_model_policy_bootstrap_service_tiers_are_standard_only() {
 }
 
 #[test]
-fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
+fn locked_model_policy_managed_background_inference_is_astra_ultra_standard() {
     for lane in [
         ModelPolicyLane::Subscription,
         ModelPolicyLane::Api,
@@ -611,7 +665,7 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
                 inherited,
                 Some(lane),
             );
-            assert_eq!(settings.model, SOL_MODEL, "{} model", lane.as_str());
+            assert_eq!(settings.model, ASTRA_MODEL, "{} model", lane.as_str());
             assert_eq!(
                 settings.reasoning_effort,
                 Some(ReasoningEffort::Ultra),
@@ -641,8 +695,8 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
         .expect("bundled models should parse")
         .models
         .into_iter()
-        .find(|model| model.slug == SOL_MODEL)
-        .expect("bundled catalog should contain Sol");
+        .find(|model| model.slug == ASTRA_MODEL)
+        .expect("bundled catalog should contain Astra");
     let inherited = BaseInstructions {
         text: "different model-specific instructions".to_string(),
         provenance: Some(BaseInstructionsProvenance::Model {
@@ -662,7 +716,7 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
     assert_eq!(
         managed.provenance,
         Some(BaseInstructionsProvenance::Model {
-            model: SOL_MODEL.to_string(),
+            model: ASTRA_MODEL.to_string(),
         })
     );
 
@@ -678,7 +732,7 @@ fn locked_model_policy_managed_background_inference_is_sol_ultra_standard() {
         BaseInstructions {
             text: "already coherent".to_string(),
             provenance: Some(BaseInstructionsProvenance::Model {
-                model: SOL_MODEL.to_string(),
+                model: ASTRA_MODEL.to_string(),
             }),
         },
     ] {
@@ -701,14 +755,14 @@ fn locked_model_policy_background_switch_does_not_restore_disabled_update_plan_g
         .expect("bundled models should parse")
         .models
         .into_iter()
-        .find(|model| model.slug == SOL_MODEL)
-        .expect("bundled catalog should contain Sol");
+        .find(|model| model.slug == ASTRA_MODEL)
+        .expect("bundled catalog should contain Astra");
     let target_instructions =
-        "Sol instructions.\n\n## `update_plan`\nUse the checklist.\n\n## Work\nProceed.\n";
+        "Astra instructions.\n\n## `update_plan`\nUse the checklist.\n\n## Work\nProceed.\n";
     model_info
         .model_messages
         .as_mut()
-        .expect("Sol should provide model messages")
+        .expect("Astra should provide model messages")
         .instructions_template = Some(target_instructions.to_string());
 
     let inherited = BaseInstructions {
@@ -733,7 +787,7 @@ fn locked_model_policy_background_switch_does_not_restore_disabled_update_plan_g
 
         assert_eq!(
             managed.text, expected,
-            "Spark-to-Sol substitution must follow update_plan_enabled={update_plan_enabled} custom_model_catalog={custom_model_catalog}"
+            "Spark-to-Astra substitution must follow update_plan_enabled={update_plan_enabled} custom_model_catalog={custom_model_catalog}"
         );
     }
 }
@@ -743,7 +797,7 @@ fn locked_model_policy_reasoning_mode_is_derived_from_the_model() {
     // Pro belongs to the model, not the lane: the API rejects the whole
     // request when `reasoning.mode` reaches a model that does not implement
     // it (verified live 2026-08-05 -- gpt-5.4-mini answers 400).
-    for pro_capable in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+    for pro_capable in [ASTRA_MODEL, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
         assert_eq!(
             ModelPolicyLane::Api.required_reasoning_mode_for_model(pro_capable),
             Some(ReasoningMode::Pro),
@@ -778,7 +832,7 @@ fn locked_model_policy_reasoning_mode_is_derived_from_the_model() {
             "{} changed behaviour for its own managed model",
             lane.as_str()
         );
-        // Review always resolves to Sol, so it must still derive Pro on the
+        // Review always resolves to Astra, so it must still derive Pro on the
         // API lane even when a root has selected a different model.
         assert_eq!(
             ModelPolicyLane::Api.required_reasoning_mode_for_model(lane.required_review_model()),
@@ -863,18 +917,33 @@ fn locked_model_policy_scopes_fast_to_explicit_subscription_and_api_roots() {
 }
 
 #[test]
-fn locked_model_policy_allows_only_root_subscription_model_selection() {
-    // Both selecting lanes: an explicit root may pick another model. The API
-    // lane joined 2026-08-05; its catalog file bounds the concrete choices at
-    // the session layer, which this lane-level predicate does not see.
-    for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
-        lane.validate_model_and_effort(
+fn locked_model_policy_allows_only_selectable_root_model_selection() {
+    ModelPolicyLane::Subscription
+        .validate_model_and_effort(
             "gpt-5.5",
             Some(&ReasoningEffort::High),
             /*allow_user_model_selection*/ true,
         )
-        .expect("an explicit selecting-lane root may pick another model");
+        .expect("an explicit subscription root may pick another model");
 
+    for model in [ASTRA_MODEL, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        ModelPolicyLane::Api
+            .validate_model_and_effort(
+                model,
+                Some(&ReasoningEffort::High),
+                /*allow_user_model_selection*/ true,
+            )
+            .expect("an explicit API root may pick a Pro-capable model");
+    }
+    ModelPolicyLane::Api
+        .validate_model_and_effort(
+            "gpt-5.5",
+            Some(&ReasoningEffort::High),
+            /*allow_user_model_selection*/ true,
+        )
+        .expect_err("the API lane must reject a model without Pro support");
+
+    for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
         let child_error = lane
             .validate_model_and_effort(
                 "gpt-5.5",
@@ -882,7 +951,7 @@ fn locked_model_policy_allows_only_root_subscription_model_selection() {
                 /*allow_user_model_selection*/ false,
             )
             .expect_err("a non-root session must remain on the managed model");
-        assert!(child_error.to_string().contains("required `gpt-5.6-sol`"));
+        assert!(child_error.to_string().contains("required `gpt-6-astra`"));
 
         for reserved_model in [
             SPARK_MODEL,
@@ -910,6 +979,146 @@ fn locked_model_policy_allows_only_root_subscription_model_selection() {
         )
         .expect_err("Spark never permits a model override");
     assert!(spark_error.to_string().contains("required"));
+}
+
+#[tokio::test]
+async fn selectable_lane_bootstrap_preserves_operator_model_and_efforts() {
+    for (lane, model, ordinary_effort, plan_effort) in [
+        (
+            ModelPolicyLane::Subscription,
+            "gpt-5.5",
+            ReasoningEffort::XHigh,
+            ReasoningEffort::High,
+        ),
+        (
+            ModelPolicyLane::Api,
+            "gpt-5.6-terra",
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ),
+    ] {
+        let mut config = locked_model_policy_config_for_lane(lane).await;
+        config.model = Some(model.to_string());
+        config.model_reasoning_effort = Some(ordinary_effort);
+        config.plan_mode_reasoning_effort = Some(plan_effort);
+        config
+            .validate_locked_model_policy_for_lane(lane)
+            .expect("selectable lanes must preserve operator-selected root inference settings");
+    }
+
+    let mut spark = locked_model_policy_config_for_lane(ModelPolicyLane::Spark).await;
+    spark.model = Some(ASTRA_MODEL.to_string());
+    spark.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+    spark
+        .validate_locked_model_policy_for_lane(ModelPolicyLane::Spark)
+        .expect_err("the dedicated Spark lane must keep its exact bootstrap model");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn selectable_lane_model_overrides_preserve_or_reset_inherited_effort() -> std::io::Result<()>
+{
+    for (lane, login_method, reasoning_mode) in [
+        (ModelPolicyLane::Subscription, "chatgpt", ""),
+        (
+            ModelPolicyLane::Api,
+            "api",
+            "model_reasoning_mode = \"pro\"\n",
+        ),
+    ] {
+        let _lane_guard = ConfigModelPolicyLaneEnvGuard::set(lane);
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            format!(
+                r#"model = "{ASTRA_MODEL}"
+review_model = "{ASTRA_MODEL}"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
+{reasoning_mode}forced_login_method = "{login_method}"
+approvals_reviewer = "user"
+
+[agents]
+enabled = true
+
+[features]
+fast_mode = true
+multi_agent = true
+
+[features.multi_agent_v2]
+enabled = true
+expose_spawn_agent_model_overrides = false
+"#
+            ),
+        )?;
+        for (label, harness_model, cli_overrides, expected_model, expected_effort) in [
+            (
+                "same-model harness",
+                Some(ASTRA_MODEL),
+                Vec::new(),
+                ASTRA_MODEL,
+                Some(ReasoningEffort::Ultra),
+            ),
+            (
+                "different-model harness",
+                Some("gpt-5.6-terra"),
+                Vec::new(),
+                "gpt-5.6-terra",
+                None,
+            ),
+            (
+                "SessionFlags model-only",
+                None,
+                vec![(
+                    "model".to_string(),
+                    TomlValue::String("gpt-5.6-terra".to_string()),
+                )],
+                "gpt-5.6-terra",
+                None,
+            ),
+            (
+                "SessionFlags explicit effort",
+                None,
+                vec![
+                    (
+                        "model".to_string(),
+                        TomlValue::String("gpt-5.6-terra".to_string()),
+                    ),
+                    (
+                        "model_reasoning_effort".to_string(),
+                        TomlValue::String("high".to_string()),
+                    ),
+                ],
+                "gpt-5.6-terra",
+                Some(ReasoningEffort::High),
+            ),
+        ] {
+            let config = ConfigBuilder::without_managed_config_for_tests()
+                .codex_home(codex_home.path().to_path_buf())
+                .fallback_cwd(Some(codex_home.path().to_path_buf()))
+                .harness_overrides(ConfigOverrides {
+                    model: harness_model.map(str::to_string),
+                    ..Default::default()
+                })
+                .cli_overrides(cli_overrides)
+                .build()
+                .await?;
+            assert_eq!(
+                (
+                    config.model.as_deref(),
+                    config.model_reasoning_effort,
+                    config.plan_mode_reasoning_effort,
+                ),
+                (
+                    Some(expected_model),
+                    expected_effort,
+                    Some(ReasoningEffort::Ultra),
+                ),
+                "case: {label}, lane: {lane:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]

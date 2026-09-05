@@ -545,11 +545,13 @@ async fn thread_resume_params_only_include_explicit_review_policy_override() {
         &config,
         "thread-id".to_string(),
         /*approvals_reviewer_override*/ None,
+        /*model_selection_overridden*/ false,
     );
     let params_with_override = thread_resume_params_from_config(
         &config,
         "thread-id".to_string(),
         Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview),
+        /*model_selection_overridden*/ false,
     );
 
     assert_eq!(params_without_override.approvals_reviewer, None);
@@ -557,6 +559,39 @@ async fn thread_resume_params_only_include_explicit_review_policy_override() {
         params_with_override.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
     );
+}
+
+#[tokio::test]
+async fn thread_resume_params_only_override_inference_when_invocation_selected_it() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        })
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config with explicit model");
+
+    let restoring = thread_resume_params_from_config(
+        &config,
+        "thread-id".to_string(),
+        /*approvals_reviewer_override*/ None,
+        /*model_selection_overridden*/ false,
+    );
+    assert_eq!((restoring.model, restoring.model_provider), (None, None));
+
+    let overriding = thread_resume_params_from_config(
+        &config,
+        "thread-id".to_string(),
+        /*approvals_reviewer_override*/ None,
+        /*model_selection_overridden*/ true,
+    );
+    assert_eq!(overriding.model, config.model);
+    assert_eq!(overriding.model_provider.as_deref(), Some("openai"));
 }
 
 #[tokio::test]
@@ -699,6 +734,7 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         &config,
         "thread-id".to_string(),
         /*approvals_reviewer_override*/ None,
+        /*model_selection_overridden*/ false,
     );
 
     assert_eq!(start_params.config, expected_config);
@@ -735,6 +771,7 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         &config,
         "thread-id".to_string(),
         /*approvals_reviewer_override*/ None,
+        /*model_selection_overridden*/ false,
     );
 
     assert_eq!(config.permissions.active_permission_profile(), None);

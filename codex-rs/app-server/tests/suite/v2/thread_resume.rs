@@ -17,6 +17,7 @@ use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_models_cache;
 use chrono::Utc;
 use codex_app_server_protocol::ActivePermissionProfile;
 use codex_app_server_protocol::ApprovalsReviewer;
@@ -80,6 +81,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
+use codex_core::config::MODEL_POLICY_LANE_ENV;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
@@ -1493,6 +1495,199 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
     assert_eq!(reasoning_effort, None);
     assert_eq!(cwd.as_path(), persisted_cwd);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_subscription_cold_resume_restores_selection_and_honors_explicit_override()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let external_home = TempDir::new()?;
+    let stale_history_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"
+model = "gpt-6-astra"
+review_model = "gpt-6-astra"
+model_provider = "openai"
+forced_login_method = "chatgpt"
+chatgpt_base_url = "https://chatgpt.com/backend-api"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+
+[agents]
+enabled = true
+
+[features]
+fast_mode = true
+multi_agent = true
+
+[features.multi_agent_v2]
+enabled = true
+hide_spawn_agent_metadata = false
+tool_namespace = "agents"
+expose_spawn_agent_model_overrides = false
+max_concurrent_threads_per_session = 6
+"#,
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .plan_type("plus")
+            .chatgpt_account_id("account-123")
+            .account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    write_models_cache(codex_home.path())?;
+    let user_config_home = codex_home.path().to_string_lossy().into_owned();
+    let env_overrides = [
+        (MODEL_POLICY_LANE_ENV, Some("subscription")),
+        ("CDX_USER_CONFIG_HOMES", Some(user_config_home.as_str())),
+        ("OPENAI_API_KEY", None),
+        ("CODEX_API_KEY", None),
+    ];
+
+    let thread_id = create_fake_rollout(
+        external_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "materialized managed thread",
+        Some("openai"),
+        /*git_info*/ None,
+    )?;
+    let thread_path = rollout_path(external_home.path(), "2025-01-05T12-00-00", &thread_id);
+    let settings: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": thread_id,
+        "thread_settings": {
+            "model": "gpt-5.5",
+            "model_provider_id": "openai",
+            "cwd": external_home.path(),
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::read_only(),
+            "reasoning_effort": "high",
+            "collaboration_mode": {
+                "mode": "default",
+                "settings": {
+                    "model": "gpt-5.5",
+                    "reasoning_effort": "high"
+                }
+            },
+        },
+    }))?;
+    append_rollout_item_to_path(
+        &thread_path,
+        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+    )
+    .await?;
+    let stale_history_path =
+        rollout_path(stale_history_home.path(), "2025-01-05T12-00-00", &thread_id);
+    std::fs::create_dir_all(stale_history_path.parent().expect("rollout parent"))?;
+    std::fs::copy(&thread_path, &stale_history_path)?;
+
+    {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .with_env_overrides(&env_overrides)
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                path: Some(thread_path.clone()),
+                ..Default::default()
+            })
+            .await?;
+        let ThreadResumeResponse {
+            model,
+            reasoning_effort,
+            ..
+        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+        assert_eq!(
+            (model.as_str(), reasoning_effort),
+            ("gpt-5.5", Some(ReasoningEffort::High)),
+            "a managed external rollout with no SQLite row must restore its latest history pair"
+        );
+
+        let update_id = mcp
+            .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+                thread_id: thread_id.clone(),
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: Some(ReasoningEffort::Medium),
+                ..Default::default()
+            })
+            .await?;
+        let _: ThreadSettingsUpdateResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(update_id)).await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/settings/updated"),
+        )
+        .await??;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    }
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&env_overrides)
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            path: Some(stale_history_path),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        model,
+        reasoning_effort,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(
+        (model.as_str(), reasoning_effort),
+        ("gpt-5.6-luna", Some(ReasoningEffort::Medium)),
+        "SQLite metadata must outrank the older rollout-history selection"
+    );
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&env_overrides)
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            model: Some("gpt-6-astra".to_string()),
+            config: Some(std::collections::HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                json!("ultra"),
+            )])),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        model,
+        reasoning_effort,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(
+        (model.as_str(), reasoning_effort),
+        ("gpt-6-astra", Some(ReasoningEffort::Ultra)),
+        "an explicit resume selection must outrank persisted thread metadata"
+    );
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
 
     Ok(())
 }
