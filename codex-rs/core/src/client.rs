@@ -725,86 +725,35 @@ impl ModelClient {
                 lane.as_str()
             )));
         }
-        // Only an ordinary root turn may select its own model. Root-owned
-        // background work is Astra/Ultra even when the interactive root is
-        // Spark; children and other non-root work retain their existing pin.
+        // Request class controls billing tiers, not model or effort choice.
+        // Model/effort capabilities are resolved before request construction.
         let root_turn =
             matches!(session_class, ManagedRequestSessionClass::Root) && !managed_background;
-        let user_selecting = lane.allows_user_model_selection() && root_turn;
-        let required_model = if managed_background {
-            lane.required_background_model()
-        } else {
-            lane.required_model()
-        };
-        if user_selecting {
-            lane.validate_user_selected_model(request.model.as_str())
-                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-        } else if request.model != required_model {
-            return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy rejected request model `{}`; required `{}`",
-                lane.as_str(),
-                request.model,
-                required_model
-            )));
-        }
-
-        let Some(reasoning) = request.reasoning.as_ref() else {
-            return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy requires an explicit reasoning payload",
-                lane.as_str()
-            )));
-        };
-
-        // Hoisted above the selection fork on purpose. This invariant used to
-        // live inside both branches, where an early return could skip it and a
-        // later edit could let the two copies disagree. Derived from the model
-        // actually being sent, so config cannot decide it.
+        lane.validate_user_selected_model(request.model.as_str())
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        let reasoning = request.reasoning.as_ref();
         let required_mode = lane.required_reasoning_mode_for_model(request.model.as_str());
-        if reasoning.mode != required_mode {
+        let actual_mode = reasoning.and_then(|reasoning| reasoning.mode);
+        if actual_mode != required_mode {
             return Err(CodexErr::InvalidRequest(format!(
                 "{} model policy rejected reasoning mode {:?} for `{}`; required {:?}",
                 lane.as_str(),
-                reasoning.mode,
+                actual_mode,
                 request.model,
                 required_mode
             )));
         }
 
-        if user_selecting {
-            match reasoning.effort.as_ref() {
-                None => {
-                    return Err(CodexErr::InvalidRequest(format!(
-                        "{} model policy requires an explicit reasoning effort for `{}`",
-                        lane.as_str(),
-                        request.model
-                    )));
-                }
-                // Fail closed on wire-invalid efforts instead of letting a
-                // config- or RPC-supplied `minimal`/literal-`ultra` become a
-                // live 400 on every request (probed 2026-08-05).
-                Some(effort) if !is_user_selectable_wire_effort(effort) => {
-                    return Err(CodexErr::InvalidRequest(format!(
-                        "{} model policy rejected wire reasoning effort {effort:?} for `{}`; selectable efforts are low, medium, high, xhigh, and max",
-                        lane.as_str(),
-                        request.model
-                    )));
-                }
-                Some(_) => {}
-            }
-        } else {
-            let required_effort = if managed_background {
-                lane.required_background_wire_effort()
-            } else {
-                lane.required_wire_effort()
-            };
-            if reasoning.effort.as_ref() != Some(&required_effort) {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "{} model policy rejected wire reasoning effort {:?}; required {}",
-                    lane.as_str(),
-                    reasoning.effort,
-                    required_effort
-                )));
-            }
+        // The isolated Pro API catalog has a narrower supported effort set.
+        // Do not impose that set on subscription models, which can advertise
+        // no reasoning, minimal, or additional model-defined effort levels.
+        if matches!(lane, ModelPolicyLane::Api)
+            && let Some(effort) = reasoning.and_then(|reasoning| reasoning.effort.as_ref())
+            && !is_user_selectable_wire_effort(effort)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "API Pro model does not support wire reasoning effort {effort:?}"
+            )));
         }
 
         if matches!(lane, ModelPolicyLane::Api) && request.service_tier.is_none() {
@@ -838,29 +787,15 @@ impl ModelClient {
         model: &str,
         reasoning: Option<&Reasoning>,
     ) -> Result<()> {
-        if model != lane.required_background_model() {
-            return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy rejected memory model `{model}`; required `{}`",
-                lane.as_str(),
-                lane.required_background_model()
-            )));
-        }
-        let Some(reasoning) = reasoning else {
-            return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy requires explicit memory reasoning",
-                lane.as_str()
-            )));
-        };
-        let required_effort = lane.required_background_wire_effort();
+        lane.validate_user_selected_model(model)
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
         let required_mode = lane.required_reasoning_mode_for_model(model);
-        if reasoning.effort.as_ref() != Some(&required_effort) || reasoning.mode != required_mode {
+        if reasoning.and_then(|reasoning| reasoning.mode) != required_mode {
             return Err(CodexErr::InvalidRequest(format!(
-                "{} model policy rejected memory reasoning mode={:?} effort={:?}; required mode={:?} effort={}",
+                "{} model policy rejected memory reasoning mode={:?}; required mode={:?}",
                 lane.as_str(),
-                reasoning.mode,
-                reasoning.effort,
-                required_mode,
-                required_effort
+                reasoning.and_then(|reasoning| reasoning.mode),
+                required_mode
             )));
         }
         Ok(())

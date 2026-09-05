@@ -2182,7 +2182,7 @@ impl Session {
         // None here makes the catalog-backed validator fail closed, which is
         // how the API lane's first live model switch was rejected (E2E,
         // 2026-08-05).
-        let available_models = if lane.allows_user_model_selection() && !is_non_root_agent {
+        let available_models = if lane.allows_user_model_selection() {
             Some(
                 self.services
                     .models_manager
@@ -4415,6 +4415,12 @@ impl Session {
         model_info: &ModelInfo,
         config: &Config,
     ) -> MultiAgentVersion {
+        // A model change may temporarily select a root-only model such as
+        // Spark. Keep the thread's saved topology, but do not expose tools
+        // that the currently selected model explicitly cannot use.
+        if model_info.multi_agent_version == Some(MultiAgentVersion::Disabled) {
+            return MultiAgentVersion::Disabled;
+        }
         if let Some(multi_agent_version) = self.multi_agent_version() {
             return config.multi_agent_version_for_model(Some(multi_agent_version));
         }

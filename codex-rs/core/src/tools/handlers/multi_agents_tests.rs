@@ -4570,17 +4570,14 @@ async fn build_agent_resume_config_clears_base_instructions() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
+async fn locked_non_root_defaults_preserve_inference_and_standard_tier() {
     let _lane_guard = ModelPolicyLaneEnvGuard::unset();
     let (session, turn) = make_session_and_context().await;
     let mut turn = turn
-        .with_model(
-            crate::config::ASTRA_MODEL.to_string(),
-            &session.services.models_manager,
-        )
+        .with_model("gpt-5.6-sol".to_string(), &session.services.models_manager)
         .await;
     let mut config = (*turn.config).clone();
-    config.model = Some("gpt-5.5".to_string());
+    config.model = Some("gpt-5.6-sol".to_string());
     config.model_reasoning_effort = Some(ReasoningEffort::High);
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
 
@@ -4588,9 +4585,9 @@ async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
         &mut config,
         crate::config::ModelPolicyLane::Subscription,
     )
-    .expect("subscription children should be repinned");
-    assert_eq!(config.model.as_deref(), Some(crate::config::ASTRA_MODEL));
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Ultra));
+    .expect("subscription children should retain choices on Standard");
+    assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(
         config.service_tier.as_deref(),
         Some(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE)
@@ -4598,7 +4595,7 @@ async fn locked_non_root_defaults_repin_spawn_and_resume_inference() {
     turn.config = Arc::new(config.clone());
     update_turn_settings_for_test(&mut turn, |settings| {
         let selected = settings.selected_mut();
-        selected.collaboration_mode.settings.reasoning_effort = Some(ReasoningEffort::Ultra);
+        selected.collaboration_mode.settings.reasoning_effort = Some(ReasoningEffort::High);
         selected.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
         settings.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
     });

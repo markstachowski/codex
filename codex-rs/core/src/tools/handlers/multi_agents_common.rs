@@ -46,22 +46,11 @@ fn validate_locked_spawn_config(config: &Config) -> Result<(), FunctionCallError
 fn validate_locked_requested_spawn_overrides(
     lane: crate::config::ModelPolicyLane,
     requested_model: Option<&str>,
-    requested_reasoning_effort: Option<&ReasoningEffort>,
+    _requested_reasoning_effort: Option<&ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
-    if requested_model.is_some_and(|model| model != lane.required_model()) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{} model policy rejects child model override; required {}",
-            lane.as_str(),
-            lane.required_model()
-        )));
-    }
-    let required_effort = lane.required_local_effort();
-    if requested_reasoning_effort.is_some_and(|effort| effort != &required_effort) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{} model policy rejects child reasoning override; required {}",
-            lane.as_str(),
-            required_effort
-        )));
+    if let Some(model) = requested_model {
+        lane.validate_user_selected_model(model)
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
     }
     Ok(())
 }
@@ -76,8 +65,6 @@ pub(crate) fn apply_locked_non_root_inference_defaults(
             lane.as_str()
         )));
     }
-    config.model = Some(lane.required_model().to_string());
-    config.model_reasoning_effort = Some(lane.required_local_effort());
     config.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
     Ok(())
 }
@@ -330,12 +317,9 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     let locked_lane = crate::config::locked_model_policy_lane()
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
         .filter(|lane| lane.multi_agent_enabled());
-    let requested_model = requested_model
-        .or(turn.config.agent_default_subagent_model.as_deref())
-        .or_else(|| locked_lane.map(crate::config::ModelPolicyLane::required_model));
+    let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
     let requested_reasoning_effort = requested_reasoning_effort
-        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone())
-        .or_else(|| locked_lane.map(crate::config::ModelPolicyLane::required_local_effort));
+        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
     if let Some(lane) = locked_lane {
         validate_locked_requested_spawn_overrides(
             lane,
@@ -380,9 +364,15 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
+        let selected_model = config.model.as_deref().unwrap_or(&turn.model_info().slug);
+        let selected_model_info = session
+            .services
+            .models_manager
+            .get_model_info(selected_model, &config.to_models_manager_config())
+            .await;
         validate_spawn_agent_reasoning_effort(
-            &turn.model_info().slug,
-            &turn.model_info().supported_reasoning_levels,
+            selected_model,
+            &selected_model_info.supported_reasoning_levels,
             &reasoning_effort,
         )?;
         config.model_reasoning_effort = Some(reasoning_effort);
@@ -549,18 +539,16 @@ mod tests {
         )
         .expect_err("a configured child model must not escape the API lane");
 
-        assert!(error.to_string().contains("required gpt-6-astra"));
+        assert!(error.to_string().contains("Pro-capable"));
     }
 
     #[test]
-    fn locked_model_policy_rejects_configured_subagent_effort_drift() {
-        let error = validate_locked_requested_spawn_overrides(
+    fn locked_model_policy_preserves_configured_subagent_effort() {
+        validate_locked_requested_spawn_overrides(
             ModelPolicyLane::Api,
             Some("gpt-6-astra"),
             Some(&ReasoningEffort::High),
         )
-        .expect_err("a configured child effort must not escape the API lane");
-
-        assert!(error.to_string().contains("required ultra"));
+        .expect("a configured child may select a supported effort without changing billing");
     }
 }

@@ -167,7 +167,7 @@ fn policy_test_request(model: &str, effort: ReasoningEffort) -> ResponsesApiRequ
 }
 
 #[test]
-fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
+fn locked_model_policy_responses_request_keeps_selection_and_tiers_separate() {
     let alternate = policy_test_request("gpt-5.5", ReasoningEffort::High);
     ModelClient::validate_locked_responses_request_for_lane(
         ModelPolicyLane::Subscription,
@@ -191,21 +191,19 @@ fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
         .as_mut()
         .expect("reasoning payload")
         .effort = None;
-    let error = ModelClient::validate_locked_responses_request_for_lane(
+    ModelClient::validate_locked_responses_request_for_lane(
         ModelPolicyLane::Subscription,
         /*is_non_root_agent*/ false,
         &missing_effort,
     )
-    .expect_err("a root request must carry its validated turn effort explicitly");
-    assert!(error.to_string().contains("explicit reasoning effort"));
+    .expect("a subscription model may use its omitted/default effort");
 
-    let error = ModelClient::validate_locked_responses_request_for_lane(
+    ModelClient::validate_locked_responses_request_for_lane(
         ModelPolicyLane::Subscription,
         /*is_non_root_agent*/ true,
         &alternate,
     )
-    .expect_err("a non-root request must remain on the managed model");
-    assert!(error.to_string().contains("required `gpt-6-astra`"));
+    .expect("a child may use its configured supported model and effort");
 
     let managed = policy_test_request("gpt-6-astra", ReasoningEffort::XHigh);
     ModelClient::validate_locked_responses_request_for_lane(
@@ -271,13 +269,12 @@ fn locked_model_policy_responses_request_keeps_root_selection_child_strict() {
 
     for reserved_model in ["gpt-5.3-codex-spark", "codex-auto-balanced"] {
         let reserved = policy_test_request(reserved_model, ReasoningEffort::High);
-        let error = ModelClient::validate_locked_responses_request_for_lane(
+        ModelClient::validate_locked_responses_request_for_lane(
             ModelPolicyLane::Subscription,
             /*is_non_root_agent*/ false,
             &reserved,
         )
-        .expect_err("the ordinary subscription lane must reject reserved routing models");
-        assert!(error.to_string().contains("reserved model"));
+        .expect("subscription model families are selected through the account catalog");
     }
 
     let spark = policy_test_request("gpt-5.3-codex-spark", ReasoningEffort::XHigh);
@@ -310,7 +307,10 @@ fn locked_model_policy_background_request_kinds_are_fail_closed() {
         ModelPolicyLane::Spark,
     ] {
         for request_kind in background_kinds {
-            let mut inherited = policy_test_request("alternate-root", ReasoningEffort::High);
+            let mut inherited = policy_test_request("gpt-5.6-terra", ReasoningEffort::High);
+            if matches!(lane, ModelPolicyLane::Api) {
+                inherited.reasoning.as_mut().expect("reasoning").mode = Some(ReasoningMode::Pro);
+            }
             inherited.service_tier = Some(ServiceTier::Fast.request_value().to_string());
             let error = ModelClient::validate_locked_responses_request_for_request_kind(
                 lane,
@@ -318,10 +318,18 @@ fn locked_model_policy_background_request_kinds_are_fail_closed() {
                 Some(request_kind),
                 &inherited,
             )
-            .expect_err("background work must reject an inherited root model");
-            assert!(error.to_string().contains("required `gpt-6-astra`"));
+            .expect_err("background work must reject an inherited premium tier");
+            assert!(error.to_string().contains("service tier"));
+            inherited.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
+            ModelClient::validate_locked_responses_request_for_request_kind(
+                lane,
+                ManagedRequestSessionClass::Root,
+                Some(request_kind),
+                &inherited,
+            )
+            .expect("background work preserves a supported configured model and effort");
 
-            let required_effort = lane.required_background_wire_effort();
+            let required_effort = lane.required_wire_effort();
             let mut managed = policy_test_request("gpt-6-astra", required_effort.clone());
             if matches!(lane, ModelPolicyLane::Api) {
                 managed.reasoning.as_mut().expect("reasoning payload").mode =
@@ -363,7 +371,7 @@ fn locked_model_policy_background_request_kinds_are_fail_closed() {
                 Some(request_kind),
                 &wrong_effort,
             )
-            .expect_err("background work must reject inherited root effort");
+            .expect("background effort is configurable independently of the tier");
         }
     }
 
@@ -392,8 +400,7 @@ fn temporary_structured_turn_uses_background_request_contract_for_all_lanes() {
         ModelPolicyLane::Api,
         ModelPolicyLane::Spark,
     ] {
-        let mut request =
-            policy_test_request("gpt-6-astra", lane.required_background_wire_effort());
+        let mut request = policy_test_request("gpt-6-astra", lane.required_wire_effort());
         request.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
         if matches!(lane, ModelPolicyLane::Api) {
             request.reasoning.as_mut().expect("reasoning payload").mode = Some(ReasoningMode::Pro);
@@ -418,7 +425,7 @@ fn temporary_structured_turn_uses_background_request_contract_for_all_lanes() {
             Some(CodexResponsesRequestKind::Turn),
             &inherited,
         )
-        .expect_err("temporary structured turns must reject root-selected models");
+        .expect("temporary structured turns preserve supported selections");
     }
 }
 
@@ -433,7 +440,7 @@ fn managed_background_turn_uses_background_request_contract() {
 
     let mut request = policy_test_request(
         "gpt-6-astra",
-        ModelPolicyLane::Subscription.required_background_wire_effort(),
+        ModelPolicyLane::Subscription.required_wire_effort(),
     );
     request.service_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string());
     ModelClient::validate_locked_responses_request_for_request_kind(
@@ -451,7 +458,7 @@ fn managed_background_turn_uses_background_request_contract() {
         Some(CodexResponsesRequestKind::Turn),
         &request,
     )
-    .expect_err("managed background turns must reject the caller's legacy model");
+    .expect("managed background turns preserve the configured model");
 }
 
 #[test]
@@ -631,7 +638,7 @@ fn locked_model_policy_request_builder_wiring_is_fail_closed() {
     ] {
         let background_reasoning = Reasoning {
             mode: lane.required_reasoning_mode_for_model("gpt-6-astra"),
-            effort: Some(lane.required_background_wire_effort()),
+            effort: Some(lane.required_wire_effort()),
             summary: None,
             context: None,
         };
@@ -654,7 +661,7 @@ fn locked_model_policy_request_builder_wiring_is_fail_closed() {
         "gpt-5.3-codex-spark",
         Some(&inherited_spark_reasoning),
     )
-    .expect_err("Spark/XHigh must not reach the dormant background memory endpoint");
+    .expect("wire validation does not replace model capability resolution with a family pin");
 }
 
 fn test_model_provider() -> SharedModelProvider {

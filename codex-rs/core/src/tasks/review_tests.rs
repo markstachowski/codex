@@ -2,7 +2,7 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn subscription_review_replaces_alternate_root_model_and_effort() {
+fn subscription_review_preserves_model_and_effort_but_not_priority() {
     let settings = resolve_review_inference_settings(
         "gpt-5.5".to_string(),
         Some(ReasoningEffort::High),
@@ -15,8 +15,8 @@ fn subscription_review_replaces_alternate_root_model_and_effort() {
     assert_eq!(
         settings,
         ReviewInferenceSettings {
-            model: "gpt-6-astra".to_string(),
-            reasoning_effort: Some(ReasoningEffort::Ultra),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: Some(ReasoningEffort::High),
             reasoning_mode: None,
             service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
         }

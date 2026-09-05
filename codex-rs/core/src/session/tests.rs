@@ -5303,7 +5303,7 @@ async fn session_configuration_apply_runs_environment_validation_before_locked_i
     );
     invalid_environment.config = EnvironmentConfigState::Ready(invalid_environment_config);
     let invalid_collaboration_mode = configuration.step_settings.collaboration_mode.with_updates(
-        Some(crate::config::SPARK_MODEL.to_string()),
+        Some(String::new()),
         Some(Some(ReasoningEffortConfig::High)),
         /*developer_instructions*/ None,
     );
@@ -5577,7 +5577,7 @@ async fn managed_root_fast_settings_preview_apply_round_trip() {
 }
 
 #[tokio::test]
-async fn locked_new_root_defaults_preserve_selectable_lanes_and_pin_spark() {
+async fn locked_new_root_defaults_preserve_model_choices_in_every_lane() {
     let histories = [
         InitialHistory::New,
         InitialHistory::Cleared,
@@ -5605,9 +5605,9 @@ async fn locked_new_root_defaults_preserve_selectable_lanes_and_pin_spark() {
                 config.service_tier.as_deref(),
             ),
             (
-                Some(lane.required_model()),
-                Some(&lane.required_local_effort()),
-                Some(&lane.required_local_effort()),
+                Some("gpt-5.4"),
+                Some(&ReasoningEffortConfig::Max),
+                Some(&ReasoningEffortConfig::High),
                 Some(lane.required_root_service_tier()),
             ),
             "history: {history:?}"

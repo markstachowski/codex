@@ -101,7 +101,9 @@ async fn plugin_attribution_for_guardian_request(
 
 fn managed_guardian_inference_settings(
     lane: crate::config::ModelPolicyLane,
-) -> std::io::Result<(&'static str, ReasoningEffort)> {
+    model: &str,
+    effort: Option<ReasoningEffort>,
+) -> std::io::Result<(&str, Option<ReasoningEffort>)> {
     if !lane.allows_non_root_sessions() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -111,7 +113,8 @@ fn managed_guardian_inference_settings(
             ),
         ));
     }
-    Ok((lane.required_review_model(), ReasoningEffort::Ultra))
+    lane.validate_user_selected_model(model)?;
+    Ok((model, effort))
 }
 
 pub(crate) fn new_guardian_review_id() -> String {
@@ -233,11 +236,17 @@ pub(super) async fn guardian_review_session_config(
 ) -> anyhow::Result<GuardianReviewSessionConfig> {
     let turn = context.turn();
     let managed_settings = crate::config::locked_model_policy_lane()?
-        .map(managed_guardian_inference_settings)
+        .map(|lane| {
+            let model = turn
+                .config
+                .review_model
+                .as_deref()
+                .unwrap_or(&context.model_info.slug);
+            managed_guardian_inference_settings(lane, model, context.reasoning_effort.clone())
+        })
         .transpose()?;
     if let Some((guardian_model, guardian_reasoning_effort)) = managed_settings {
         let guardian_model = guardian_model.to_string();
-        let guardian_reasoning_effort = Some(guardian_reasoning_effort);
         let guardian_model_info = session
             .services
             .models_manager
@@ -488,19 +497,28 @@ mod review_tests {
     use crate::config::ModelPolicyLane;
 
     #[test]
-    fn managed_guardian_inference_settings_reject_spark_and_use_astra_ultra() {
+    fn managed_guardian_inference_settings_preserve_choices_and_root_only_boundary() {
         for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
-            assert_eq!(
-                managed_guardian_inference_settings(lane)
-                    .expect("managed Guardian review settings"),
-                (crate::config::ASTRA_MODEL, ReasoningEffort::Ultra)
-            );
+            for effort in [
+                None,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Ultra),
+            ] {
+                assert_eq!(
+                    managed_guardian_inference_settings(lane, "gpt-5.6-sol", effort.clone())
+                        .expect("managed Guardian review settings"),
+                    ("gpt-5.6-sol", effort)
+                );
+            }
         }
 
-        let error = managed_guardian_inference_settings(ModelPolicyLane::Spark)
-            .expect_err("Spark is root-only and must not create Guardian work");
+        let error = managed_guardian_inference_settings(
+            ModelPolicyLane::Spark,
+            "gpt-6-astra",
+            /*effort*/ None,
+        )
+        .expect_err("Spark is root-only and must not create Guardian work");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("root-only"));
     }
-
 }

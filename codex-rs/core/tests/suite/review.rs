@@ -583,7 +583,7 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
     server.verify().await;
 }
 
-/// Managed reviews re-pin their outer context and final delegate settings.
+/// Managed reviews honor operator inference settings while keeping Standard billing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_review_context_is_relocked_after_upstream_transforms() {
     skip_if_no_network!();
@@ -663,7 +663,7 @@ async fn managed_review_context_is_relocked_after_upstream_transforms() {
                 description: "Priority processing".to_string(),
             }];
         })
-        .with_model_info_override("gpt-6-astra", |model_info| {
+        .with_model_info_override("gpt-5.6-sol", |model_info| {
             model_info.supported_reasoning_levels = [
                 ReasoningEffort::XHigh,
                 ReasoningEffort::Max,
@@ -679,7 +679,7 @@ async fn managed_review_context_is_relocked_after_upstream_transforms() {
             model_info.multi_agent_reasoning_effort = Some(ReasoningEffort::XHigh);
         })
         .with_config(|config| {
-            config.review_model = Some("gpt-6-astra".to_string());
+            config.review_model = Some("gpt-5.6-sol".to_string());
             config
                 .features
                 .enable(Feature::FastMode)
@@ -729,8 +729,8 @@ async fn managed_review_context_is_relocked_after_upstream_transforms() {
         CollaborationMode {
             mode: ModeKind::Default,
             settings: Settings {
-                model: "gpt-6-astra".to_string(),
-                reasoning_effort: Some(ReasoningEffort::Ultra),
+                model: "gpt-5.6-sol".to_string(),
+                reasoning_effort: Some(ReasoningEffort::XHigh),
                 developer_instructions: None,
             },
         }
@@ -747,8 +747,8 @@ async fn managed_review_context_is_relocked_after_upstream_transforms() {
             delegate_config.service_tier,
         ),
         (
-            Some("gpt-6-astra".to_string()),
-            Some(ReasoningEffort::Ultra),
+            Some("gpt-5.6-sol".to_string()),
+            Some(ReasoningEffort::XHigh),
             None::<ReasoningMode>,
             Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
         ),

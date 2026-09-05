@@ -121,7 +121,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::is_auto_routing_model_family;
 pub use codex_protocol::openai_models::is_pro_capable_model;
 pub use codex_protocol::openai_models::is_spark_model_family;
 use codex_protocol::permissions::DenyReadValidator;
@@ -325,42 +324,17 @@ impl ModelPolicyLane {
         }
     }
 
-    /// Review work always uses Astra/Ultra. Spark is a root-only interactive lane.
+    /// Initial review default; an operator's configured review model wins.
     pub const fn required_review_model(self) -> &'static str {
         ASTRA_MODEL
     }
 
-    /// Model used by root-owned background inference. Spark is an interactive
-    /// root-only lane, so its background work returns to Astra with every other
-    /// managed lane.
-    pub(crate) const fn required_background_model(self) -> &'static str {
-        match self {
-            Self::Subscription | Self::Api | Self::Spark => ASTRA_MODEL,
-        }
-    }
-
-    /// Local reasoning effort used by root-owned background inference.
-    pub(crate) fn required_background_local_effort(self) -> ReasoningEffort {
-        match self {
-            Self::Subscription | Self::Api | Self::Spark => ReasoningEffort::Ultra,
-        }
-    }
-
-    /// Wire reasoning effort used by root-owned background inference.
-    pub(crate) fn required_background_wire_effort(self) -> ReasoningEffort {
-        match self {
-            Self::Subscription | Self::Spark => ReasoningEffort::XHigh,
-            Self::Api => ReasoningEffort::Max,
-        }
-    }
-
-    /// Whether an explicit root-session model selection may differ from the
-    /// managed default. Background work and child agents remain pinned.
+    /// Model and effort defaults are preferences, not billing-lane restrictions.
     ///
     /// The API lane is bounded by the curated catalog supplied by its isolated
     /// physical config; subscription roots use the account/catalog picker.
     pub const fn allows_user_model_selection(self) -> bool {
-        matches!(self, Self::Subscription | Self::Api)
+        true
     }
 
     /// Whether an explicit root may select the flex service tier. Metered
@@ -410,14 +384,11 @@ impl ModelPolicyLane {
     }
 
     pub(crate) fn validate_user_selected_model(self, model: &str) -> std::io::Result<()> {
-        // Reserved families stay rejected on every lane that permits
-        // selection: Spark has a dedicated lane and usage limit, and automatic
-        // routing would make the running model unprovable.
-        if is_spark_model_family(model) || is_auto_routing_model_family(model) {
+        if model.trim().is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "{} model policy rejected reserved model `{model}`; use the dedicated Spark lane for Spark and select an explicit model instead of automatic routing",
+                    "{} model selection requires a nonempty model id",
                     self.as_str()
                 ),
             ));
@@ -437,35 +408,12 @@ impl ModelPolicyLane {
     pub(crate) fn validate_model_and_effort(
         self,
         model: &str,
-        reasoning_effort: Option<&ReasoningEffort>,
-        allow_user_model_selection: bool,
+        _reasoning_effort: Option<&ReasoningEffort>,
+        _allow_user_model_selection: bool,
     ) -> std::io::Result<()> {
-        let require_managed_model =
-            !allow_user_model_selection || !self.allows_user_model_selection();
-        if allow_user_model_selection {
-            self.validate_user_selected_model(model)?;
-        }
-        if require_managed_model && model != self.required_model() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} model policy rejected model `{model}`; required `{}`",
-                    self.as_str(),
-                    self.required_model()
-                ),
-            ));
-        }
-        let required_effort = self.required_local_effort();
-        if require_managed_model && reasoning_effort != Some(&required_effort) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} model policy rejected local reasoning effort {reasoning_effort:?}; required {required_effort}",
-                    self.as_str()
-                ),
-            ));
-        }
-        Ok(())
+        // Catalog-backed resolution validates effort against the selected
+        // model. Session class controls tiers separately, never model choice.
+        self.validate_user_selected_model(model)
     }
 
     pub(crate) fn validate_service_tier(
@@ -582,9 +530,9 @@ pub fn managed_background_inference_for_lane(
     lane: Option<ModelPolicyLane>,
 ) -> ManagedBackgroundInferenceSettings {
     match lane {
-        Some(lane) => ManagedBackgroundInferenceSettings {
-            model: lane.required_background_model().to_string(),
-            reasoning_effort: Some(lane.required_background_local_effort()),
+        Some(_) => ManagedBackgroundInferenceSettings {
+            model: inherited_model,
+            reasoning_effort: inherited_reasoning_effort,
             service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
         },
         None => ManagedBackgroundInferenceSettings {
@@ -2131,49 +2079,16 @@ impl Config {
                 ),
             )
         };
-        let required_model = lane.required_model();
-        if lane.allows_user_model_selection() {
-            let selected_model = self.model.as_deref().ok_or_else(|| {
-                invalid(
-                    "model",
-                    "None".to_string(),
-                    "a concrete model from the current picker catalog".to_string(),
-                )
-            })?;
-            lane.validate_user_selected_model(selected_model)?;
-        } else if self.model.as_deref() != Some(required_model) {
-            return Err(invalid(
+        let selected_model = self.model.as_deref().ok_or_else(|| {
+            invalid(
                 "model",
-                format!("{:?}", self.model),
-                required_model.to_string(),
-            ));
-        }
-        let required_review_model = lane.required_review_model();
-        if self.review_model.as_deref() != Some(required_review_model) {
-            return Err(invalid(
-                "review_model",
-                format!("{:?}", self.review_model),
-                required_review_model.to_string(),
-            ));
-        }
-        let required_effort = lane.required_local_effort();
-        if !lane.allows_user_model_selection()
-            && self.model_reasoning_effort.as_ref() != Some(&required_effort)
-        {
-            return Err(invalid(
-                "model_reasoning_effort",
-                format!("{:?}", self.model_reasoning_effort),
-                required_effort.to_string(),
-            ));
-        }
-        if !lane.allows_user_model_selection()
-            && self.plan_mode_reasoning_effort.as_ref() != Some(&required_effort)
-        {
-            return Err(invalid(
-                "plan_mode_reasoning_effort",
-                format!("{:?}", self.plan_mode_reasoning_effort),
-                required_effort.to_string(),
-            ));
+                "None".to_string(),
+                "a concrete model from the current picker catalog".to_string(),
+            )
+        })?;
+        lane.validate_user_selected_model(selected_model)?;
+        if let Some(model) = self.review_model.as_deref() {
+            lane.validate_user_selected_model(model)?;
         }
         if self.model_reasoning_mode != lane.required_reasoning_mode() {
             return Err(invalid(
@@ -2251,36 +2166,10 @@ impl Config {
             ));
         }
         self.validate_locked_multi_agent_version_for_lane(lane)?;
-        if self.multi_agent_v2.expose_spawn_agent_model_overrides {
-            return Err(invalid(
-                "features.multi_agent_v2.expose_spawn_agent_model_overrides",
-                "true".to_string(),
-                "false".to_string(),
-            ));
-        }
         match lane {
             ModelPolicyLane::Subscription | ModelPolicyLane::Api => {
-                if self
-                    .agent_default_subagent_model
-                    .as_deref()
-                    .is_some_and(|model| model != required_model)
-                {
-                    return Err(invalid(
-                        "agents.default_subagent_model",
-                        format!("{:?}", self.agent_default_subagent_model),
-                        format!("unset or {required_model}"),
-                    ));
-                }
-                if self
-                    .agent_default_subagent_reasoning_effort
-                    .as_ref()
-                    .is_some_and(|effort| effort != &required_effort)
-                {
-                    return Err(invalid(
-                        "agents.default_subagent_reasoning_effort",
-                        format!("{:?}", self.agent_default_subagent_reasoning_effort),
-                        format!("unset or {required_effort}"),
-                    ));
+                if let Some(model) = self.agent_default_subagent_model.as_deref() {
+                    lane.validate_user_selected_model(model)?;
                 }
             }
             ModelPolicyLane::Spark => {
@@ -2331,30 +2220,9 @@ impl Config {
                 ),
             )
         };
-        let required_model = lane.required_background_model();
-        if self.model.as_deref() != Some(required_model) {
-            return Err(invalid(
-                "model",
-                format!("{:?}", self.model),
-                required_model.to_string(),
-            ));
-        }
-        let required_effort = lane.required_background_local_effort();
-        if self.model_reasoning_effort.as_ref() != Some(&required_effort) {
-            return Err(invalid(
-                "model_reasoning_effort",
-                format!("{:?}", self.model_reasoning_effort),
-                required_effort.to_string(),
-            ));
-        }
-        if self.plan_mode_reasoning_effort.as_ref() != Some(&required_effort) {
-            return Err(invalid(
-                "plan_mode_reasoning_effort",
-                format!("{:?}", self.plan_mode_reasoning_effort),
-                required_effort.to_string(),
-            ));
-        }
-        let required_mode = lane.required_reasoning_mode_for_model(required_model);
+        let selected_model = self.model.as_deref().unwrap_or_default();
+        lane.validate_user_selected_model(selected_model)?;
+        let required_mode = lane.required_reasoning_mode_for_model(selected_model);
         if self.model_reasoning_mode != required_mode {
             return Err(invalid(
                 "model_reasoning_mode",
@@ -2518,9 +2386,7 @@ impl Config {
         )
     }
 
-    /// Validate child-agent inference settings. Children and role files must
-    /// stay on the managed model even when the root explicitly selects another
-    /// subscription model for its current conversation.
+    /// Validate child-agent billing isolation without replacing inference preferences.
     pub fn validate_locked_subagent_inference_settings(
         &self,
         model: &str,
@@ -2536,8 +2402,8 @@ impl Config {
     }
 
     /// Validate a server-owned internal background session. Unlike child
-    /// agents, this path remains available to the root-only Spark lane, but it
-    /// is still pinned to the managed background model, effort, and tier.
+    /// agents, this path remains available to the root-only Spark lane. It
+    /// inherits resolved model/effort preferences but always stays on Standard.
     fn validate_locked_background_session_inference_settings(
         &self,
         model: &str,
@@ -2547,27 +2413,12 @@ impl Config {
         let Some(lane) = locked_model_policy_lane()? else {
             return Ok(());
         };
-        let required_model = lane.required_background_model();
-        if model != required_model {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} model policy rejected internal background model `{model}`; required `{required_model}`",
-                    lane.as_str()
-                ),
-            ));
-        }
-        let required_effort = lane.required_background_local_effort();
-        if reasoning_effort != Some(&required_effort) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} model policy rejected internal background reasoning effort {reasoning_effort:?}; required {required_effort}",
-                    lane.as_str()
-                ),
-            ));
-        }
-        let required_mode = lane.required_reasoning_mode_for_model(required_model);
+        lane.validate_model_and_effort(
+            model,
+            reasoning_effort,
+            /*_allow_user_model_selection*/ false,
+        )?;
+        let required_mode = lane.required_reasoning_mode_for_model(model);
         if self.model_reasoning_mode != required_mode {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

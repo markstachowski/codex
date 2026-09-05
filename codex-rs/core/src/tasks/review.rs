@@ -67,12 +67,15 @@ fn resolve_review_inference_settings(
                 lane.as_str()
             ),
         )),
-        Some(lane) => Ok(ReviewInferenceSettings {
-            model: lane.required_model().to_string(),
-            reasoning_effort: Some(lane.required_local_effort()),
-            reasoning_mode: lane.required_reasoning_mode(),
-            service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
-        }),
+        Some(lane) => {
+            lane.validate_user_selected_model(&requested_model)?;
+            Ok(ReviewInferenceSettings {
+                reasoning_mode: lane.required_reasoning_mode_for_model(&requested_model),
+                model: requested_model,
+                reasoning_effort: inherited_reasoning_effort,
+                service_tier: Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
+            })
+        }
         None => Ok(ReviewInferenceSettings {
             model: requested_model,
             reasoning_effort: inherited_reasoning_effort,

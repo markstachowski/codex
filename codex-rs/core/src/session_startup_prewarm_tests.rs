@@ -109,7 +109,7 @@ async fn managed_startup_prewarm_captures_one_coherent_astra_snapshot_for_every_
         assert_eq!(
             guardian_parent_turn.model_info().slug.as_str(),
             root_model.as_str(),
-            "Guardian must retain the interactive root turn while managed prewarm uses Astra"
+            "Guardian and prewarm must retain the selected model"
         );
         assert_eq!(guardian_parent_turn.reasoning_effort(), Some(&root_effort));
         assert_eq!(guardian_parent_turn.config.service_tier, root_tier);
@@ -136,8 +136,12 @@ async fn managed_startup_prewarm_captures_one_coherent_astra_snapshot_for_every_
                 managed_step.turn.model_info().slug.as_str(),
                 managed_step.turn.config.model.as_deref(),
             ),
-            ("gpt-6-astra", "gpt-6-astra", Some("gpt-6-astra"),),
-            "{} must not retain any root-model authority in the managed snapshot",
+            (
+                root_model.as_str(),
+                root_model.as_str(),
+                Some(root_model.as_str())
+            ),
+            "{} must preserve the selected model throughout the managed snapshot",
             lane.as_str()
         );
         assert_eq!(
@@ -147,9 +151,9 @@ async fn managed_startup_prewarm_captures_one_coherent_astra_snapshot_for_every_
                 managed_step.turn.config.model_reasoning_effort.clone(),
             ),
             (
-                Some(ReasoningEffort::Ultra),
-                Some(ReasoningEffort::Ultra),
-                Some(ReasoningEffort::Ultra),
+                Some(root_effort.clone()),
+                Some(root_effort.clone()),
+                Some(root_effort.clone()),
             )
         );
         assert_eq!(
@@ -210,24 +214,14 @@ async fn managed_startup_prewarm_captures_one_coherent_astra_snapshot_for_every_
         };
         assert_eq!(
             managed_background_base_instructions_for_model(
-                root_derived_instructions,
+                root_derived_instructions.clone(),
                 &managed_step.settings.model_info,
                 managed_step.turn.personality(),
                 /*omit_update_plan_instructions*/
                 !managed_step.turn.config.update_plan_enabled
                     && managed_step.turn.config.model_catalog.is_none(),
             ),
-            BaseInstructions {
-                text: crate::context::without_update_plan_instructions(
-                    &managed_step
-                        .settings
-                        .model_info
-                        .get_model_instructions(managed_step.turn.personality()),
-                ),
-                provenance: Some(BaseInstructionsProvenance::Model {
-                    model: "gpt-6-astra".to_string(),
-                }),
-            }
+            root_derived_instructions
         );
         let custom_instructions = BaseInstructions {
             text: "custom instructions must survive a managed model switch".to_string(),
@@ -275,7 +269,7 @@ async fn managed_startup_prewarm_seeds_missing_root_metadata_and_preserves_resol
         .await
         .request;
 
-    assert_eq!(managed_turn.model_info().slug, "gpt-6-astra");
+    assert_eq!(managed_turn.model_info().slug, "gpt-5.2");
     assert_eq!(managed_turn.reasoning_summary(), ReasoningSummary::Auto);
     assert_eq!(
         managed_turn.config.model_reasoning_summary,
@@ -283,8 +277,8 @@ async fn managed_startup_prewarm_seeds_missing_root_metadata_and_preserves_resol
     );
     assert_eq!(
         managed_turn.model_info().default_reasoning_summary,
-        ReasoningSummary::None,
-        "the preserved Auto value must come from the root snapshot, not Astra defaults"
+        ReasoningSummary::Auto,
+        "the selected model's default summary must be preserved"
     );
     let root_metadata = session
         .services
@@ -406,15 +400,12 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
     lane_env.restore();
     assert_eq!(locked_model_policy_lane()?, Some(lane));
 
-    let astra_model_info = session
+    let selected_model_info = session
         .services
         .models_manager
-        .get_model_info(
-            lane.required_background_model(),
-            &root_turn.config.to_models_manager_config(),
-        )
+        .get_model_info(&root_model, &root_turn.config.to_models_manager_config())
         .await;
-    let expected_instructions = astra_model_info.get_model_instructions(root_turn.personality());
+    let expected_instructions = selected_model_info.get_model_instructions(root_turn.personality());
     let base_instructions = BaseInstructions {
         text: root_turn
             .model_info()
@@ -450,7 +441,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         BaseInstructions {
             text: expected_instructions.clone(),
             provenance: Some(BaseInstructionsProvenance::Model {
-                model: "gpt-6-astra".to_string(),
+                model: root_model.clone(),
             }),
         }
     );
@@ -461,7 +452,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
     );
     assert!(
         !prepared.prompt.tools.is_empty(),
-        "managed prewarm must serialize the Astra tool snapshot"
+        "managed prewarm must serialize the selected model's tool snapshot"
     );
 
     // This helper materializes only the body. It intentionally does not call current_client_setup,
@@ -489,10 +480,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         ModelPolicyLane::Api => Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
         ModelPolicyLane::Subscription | ModelPolicyLane::Spark => None,
     };
-    let expected_effort = match lane {
-        ModelPolicyLane::Api => "max",
-        ModelPolicyLane::Subscription | ModelPolicyLane::Spark => "xhigh",
-    };
+    let expected_effort = root_effort.to_string();
     for (transport, wire) in [("HTTP", &http_wire), ("WebSocket", &websocket_wire)] {
         assert_eq!(
             (
@@ -503,15 +491,15 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
                 wire["parallel_tool_calls"].as_bool(),
             ),
             (
-                Some("gpt-6-astra"),
+                Some(root_model.as_str()),
                 expected_mode,
-                Some(expected_effort),
+                Some(expected_effort.as_str()),
                 expected_tier,
-                Some(!astra_model_info.use_responses_lite),
+                Some(!selected_model_info.use_responses_lite),
             ),
             "{transport} must carry the actual locked lane's managed prewarm contract"
         );
-        let serialized_instructions = if astra_model_info.use_responses_lite {
+        let serialized_instructions = if selected_model_info.use_responses_lite {
             wire["input"]
                 .as_array()
                 .and_then(|input| {
@@ -526,7 +514,7 @@ async fn locked_model_policy_startup_prewarm_materializes_actual_lane_without_ne
         assert_eq!(
             serialized_instructions,
             Some(expected_instructions.as_str()),
-            "{transport} must serialize the Astra-derived base instructions"
+            "{transport} must serialize the selected model's base instructions"
         );
     }
     assert_eq!(http_wire.get("generate"), None);

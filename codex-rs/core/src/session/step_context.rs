@@ -55,8 +55,8 @@ impl StepContext {
     /// Approval enforcement intentionally remains Turn/config-owned, so parity here
     /// is a security boundary rather than a debug-only assertion.
     pub(crate) fn validate_managed_background(&self, lane: ModelPolicyLane) -> CodexResult<()> {
-        let required_model = lane.required_background_model();
-        let required_effort = Some(lane.required_background_local_effort());
+        let required_model = self.turn.config.model.as_deref().unwrap_or_default();
+        let required_effort = self.turn.config.model_reasoning_effort.clone();
         let required_tier = Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE);
         let step_model = self.settings.model_info.slug.as_str();
         let turn_model = self.turn.model_info().slug.as_str();

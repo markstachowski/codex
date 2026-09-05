@@ -3484,7 +3484,8 @@ async fn guardian_review_routes_required_actions(
 #[tokio::test]
 async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() -> anyhow::Result<()>
 {
-    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+    // The debug-build retry/fork future includes managed session policy validation.
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
         .name("guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history".to_string())
@@ -3934,10 +3935,13 @@ async fn managed_guardian_review_session_retains_node_repl_developer_policy() {
         );
     }
 
-    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref())
-        .await
-        .expect("managed Guardian config")
-        .spawn_config;
+    let guardian_config = guardian_review_session_config(
+        session.as_ref(),
+        &GuardianReviewContext::from(Arc::clone(&turn)),
+    )
+    .await
+    .expect("managed Guardian config")
+    .spawn_config;
 
     assert!(
         guardian_config
@@ -3950,11 +3954,12 @@ async fn managed_guardian_review_session_retains_node_repl_developer_policy() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn managed_guardian_review_session_uses_forced_model_limits() {
+async fn managed_guardian_review_session_uses_selected_model_limits() {
     let lane_env = crate::session::tests::ModelPolicyLaneEnvGuard::unset();
     let server = start_mock_server().await;
     let (session, mut turn) = guardian_test_session_and_turn(&server).await;
     let mut config = (*turn.config).clone();
+    config.review_model = Some("gpt-5.6-sol".to_string());
     config.model_context_window = Some(900_000);
     config.model_auto_compact_token_limit = Some(600_000);
     Arc::get_mut(&mut turn)
@@ -3968,18 +3973,18 @@ async fn managed_guardian_review_session_uses_forced_model_limits() {
         );
     }
 
-    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref())
-        .await
-        .expect("managed Guardian config")
-        .spawn_config;
+    let guardian_config = guardian_review_session_config(
+        session.as_ref(),
+        &GuardianReviewContext::from(Arc::clone(&turn)),
+    )
+    .await
+    .expect("managed Guardian config")
+    .spawn_config;
 
-    assert_eq!(
-        guardian_config.model.as_deref(),
-        Some(crate::config::ASTRA_MODEL)
-    );
+    assert_eq!(guardian_config.model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(
         guardian_config.model_reasoning_effort,
-        Some(codex_protocol::openai_models::ReasoningEffort::Ultra)
+        turn.reasoning_effort().cloned()
     );
     assert_eq!(guardian_config.model_context_window, None);
     assert_eq!(guardian_config.model_auto_compact_token_limit, None);
@@ -4068,6 +4073,8 @@ async fn guardian_review_session_config_isolates_parent_compaction_controls() {
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        ReasoningSummary::default(),
+        /*personality*/ None,
         /*model_messages*/ None,
     )
     .expect("guardian config");
@@ -4366,6 +4373,8 @@ async fn guardian_review_session_config_rejects_pinned_parent_compaction_reuse()
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        ReasoningSummary::default(),
+        /*personality*/ None,
         /*model_messages*/ None,
     )
     .expect_err("Guardian isolation must fail closed when parent compaction reuse is pinned on");
@@ -4397,6 +4406,8 @@ async fn guardian_review_session_config_rejects_pinned_token_budget() {
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        ReasoningSummary::default(),
+        /*personality*/ None,
         /*model_messages*/ None,
     )
     .expect_err("Guardian isolation must fail closed when token budget is pinned on");
@@ -4444,6 +4455,8 @@ async fn guardian_review_session_config_only_limits_openai_provider_retries() {
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
+        ReasoningSummary::default(),
+        /*personality*/ None,
         /*model_messages*/ None,
     )
     .expect("guardian config");

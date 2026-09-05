@@ -345,7 +345,7 @@ fn locked_model_policy_lane_contracts_are_exact() {
             ForcedLoginMethod::Chatgpt,
             false,
             MultiAgentVersion::Disabled,
-            false,
+            true,
             false,
             false,
         ),
@@ -648,7 +648,7 @@ fn locked_model_policy_bootstrap_service_tiers_are_standard_only() {
 }
 
 #[test]
-fn locked_model_policy_managed_background_inference_is_astra_ultra_standard() {
+fn locked_model_policy_managed_background_preserves_preferences_on_standard() {
     for lane in [
         ModelPolicyLane::Subscription,
         ModelPolicyLane::Api,
@@ -665,10 +665,10 @@ fn locked_model_policy_managed_background_inference_is_astra_ultra_standard() {
                 inherited,
                 Some(lane),
             );
-            assert_eq!(settings.model, ASTRA_MODEL, "{} model", lane.as_str());
+            assert_eq!(settings.model, "alternate-root", "{} model", lane.as_str());
             assert_eq!(
                 settings.reasoning_effort,
-                Some(ReasoningEffort::Ultra),
+                Some(ReasoningEffort::Low),
                 "{} local effort",
                 lane.as_str()
             );
@@ -922,7 +922,7 @@ fn locked_model_policy_allows_only_selectable_root_model_selection() {
         .validate_model_and_effort(
             "gpt-5.5",
             Some(&ReasoningEffort::High),
-            /*allow_user_model_selection*/ true,
+            /*_allow_user_model_selection*/ true,
         )
         .expect("an explicit subscription root may pick another model");
 
@@ -931,7 +931,7 @@ fn locked_model_policy_allows_only_selectable_root_model_selection() {
             .validate_model_and_effort(
                 model,
                 Some(&ReasoningEffort::High),
-                /*allow_user_model_selection*/ true,
+                /*_allow_user_model_selection*/ true,
             )
             .expect("an explicit API root may pick a Pro-capable model");
     }
@@ -939,19 +939,17 @@ fn locked_model_policy_allows_only_selectable_root_model_selection() {
         .validate_model_and_effort(
             "gpt-5.5",
             Some(&ReasoningEffort::High),
-            /*allow_user_model_selection*/ true,
+            /*_allow_user_model_selection*/ true,
         )
         .expect_err("the API lane must reject a model without Pro support");
 
     for lane in [ModelPolicyLane::Subscription, ModelPolicyLane::Api] {
-        let child_error = lane
-            .validate_model_and_effort(
-                "gpt-5.5",
-                Some(&ReasoningEffort::High),
-                /*allow_user_model_selection*/ false,
-            )
-            .expect_err("a non-root session must remain on the managed model");
-        assert!(child_error.to_string().contains("required `gpt-6-astra`"));
+        lane.validate_model_and_effort(
+            "gpt-5.6-terra",
+            Some(&ReasoningEffort::High),
+            /*_allow_user_model_selection*/ false,
+        )
+        .expect("child models and efforts are configurable");
 
         for reserved_model in [
             SPARK_MODEL,
@@ -959,26 +957,40 @@ fn locked_model_policy_allows_only_selectable_root_model_selection() {
             "openai/codex-auto-balanced",
             "CODEX-AUTO-BALANCED",
         ] {
-            let error = lane
-                .validate_model_and_effort(
-                    reserved_model,
-                    Some(&ReasoningEffort::High),
-                    /*allow_user_model_selection*/ true,
-                )
-                .expect_err("Spark and automatic routing stay outside the ordinary picker");
-            assert!(error.to_string().contains("reserved model"));
+            let result = lane.validate_model_and_effort(
+                reserved_model,
+                Some(&ReasoningEffort::High),
+                /*_allow_user_model_selection*/ true,
+            );
+            if lane == ModelPolicyLane::Api {
+                assert!(
+                    result.is_err(),
+                    "the Pro API catalog excludes non-Pro models"
+                );
+            } else {
+                result.expect("subscription model families are catalog-controlled");
+            }
         }
     }
 
-    // Spark keeps no selection at all.
-    let spark_error = ModelPolicyLane::Spark
+    ModelPolicyLane::Spark
         .validate_model_and_effort(
             "gpt-5.5",
             Some(&ReasoningEffort::High),
-            /*allow_user_model_selection*/ true,
+            /*_allow_user_model_selection*/ true,
         )
-        .expect_err("Spark never permits a model override");
-    assert!(spark_error.to_string().contains("required"));
+        .expect("the Spark launcher default does not prohibit explicit selections");
+}
+
+#[tokio::test]
+async fn subscription_operator_choices_include_review_and_agent_preferences() {
+    let mut config = locked_model_policy_config_for_lane(ModelPolicyLane::Subscription).await;
+    config.review_model = Some("gpt-5.6-sol".to_string());
+    config.agent_default_subagent_model = Some("gpt-5.4-mini".to_string());
+    config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Low);
+    config
+        .validate_locked_model_policy_for_lane(ModelPolicyLane::Subscription)
+        .expect("operator review and agent preferences must not block startup");
 }
 
 #[tokio::test]
@@ -1011,7 +1023,7 @@ async fn selectable_lane_bootstrap_preserves_operator_model_and_efforts() {
     spark.model_reasoning_effort = Some(ReasoningEffort::Ultra);
     spark
         .validate_locked_model_policy_for_lane(ModelPolicyLane::Spark)
-        .expect_err("the dedicated Spark lane must keep its exact bootstrap model");
+        .expect("the dedicated Spark launcher honors operator model and effort choices");
 }
 
 #[tokio::test]

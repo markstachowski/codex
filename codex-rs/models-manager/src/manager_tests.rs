@@ -17,6 +17,7 @@ use codex_login::ExternalAuthRefreshContext;
 use codex_login::TokenData;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -41,7 +42,7 @@ const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
 #[test]
-fn model_policy_picker_contract_distinguishes_selectable_and_exact_lanes() {
+fn model_policy_picker_contract_preserves_subscription_choices() {
     assert_eq!(
         picker_contract_for_lane(/*lane*/ None),
         PickerContract::Upstream
@@ -53,10 +54,7 @@ fn model_policy_picker_contract_distinguishes_selectable_and_exact_lanes() {
     assert_eq!(picker_contract_for_lane(Some("api")), PickerContract::Api);
     assert_eq!(
         picker_contract_for_lane(Some("spark")),
-        PickerContract::Exact {
-            model: SPARK_MODEL,
-            effort: ReasoningEffort::XHigh,
-        }
+        PickerContract::Subscription
     );
     assert_eq!(
         picker_contract_for_lane(Some("invalid")),
@@ -167,7 +165,10 @@ fn model_policy_picker_contract_filters_the_actual_catalog_path() {
             .iter()
             .map(|preset| preset.model.as_str())
             .collect::<Vec<_>>(),
-        vec!["gpt-6-astra", SOL_MODEL, "gpt-5.6-terra", "gpt-5.4"]
+        catalog
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>()
     );
     assert_eq!(subscription[2].supported_reasoning_efforts.len(), 2);
 
@@ -179,35 +180,16 @@ fn model_policy_picker_contract_filters_the_actual_catalog_path() {
         vec!["gpt-6-astra", SOL_MODEL, "gpt-5.6-terra"]
     );
 
-    for (contract, expected_model, expected_effort) in [
-        (
-            PickerContract::Exact {
-                model: SOL_MODEL,
-                effort: ReasoningEffort::Ultra,
-            },
-            SOL_MODEL,
-            ReasoningEffort::Ultra,
-        ),
-        (
-            PickerContract::Exact {
-                model: SPARK_MODEL,
-                effort: ReasoningEffort::XHigh,
-            },
-            SPARK_MODEL,
-            ReasoningEffort::XHigh,
-        ),
-    ] {
-        let filtered = build_available_models_with_contract(&manager, catalog.clone(), contract);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].model, expected_model);
+    let spark = build_available_models_with_contract(
+        &manager,
+        catalog.clone(),
+        picker_contract_for_lane(Some("spark")),
+    );
+    assert_eq!(spark, subscription);
+    for (preset, original) in subscription.iter().zip(&catalog) {
         assert_eq!(
-            filtered[0].default_reasoning_effort,
-            expected_effort.clone()
-        );
-        assert_eq!(filtered[0].supported_reasoning_efforts.len(), 1);
-        assert_eq!(
-            filtered[0].supported_reasoning_efforts[0].effort,
-            expected_effort
+            preset.supported_reasoning_efforts,
+            original.supported_reasoning_levels
         );
     }
 }

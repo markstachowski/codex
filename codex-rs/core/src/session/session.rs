@@ -612,7 +612,7 @@ pub(crate) fn validate_root_model_selection_for_lane(
                 ),
             )
         })?;
-    let effort_supported = reasoning_effort.is_some_and(|effort| {
+    let effort_supported = reasoning_effort.is_none_or(|effort| {
         effort == &preset.default_reasoning_effort
             || preset
                 .supported_reasoning_efforts
@@ -640,18 +640,11 @@ pub(crate) fn validate_model_selection_update_for_lane(
     reasoning_effort: Option<&ReasoningEffortConfig>,
     available_models: Option<&[ModelPreset]>,
 ) -> std::io::Result<()> {
-    if is_non_root_agent {
-        if !lane.allows_non_root_sessions() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{} model policy rejects non-root sessions", lane.as_str()),
-            ));
-        }
-        return lane.validate_model_and_effort(
-            model,
-            reasoning_effort,
-            /*allow_user_model_selection*/ false,
-        );
+    if is_non_root_agent && !lane.allows_non_root_sessions() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} model policy rejects non-root sessions", lane.as_str()),
+        ));
     }
     if lane.allows_user_model_selection() {
         let available_models = available_models.ok_or_else(|| {
@@ -668,7 +661,7 @@ pub(crate) fn validate_model_selection_update_for_lane(
         lane.validate_model_and_effort(
             model,
             reasoning_effort,
-            /*allow_user_model_selection*/ false,
+            /*_allow_user_model_selection*/ false,
         )
     }
 }
@@ -1916,14 +1909,18 @@ mod model_selection_update_tests {
             preset(crate::config::SPARK_MODEL, /*show_in_picker*/ true),
             preset("codex-auto-balanced", /*show_in_picker*/ true),
         ];
-        validate_model_selection_update_for_lane(
-            crate::config::ModelPolicyLane::Subscription,
-            /*is_non_root_agent*/ false,
-            "gpt-5.5",
-            Some(&ReasoningEffortConfig::High),
-            Some(&catalog),
-        )
-        .expect("visible catalog model with advertised effort should apply");
+        for model in ["gpt-5.5", crate::config::SPARK_MODEL, "codex-auto-balanced"] {
+            for is_non_root_agent in [false, true] {
+                validate_model_selection_update_for_lane(
+                    crate::config::ModelPolicyLane::Subscription,
+                    is_non_root_agent,
+                    model,
+                    Some(&ReasoningEffortConfig::High),
+                    Some(&catalog),
+                )
+                .expect("visible catalog model with advertised effort should apply");
+            }
+        }
 
         for (model, effort, expected) in [
             (
@@ -1939,12 +1936,12 @@ mod model_selection_update_tests {
             (
                 crate::config::SPARK_MODEL,
                 ReasoningEffortConfig::XHigh,
-                "reserved model",
+                "does not advertise",
             ),
             (
                 "codex-auto-balanced",
-                ReasoningEffortConfig::Medium,
-                "reserved model",
+                ReasoningEffortConfig::Low,
+                "does not advertise",
             ),
             ("gpt-5.5", ReasoningEffortConfig::Low, "does not advertise"),
         ] {
