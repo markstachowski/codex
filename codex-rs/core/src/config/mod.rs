@@ -285,7 +285,6 @@ pub const MANAGED_TEMPORARY_STRUCTURED_DISABLED_BOOL_OVERRIDES: &[&str] = &[
     "features.default_mode_request_user_input",
     "orchestrator.skills.enabled",
     "skills.include_instructions",
-    "token_budget.use_history_notes_extension",
     "tools.experimental_request_user_input.enabled",
     "tools.update_plan.enabled",
 ];

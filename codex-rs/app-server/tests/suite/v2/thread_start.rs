@@ -1249,6 +1249,12 @@ expose_spawn_agent_model_overrides = false
             .await?;
         let response: ThreadStartResponse =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+        assert!(
+            !mcp.pending_notification_methods()
+                .iter()
+                .any(|method| method == "configWarning"),
+            "managed temporary bootstrap must not emit configuration warnings for {lane}",
+        );
         assert_eq!(
             (
                 response.model.as_str(),
