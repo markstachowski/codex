@@ -3392,3 +3392,6 @@ fn review_scope(action: &serde_json::Value) -> Option<GuardianScope> {
 
 #[path = "budget_tests.rs"]
 mod budget;
+
+#[path = "managed_startup_tests.rs"]
+mod managed_startup;

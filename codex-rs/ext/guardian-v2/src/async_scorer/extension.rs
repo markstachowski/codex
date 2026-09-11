@@ -15,6 +15,8 @@ use codex_analytics::GuardianV2Event;
 use codex_analytics::GuardianV2EventKind;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::config::ModelPolicyLane;
+use codex_core::config::locked_model_policy_lane;
 use codex_core::context::GuardianContextMode;
 use codex_core::context::GuardianReviewEvidence;
 use codex_core::context::NodeReplReviewEvidence;
@@ -105,11 +107,26 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
         &'a self,
         input: ThreadStartInput<'a, Config>,
     ) -> ExtensionFuture<'a, ()> {
+        self.start_thread(input, locked_model_policy_lane())
+    }
+}
+
+impl GuardianV2Extension {
+    fn start_thread<'a>(
+        &'a self,
+        input: ThreadStartInput<'a, Config>,
+        model_policy_lane: std::io::Result<Option<ModelPolicyLane>>,
+    ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             if !input.config.features.enabled(Feature::GuardianApproval) {
                 return;
             }
 
+            // A restarted scorer must not authorize actions with an earlier sampler's score.
+            input.thread_store.remove::<LunaSampler>();
+            input.thread_store.remove::<GuardianV2Enabled>();
+            input.thread_store.remove::<GuardianV2ScoreProgress>();
+            input.thread_store.remove::<SecurityRiskScore>();
             let model = input.thread_store.get::<ModelInfo>();
             let thread_id = input.thread_store.level_id().to_string();
             let guardian_config = match GuardianV2Config::resolve(input.config) {
@@ -134,21 +151,40 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                 policy.enforce_required_model();
             }
             let scoring_enabled = policy.scoring_enabled();
-            let sampler_config = super::startup::sampler_config(
-                &input,
-                Arc::clone(&self.auth_manager),
-                self.thread_manager.upgrade(),
-            )
-            .await;
-
             if scoring_enabled && guardian_config.transcript.include_images {
                 input
                     .thread_store
                     .get_or_init(NodeReplReviewEvidence::default)
                     .enable_image_capture();
             }
-            input.thread_store.remove::<LunaSampler>();
-            input.thread_store.remove::<GuardianV2Enabled>();
+            input.thread_store.insert(guardian_config);
+            // Synchronous review still needs the host's evidence and trusted skill context.
+            input
+                .thread_store
+                .get_or_init(GuardianReviewEvidence::default);
+            input
+                .thread_store
+                .insert(TrustedSkillRoots::from_config(input.config));
+            match model_policy_lane {
+                // Managed lanes intentionally prohibit Luna's fixed-model transport.
+                // Without score progress, approval routing requires synchronous review.
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    self.event_sink.emit_warning(ExtensionWarning {
+                        thread_id,
+                        turn_id: None,
+                        message: format!("Guardian model policy initialization failed: {error}"),
+                    });
+                    return;
+                }
+            }
+            let sampler_config = super::startup::sampler_config(
+                &input,
+                Arc::clone(&self.auth_manager),
+                self.thread_manager.upgrade(),
+            )
+            .await;
             let sampler = match LunaSampler::new(sampler_config) {
                 Ok(sampler) => input.thread_store.get_or_init(|| sampler),
                 Err(error) => {
@@ -160,18 +196,10 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     return;
                 }
             };
-            input.thread_store.insert(guardian_config);
             input.thread_store.insert(GuardianV2ScoreProgress {
                 metrics: input.extension_metrics.clone(),
                 ..Default::default()
             });
-            // Preserve the answer path selected by the host for this thread.
-            input
-                .thread_store
-                .get_or_init(GuardianReviewEvidence::default);
-            input
-                .thread_store
-                .insert(TrustedSkillRoots::from_config(input.config));
             if scoring_enabled {
                 input.thread_store.insert(GuardianV2Enabled);
             }
